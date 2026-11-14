@@ -136,6 +136,17 @@ impl Engine {
                 out.push(item.clone());
             }
         }
+        // Nothing used yet and none of the usual suspects installed: still show something.
+        if out.len() < COUNT {
+            let missing: Vec<Item> = apps
+                .iter()
+                .filter(|item| !out.iter().any(|picked| picked.id == item.id))
+                .take(COUNT - out.len())
+                .cloned()
+                .collect();
+            out.extend(missing);
+        }
+        out.extend(recent_files(4));
         out
     }
 
@@ -208,6 +219,39 @@ impl Engine {
         self.history.lock().unwrap().record(&item.id, query);
         Ok(Outcome::Done)
     }
+}
+
+/// The files Windows lists under "Recent", newest first. Opening the shortcut opens the file.
+fn recent_files(limit: usize) -> Vec<Item> {
+    let Some(dir) = dirs::data_dir().map(|d| d.join("Microsoft").join("Windows").join("Recent")) else {
+        return Vec::new();
+    };
+    let Ok(read) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = read
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let is_lnk = path.extension().and_then(|x| x.to_str()).map_or(false, |x| x.eq_ignore_ascii_case("lnk"));
+            if !is_lnk {
+                return None;
+            }
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .collect();
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries
+        .into_iter()
+        .take(limit)
+        .map(|(_, path)| Item {
+            id: format!("recent:{}", path.display()),
+            title: path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+            subtitle: "Recently opened".to_string(),
+            kind: Kind::File,
+            action: Action::OpenPath(path),
+            score: 0,
+        })
+        .collect()
 }
 
 #[cfg(test)]

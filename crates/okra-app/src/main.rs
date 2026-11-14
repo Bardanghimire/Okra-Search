@@ -47,6 +47,8 @@ struct App {
     last_height: f32,
     /// True once the window has actually been focused; losing focus after that hides it.
     had_focus: bool,
+    /// After showing, keep asking Windows for focus until it is granted (or this time passes).
+    focus_retry_until: Option<std::time::Instant>,
     #[cfg(windows)]
     _resident: Option<ResidentControls>,
 }
@@ -81,7 +83,8 @@ impl ResidentControls {
                         GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
                             if event.id == hotkey_id && event.state == HotKeyState::Pressed {
                                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                                context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                                bring_to_front();
+context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                                 context.send_viewport_cmd(egui::ViewportCommand::Focus);
                                 context.request_repaint();
                             }
@@ -125,7 +128,8 @@ impl ResidentControls {
                     context_for_menu.request_repaint();
                 } else if event.id == show_id {
                     flag_for_menu.store(true, std::sync::atomic::Ordering::SeqCst);
-                    context_for_menu.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    bring_to_front();
+context_for_menu.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     context_for_menu.send_viewport_cmd(egui::ViewportCommand::Focus);
                     context_for_menu.request_repaint();
                 }
@@ -141,7 +145,8 @@ impl ResidentControls {
                 };
                 if should_show {
                     flag_for_tray.store(true, std::sync::atomic::Ordering::SeqCst);
-                    context_for_tray.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    bring_to_front();
+context_for_tray.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     context_for_tray.send_viewport_cmd(egui::ViewportCommand::Focus);
                     context_for_tray.request_repaint();
                 }
@@ -224,6 +229,7 @@ impl App {
             resident_initialized: false,
             last_height: 0.0,
             had_focus: false,
+            focus_retry_until: None,
             #[cfg(windows)]
             _resident: None,
         };
@@ -246,13 +252,17 @@ impl App {
         self.results = self.engine.search("");
         self.selected = 0;
         self.search_again();
+        #[cfg(windows)]
+        bring_to_front();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.focus_retry_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(700));
         ctx.request_repaint();
     }
 
     fn hide(&mut self, ctx: &egui::Context) {
         self.had_focus = false;
+        self.focus_retry_until = None;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
@@ -426,6 +436,16 @@ impl eframe::App for App {
             self.had_focus = true;
         } else if self.had_focus {
             self.hide(ctx);
+        }
+        if let Some(deadline) = self.focus_retry_until {
+            if focused || std::time::Instant::now() > deadline {
+                self.focus_retry_until = None;
+            } else {
+                #[cfg(windows)]
+                bring_to_front();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                ctx.request_repaint_after(std::time::Duration::from_millis(60));
+            }
         }
 
         let (down, up, enter, escape) = ctx.input_mut(|input| {
@@ -759,6 +779,64 @@ fn load_system_font(ctx: &egui::Context) {
         family.insert(0, "segoe-ui".to_owned());
     }
     ctx.set_fonts(fonts);
+}
+
+/// Windows only lets the process that currently owns the foreground steal focus, so after another
+/// app was launched from here a plain "focus" request is silently refused and the launcher shows
+/// up unfocused. This borrows the foreground thread's input right (the usual launcher trick).
+#[cfg(windows)]
+fn bring_to_front() {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "user32")]
+    extern "system" {
+        fn FindWindowW(class: *const u16, title: *const u16) -> *mut c_void;
+        fn ShowWindow(hwnd: *mut c_void, command: i32) -> i32;
+        fn SetForegroundWindow(hwnd: *mut c_void) -> i32;
+        fn GetForegroundWindow() -> *mut c_void;
+        fn GetWindowThreadProcessId(hwnd: *mut c_void, process_id: *mut u32) -> u32;
+        fn AttachThreadInput(from: u32, to: u32, attach: i32) -> i32;
+        fn keybd_event(vk: u8, scan: u8, flags: u32, extra: usize);
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThreadId() -> u32;
+    }
+    const SW_SHOW: i32 = 5;
+    const VK_MENU: u8 = 0x12;
+    const KEYEVENTF_KEYUP: u32 = 2;
+
+    let title: Vec<u16> = std::ffi::OsStr::new("Okra Brown Search")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd.is_null() {
+            return;
+        }
+        let mut process_id = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut process_id);
+        if process_id != std::process::id() {
+            return;
+        }
+        ShowWindow(hwnd, SW_SHOW);
+        // A synthetic Alt tap marks this process as having just received input.
+        keybd_event(VK_MENU, 0, 0, 0);
+        keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+        let foreground = GetForegroundWindow();
+        let foreground_thread = if foreground.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground, std::ptr::null_mut())
+        };
+        let ours = GetCurrentThreadId();
+        let attached = foreground_thread != 0 && foreground_thread != ours && AttachThreadInput(ours, foreground_thread, 1) != 0;
+        SetForegroundWindow(hwnd);
+        if attached {
+            AttachThreadInput(ours, foreground_thread, 0);
+        }
+    }
 }
 
 #[cfg(windows)]
