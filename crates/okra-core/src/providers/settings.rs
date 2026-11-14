@@ -1,5 +1,5 @@
 use super::{Action, Item, Kind, Provider};
-use crate::matcher::fuzzy;
+use crate::matcher::{score, Query};
 
 struct SettingEntry {
     name: &'static str,
@@ -68,15 +68,16 @@ impl Provider for SettingsProvider {
         Some("s")
     }
     fn query(&self, q: &str, limit: usize) -> Vec<Item> {
+        let query = Query::new(q);
         let mut items: Vec<Item> = SETTINGS
             .iter()
             .filter_map(|entry| {
-                let score = if q.is_empty() {
+                let rank = if query.is_empty() {
                     0
                 } else {
-                    fuzzy(q, entry.name)
-                        .map(|m| m.score + 36)
-                        .or_else(|| fuzzy(q, entry.detail).map(|m| m.score + 8))?
+                    score(&query, entry.name)
+                        .map(|s| s + 36)
+                        .or_else(|| score(&query, entry.detail).map(|s| s + 8))?
                 };
                 let action = match entry.target {
                     SettingTarget::Uri(uri) => Action::OpenUri(uri.to_string()),
@@ -91,7 +92,7 @@ impl Provider for SettingsProvider {
                     subtitle: entry.detail.to_string(),
                     kind: Kind::Setting,
                     action,
-                    score,
+                    score: rank,
                 })
             })
             .collect();

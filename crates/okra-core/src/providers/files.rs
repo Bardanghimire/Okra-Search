@@ -1,7 +1,7 @@
 use super::everything::{EsCli, EverythingSdk};
 use super::{Action, Item, Kind, Provider};
 use crate::config::{Config, FileBackendKind};
-use crate::matcher::{fuzzy, is_subsequence, lc, normalize};
+use crate::matcher::{char_mask, is_subsequence, lc, score, score_with_lower, Query};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use walkdir::WalkDir;
@@ -39,7 +39,24 @@ struct FileEntry {
     is_dir: bool,
 }
 
-type Index = Arc<RwLock<Vec<FileEntry>>>;
+/// `masks[i]` is the [`char_mask`] of `entries[i].lower`. Kept in its own contiguous array so the
+/// first filtering pass streams 8 bytes per file instead of touching every file's strings.
+#[derive(Default)]
+struct IndexData {
+    entries: Vec<FileEntry>,
+    masks: Vec<u64>,
+}
+
+impl IndexData {
+    fn extend(&mut self, batch: impl IntoIterator<Item = FileEntry>) {
+        for e in batch {
+            self.masks.push(char_mask(e.lower.chars()));
+            self.entries.push(e);
+        }
+    }
+}
+
+type Index = Arc<RwLock<IndexData>>;
 
 fn skip(name: &str) -> bool {
     name.starts_with('.')
@@ -47,7 +64,7 @@ fn skip(name: &str) -> bool {
 }
 
 fn build_index(roots: Vec<PathBuf>, max_depth: usize) -> Index {
-    let index: Index = Arc::new(RwLock::new(Vec::new()));
+    let index: Index = Arc::new(RwLock::new(IndexData::default()));
     let i2 = index.clone();
     std::thread::spawn(move || {
         for root in roots {
@@ -89,19 +106,32 @@ impl FileBackend for Builtin {
         "built-in index"
     }
     fn search(&self, q: &str, max: usize) -> Option<Vec<(PathBuf, bool)>> {
-        let qc = normalize(q);
+        let query = Query::new(q);
         let idx = self.index.get_or_init(|| build_index(self.roots.clone(), self.depth)).read().unwrap();
-        let mut hits: Vec<(i64, &FileEntry)> = Vec::new();
-        for e in idx.iter() {
-            if is_subsequence(&qc, &e.lower) {
-                if let Some(m) = fuzzy(q, &e.name) {
-                    hits.push((m.score, e));
+        // (score, position in index). Higher score first; equal scores keep index order.
+        let mut hits: Vec<(i64, usize)> = Vec::new();
+        let qm = query.mask();
+        for (pos, &mask) in idx.masks.iter().enumerate() {
+            if mask & qm != qm {
+                continue; // lacks one of the query's characters: cannot match
+            }
+            let e = &idx.entries[pos];
+            if is_subsequence(query.chars(), &e.lower) {
+                if let Some(s) = score_with_lower(&query, &e.name, &e.lower) {
+                    hits.push((s, pos));
                 }
             }
         }
-        hits.sort_by(|a, b| b.0.cmp(&a.0));
+        // Only the best `max` are needed: select them in O(n) and sort just those, instead of
+        // sorting every hit (a short query like "ch" can match a large share of the index).
+        let order = |a: &(i64, usize), b: &(i64, usize)| b.0.cmp(&a.0).then(a.1.cmp(&b.1));
+        if max > 0 && hits.len() > max {
+            hits.select_nth_unstable_by(max - 1, order);
+            hits.truncate(max);
+        }
+        hits.sort_by(order);
         hits.truncate(max);
-        Some(hits.into_iter().map(|(_, e)| (e.path.clone(), e.is_dir)).collect())
+        Some(hits.into_iter().map(|(_, pos)| (idx.entries[pos].path.clone(), idx.entries[pos].is_dir)).collect())
     }
 }
 
@@ -118,10 +148,12 @@ impl FilesProvider {
         let mut backends: Vec<Box<dyn FileBackend>> = Vec::new();
         let use_everything = !matches!(cfg.file_backend, FileBackendKind::Builtin);
         if use_everything {
+            // es.exe talks to the same running Everything instance as the SDK DLL, so it can only
+            // help when the DLL is missing. Probing it spawns processes, so skip that when the
+            // DLL loaded: it keeps startup fast and avoids a ~50x slower per-query path.
             if let Some(sdk) = EverythingSdk::load(cfg.everything_dll.as_deref()) {
                 backends.push(Box::new(sdk));
-            }
-            if let Some(es) = EsCli::find(cfg.es_exe.as_deref()) {
+            } else if let Some(es) = EsCli::find(cfg.es_exe.as_deref()) {
                 backends.push(Box::new(es));
             }
         }
@@ -158,7 +190,8 @@ impl Provider for FilesProvider {
         Some("f")
     }
     fn query(&self, q: &str, limit: usize) -> Vec<Item> {
-        if normalize(q).len() < 2 {
+        let query = Query::new(q);
+        if query.len() < 2 {
             return vec![];
         }
         for b in &self.backends {
@@ -169,9 +202,8 @@ impl Provider for FilesProvider {
                 .map(|(path, is_dir)| {
                     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string());
                     // Everything also matches on path / by operators, so fall back to weaker scores.
-                    let score = fuzzy(q, &name)
-                        .map(|m| m.score)
-                        .or_else(|| fuzzy(q, &path.display().to_string()).map(|m| m.score - 40))
+                    let rank = score(&query, &name)
+                        .or_else(|| score(&query, &path.display().to_string()).map(|s| s - 40))
                         .unwrap_or(-60)
                         - 10
                         + if is_dir { 5 } else { 0 };
@@ -181,7 +213,7 @@ impl Provider for FilesProvider {
                         title: name,
                         kind: if is_dir { Kind::Folder } else { Kind::File },
                         action: Action::OpenPath(path),
-                        score,
+                        score: rank,
                     }
                 })
                 .collect();
@@ -190,5 +222,65 @@ impl Provider for FilesProvider {
             return items;
         }
         vec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed >> 33
+    }
+
+    fn synth(n: usize) -> Builtin {
+        const WORDS: &[&str] = &[
+            "report", "invoice", "final", "draft", "thesis", "turbine", "heat", "transfer", "chapter", "notes",
+            "Visual", "Studio", "Code", "Chrome", "Firefox", "setup", "backup", "photo", "IMG", "scan", "lecture",
+            "design", "gear", "shaft", "fluent", "ansys", "model", "v2", "copy", "new",
+        ];
+        const EXT: &[&str] = &["pdf", "docx", "xlsx", "txt", "png", "py", "rs", "dll", "exe", "zip"];
+        let mut seed = 42u64;
+        let mut entries = Vec::with_capacity(n);
+        for i in 0..n {
+            let words = 1 + (lcg(&mut seed) % 4) as usize;
+            let mut name = String::new();
+            for w in 0..words {
+                if w > 0 {
+                    name.push(['_', '-', ' '][(lcg(&mut seed) % 3) as usize]);
+                }
+                name.push_str(WORDS[(lcg(&mut seed) % WORDS.len() as u64) as usize]);
+            }
+            name.push('.');
+            name.push_str(EXT[(lcg(&mut seed) % EXT.len() as u64) as usize]);
+            entries.push(FileEntry {
+                lower: name.chars().map(lc).collect(),
+                path: PathBuf::from(format!("/synthetic/{i}/{name}")),
+                name,
+                is_dir: false,
+            });
+        }
+        let b = Builtin { roots: vec![], depth: 0, index: OnceLock::new() };
+        let mut data = IndexData::default();
+        data.extend(entries);
+        let _ = b.index.set(Arc::new(RwLock::new(data)));
+        b
+    }
+
+    /// `cargo test --release -p okra-core -- --ignored --nocapture bench_builtin`
+    #[test]
+    #[ignore]
+    fn bench_builtin() {
+        let b = synth(300_000);
+        let queries = ["ch", "chr", "chrome", "vsc", "turb", "heat tr", "report fin", "invoice pdf"];
+        let _ = b.search("warm", 200);
+        let t = std::time::Instant::now();
+        let mut total = 0usize;
+        for q in &queries {
+            total += b.search(q, 200).unwrap().len();
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3 / queries.len() as f64;
+        println!("built-in index, 300k entries: {ms:.2} ms / query (returned {total} rows)");
     }
 }

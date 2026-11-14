@@ -1,5 +1,5 @@
 use super::{Action, Item, Kind, Provider};
-use crate::matcher::fuzzy;
+use crate::matcher::{score, Query};
 
 pub struct WindowsProvider;
 
@@ -110,17 +110,18 @@ impl Provider for WindowsProvider {
         Some("win")
     }
     fn query(&self, q: &str, limit: usize) -> Vec<Item> {
+        let query = Query::new(q);
         let mut items: Vec<Item> = native::enumerate()
             .into_iter()
             .filter_map(|window| {
-                let score = if q.is_empty() { 0 } else { fuzzy(q, &window.title)?.score + 25 };
+                let rank = if query.is_empty() { 0 } else { score(&query, &window.title)? + 25 };
                 Some(Item {
                     id: format!("window:{}", window.hwnd),
                     title: window.title,
                     subtitle: format!("Open window · PID {}", window.pid),
                     kind: Kind::Window,
                     action: Action::FocusWindow(window.hwnd),
-                    score,
+                    score: rank,
                 })
             })
             .collect();

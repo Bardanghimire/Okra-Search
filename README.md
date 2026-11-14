@@ -32,6 +32,16 @@ The file query is passed to Everything unchanged, so Everything operators are av
 - `f dm:today`
 - `f content:invoice` (requires content indexing to be enabled in Everything)
 
+## Performance design
+
+- **Instant start.** The installed-app list is cached in `%LOCALAPPDATA%\okra-brown-search\apps.json` and loaded immediately; the slow part (Start Menu walk plus `Get-StartApps` via PowerShell) runs on a background thread, rewrites the cache, and re-runs the query on screen when it finishes. It repeats every 30 minutes so newly installed apps appear without a restart.
+- **Nothing slow on the keystroke path.** Typing is coalesced on a worker thread; only the newest query is ever searched.
+- **Allocation-free fuzzy matcher.** The query is prepared once per search, non-matches are rejected without allocating, and scoring is linear in name length. A randomized test checks it against the original reference implementation (identical scores and matched positions).
+- **Fast built-in index.** Each indexed file carries a 64-bit character signature in a contiguous array, so most files are rejected with one AND before any text is read; only the best results are selected rather than sorting every hit.
+- **Everything is still the fast path.** When Everything is running, file queries are answered by its own index; the built-in index is only a fallback.
+
+Micro-benchmarks: `cargo run --release -p okra-core --example bench`, and for the real built-in index path `cargo test --release -p okra-core -- --ignored --nocapture bench_builtin`.
+
 ## Requirements
 
 - Windows 10 or Windows 11 (the global hotkey, tray, Start app discovery, Settings shortcuts, and window switching are Windows features).
@@ -59,7 +69,7 @@ The executable is under `target\release\okra-brown-search.exe`. The included Git
 The default `auto` mode tries:
 
 1. `Everything64.dll` / `Everything32.dll` from the executable folder, normal DLL search locations, or the configured `everything_dll` path.
-2. `es.exe` on `PATH`, under the Everything installation folder, or the configured `es_exe` path.
+2. `es.exe` on `PATH`, under the Everything installation folder, or the configured `es_exe` path. This is only probed when the DLL is not found, because both talk to the same running Everything instance.
 3. The built-in filename index over the configured `file_roots`.
 
 Configuration is stored in `%APPDATA%\okra-brown-search\config.json` (or the platform config directory for non-Windows builds). The Settings page also lets you select the backend, theme, maximum result count, and optional Windows sign-in startup. Enabling sign-in startup adds an `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` entry; disabling it removes that entry. Backend and result-count changes are applied on the next launch.
@@ -87,4 +97,5 @@ This build includes the resident launcher and Windows top-level window switching
 
 - `crates/okra-core` — providers, Everything integration, fuzzy matching, settings catalog, activation, and usage history.
 - `crates/okra-app` — egui interface, resident global hotkey, tray menu, single-instance guard, startup integration, and settings UI.
-- `assets` — Okra Brown Search logo and Windows application icon.
+- `assets` — logo and icons (window/app icon, `.ico`, in-app mark, tray icon).
+- `tools/make_icons.py` — regenerates every file in `assets` from one definition (`pip install pillow numpy`, then `python tools/make_icons.py`).

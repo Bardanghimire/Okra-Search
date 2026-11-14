@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::history::History;
 use crate::providers::{
-    apps::AppsProvider,
+    apps::{AppsProvider, RefreshCallback},
     files::FilesProvider,
     settings::SettingsProvider,
     windows::WindowsProvider,
@@ -9,7 +9,7 @@ use crate::providers::{
 };
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// What the UI must do after an item was activated.
 #[derive(Debug, PartialEq, Eq)]
@@ -22,23 +22,36 @@ pub struct Engine {
     providers: Vec<Box<dyn Provider>>,
     history: Mutex<History>,
     max_results: usize,
+    on_index_refresh: Arc<OnceLock<RefreshCallback>>,
 }
 
 impl Engine {
     pub fn new(cfg: &Config) -> Self {
         // Okra Brown Search is intentionally a focused, built-in Windows search tool:
         // apps, Everything-backed files, Windows Settings, and open windows.
+        //
+        // Construction never blocks on slow discovery: the app list comes from an on-disk cache
+        // and is refreshed on a background thread (see `set_on_index_refresh`).
+        let on_index_refresh: Arc<OnceLock<RefreshCallback>> = Arc::new(OnceLock::new());
         let providers: Vec<Box<dyn Provider>> = vec![
-            Box::new(AppsProvider::scan()),
+            Box::new(AppsProvider::start(on_index_refresh.clone())),
             Box::new(FilesProvider::new(cfg)),
             Box::new(SettingsProvider),
             Box::new(WindowsProvider),
         ];
-        Self::with_providers(providers, History::load(), cfg.max_results)
+        let mut engine = Self::with_providers(providers, History::load(), cfg.max_results);
+        engine.on_index_refresh = on_index_refresh;
+        engine
     }
 
     pub fn with_providers(providers: Vec<Box<dyn Provider>>, history: History, max_results: usize) -> Self {
-        Self { providers, history: Mutex::new(history), max_results }
+        Self { providers, history: Mutex::new(history), max_results, on_index_refresh: Arc::new(OnceLock::new()) }
+    }
+
+    /// Register a callback fired (from a background thread) whenever the application list has been
+    /// refreshed, so the UI can re-run the query that is currently displayed. Can be set once.
+    pub fn set_on_index_refresh(&self, callback: impl Fn() + Send + Sync + 'static) {
+        let _ = self.on_index_refresh.set(Box::new(callback));
     }
 
     /// `f invoice` -> only the provider whose prefix is `f`, query `invoice`.

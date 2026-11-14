@@ -31,6 +31,9 @@ struct App {
     r_rx: Receiver<(u64, Vec<Item>)>,
     settings_open: bool,
     show_requested: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the background app scanner when a fresh application list is available.
+    index_refreshed: Arc<std::sync::atomic::AtomicBool>,
+    brand: egui::TextureHandle,
     start_hidden: bool,
     resident_initialized: bool,
     #[cfg(windows)]
@@ -87,7 +90,9 @@ impl ResidentControls {
         };
 
         let tray_icon = (|| -> Result<tray_icon::TrayIcon, String> {
-            let image = image::load_from_memory(include_bytes!("../../../assets/okra-brown-search.png"))
+            // A dedicated 32 px render: the shell scales tray icons to 16/20/24/32 px, and a
+            // pre-rendered small icon stays far crisper than downscaling the 256 px window icon.
+            let image = image::load_from_memory(include_bytes!("../../../assets/okra-tray.png"))
                 .map_err(|e| e.to_string())?
                 .into_rgba8();
             let (width, height) = image.dimensions();
@@ -154,6 +159,7 @@ impl ResidentControls {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, engine: Arc<Engine>, config: Config, start_hidden: bool) -> Self {
         apply_theme(&cc.egui_ctx, config.theme);
+        let brand = load_brand_texture(&cc.egui_ctx);
 
         // Search runs on a worker thread; rapid typing replaces stale queued queries.
         let (q_tx, q_rx) = channel::<(u64, String)>();
@@ -174,6 +180,17 @@ impl App {
 
         let show_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        // When the background scan finds the (possibly new) list of installed apps, re-run the
+        // query on screen so results appear without the user having to type another key.
+        let index_refreshed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let (flag, ctx) = (index_refreshed.clone(), cc.egui_ctx.clone());
+            engine.set_on_index_refresh(move || {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                ctx.request_repaint();
+            });
+        }
+
         let mut app = Self {
             engine,
             initial_backend: config.file_backend,
@@ -190,6 +207,8 @@ impl App {
             r_rx,
             settings_open: false,
             show_requested,
+            index_refreshed,
+            brand,
             start_hidden,
             resident_initialized: false,
             #[cfg(windows)]
@@ -335,6 +354,9 @@ impl eframe::App for App {
         if self.show_requested.swap(false, std::sync::atomic::Ordering::SeqCst) {
             self.show(ctx);
         }
+        if self.index_refreshed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.search_again();
+        }
 
         let (down, up, enter, escape) = ctx.input_mut(|input| {
             (
@@ -371,7 +393,7 @@ impl eframe::App for App {
             .frame(egui::Frame::none().fill(background_color(self.config.theme)).inner_margin(egui::Margin::same(18.0)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    draw_brand_mark(ui);
+                    ui.add(egui::Image::new((self.brand.id(), Vec2::splat(40.0))));
                     ui.vertical(|ui| {
                         ui.label(RichText::new("Okra Brown Search").size(19.0).strong().color(text_color(self.config.theme)));
                         ui.label(RichText::new("Find anything on this PC").small().color(muted_color(self.config.theme)));
@@ -492,30 +514,13 @@ fn selected_color(theme: ThemeKind) -> Color32 {
     }
 }
 
-fn draw_brand_mark(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(38.0), egui::Sense::hover());
-    let painter = ui.painter_at(rect);
-    let center = rect.center();
-    painter.circle_filled(center, 18.0, Color32::from_rgb(238, 225, 199));
-    painter.circle_stroke(center, 13.0, Stroke::new(4.0_f32, Color32::from_rgb(91, 54, 35)));
-    painter.line_segment(
-        [center + Vec2::new(9.0, 9.0), center + Vec2::new(16.0, 16.0)],
-        Stroke::new(5.0_f32, Color32::from_rgb(91, 54, 35)),
-    );
-    let pod = vec![
-        center + Vec2::new(-10.0, 9.0),
-        center + Vec2::new(-4.0, 1.0),
-        center + Vec2::new(2.0, -8.0),
-        center + Vec2::new(8.0, -12.0),
-        center + Vec2::new(10.0, -5.0),
-        center + Vec2::new(7.0, 4.0),
-        center + Vec2::new(-1.0, 12.0),
-    ];
-    painter.add(egui::Shape::convex_polygon(pod, GREEN, Stroke::new(0.5_f32, Color32::from_rgb(63, 91, 34))));
-    painter.line_segment(
-        [center + Vec2::new(-7.0, 7.0), center + Vec2::new(7.0, -8.0)],
-        Stroke::new(1.4_f32, Color32::from_rgb(190, 207, 95)),
-    );
+fn load_brand_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let rgba = image::load_from_memory(include_bytes!("../../../assets/okra-mark.png"))
+        .expect("bundled logo is a valid PNG")
+        .into_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+    ctx.load_texture("okra-brand", image, egui::TextureOptions::LINEAR)
 }
 
 #[cfg(windows)]
