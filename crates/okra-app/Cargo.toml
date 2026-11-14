@@ -1,0 +1,19 @@
+[package]
+name = "okra-brown-search"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.80"
+description = "A minimal Windows desktop search launcher written in Rust"
+build = "build.rs"
+
+[dependencies]
+okra-core = { path = "../okra-core" }
+eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+image = { version = "0.24", default-features = false, features = ["png"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+global-hotkey = "0.6"
+tray-icon = "0.19"
+
+[build-dependencies]
+winres = "0.1"

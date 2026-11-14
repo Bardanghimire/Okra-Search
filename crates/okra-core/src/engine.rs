@@ -1,0 +1,190 @@
+use crate::config::Config;
+use crate::history::History;
+use crate::providers::{
+    apps::AppsProvider,
+    files::FilesProvider,
+    settings::SettingsProvider,
+    windows::WindowsProvider,
+    Action, Item, Provider,
+};
+use std::collections::HashSet;
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
+
+/// What the UI must do after an item was activated.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Done,
+    CopyText(String),
+}
+
+pub struct Engine {
+    providers: Vec<Box<dyn Provider>>,
+    history: Mutex<History>,
+    max_results: usize,
+}
+
+impl Engine {
+    pub fn new(cfg: &Config) -> Self {
+        // Okra Brown Search is intentionally a focused, built-in Windows search tool:
+        // apps, Everything-backed files, Windows Settings, and open windows.
+        let providers: Vec<Box<dyn Provider>> = vec![
+            Box::new(AppsProvider::scan()),
+            Box::new(FilesProvider::new(cfg)),
+            Box::new(SettingsProvider),
+            Box::new(WindowsProvider),
+        ];
+        Self::with_providers(providers, History::load(), cfg.max_results)
+    }
+
+    pub fn with_providers(providers: Vec<Box<dyn Provider>>, history: History, max_results: usize) -> Self {
+        Self { providers, history: Mutex::new(history), max_results }
+    }
+
+    /// `f invoice` -> only the provider whose prefix is `f`, query `invoice`.
+    fn route<'a>(&'a self, raw: &'a str) -> (Vec<&'a dyn Provider>, &'a str) {
+        for provider in &self.providers {
+            if let Some(prefix) = provider.prefix() {
+                if let Some(rest) = raw.strip_prefix(prefix).and_then(|r| r.strip_prefix(' ')) {
+                    return (vec![provider.as_ref()], rest.trim());
+                }
+            }
+        }
+        (self.providers.iter().filter(|p| p.in_default()).map(|p| p.as_ref()).collect(), raw.trim())
+    }
+
+    pub fn search(&self, raw: &str) -> Vec<Item> {
+        let (providers, query) = self.route(raw.trim_start());
+        let mut items: Vec<Item> = providers.iter().flat_map(|p| p.query(query, self.max_results)).collect();
+        {
+            let history = self.history.lock().unwrap();
+            for item in &mut items {
+                item.score += history.boost(&item.id);
+            }
+        }
+        items.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
+        let mut seen = HashSet::new();
+        items.retain(|item| seen.insert(item.id.clone()));
+        items.truncate(self.max_results);
+        items
+    }
+
+    pub fn activate(&self, item: &Item) -> Result<Outcome, String> {
+        match &item.action {
+            Action::Launch { path, exec } => {
+                if let Some(command) = exec {
+                    #[cfg(windows)]
+                    {
+                        let _ = command;
+                        open::that_detached(path).map_err(|e| e.to_string())?;
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        Command::new("sh")
+                            .arg("-c")
+                            .arg(command)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                            .map_err(|e| e.to_string())?;
+                    }
+                } else {
+                    open::that_detached(path).map_err(|e| e.to_string())?;
+                }
+            }
+            Action::LaunchAppId(app_id) => {
+                #[cfg(windows)]
+                {
+                    Command::new("explorer.exe")
+                        .arg(format!("shell:AppsFolder\\{app_id}"))
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .map_err(|e| e.to_string())?;
+                }
+                #[cfg(not(windows))]
+                return Err("Packaged Windows applications can only be launched on Windows".into());
+            }
+            Action::Run { program, args } => {
+                Command::new(program)
+                    .args(args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|e| format!("Could not start {program}: {e}"))?;
+            }
+            Action::OpenPath(path) => {
+                open::that_detached(path).map_err(|e| e.to_string())?;
+            }
+            Action::OpenUri(uri) => {
+                open::that_detached(uri).map_err(|e| format!("Could not open {uri}: {e}"))?;
+            }
+            Action::Copy(text) => {
+                self.history.lock().unwrap().record(&item.id);
+                return Ok(Outcome::CopyText(text.clone()));
+            }
+            Action::FocusWindow(hwnd) => {
+                crate::providers::windows::WindowsProvider::focus(*hwnd)?;
+            }
+        }
+        self.history.lock().unwrap().record(&item.id);
+        Ok(Outcome::Done)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::History;
+    use crate::providers::Kind;
+
+    struct Fake(&'static str, Option<&'static str>, bool);
+    impl Provider for Fake {
+        fn name(&self) -> &'static str { self.0 }
+        fn prefix(&self) -> Option<&'static str> { self.1 }
+        fn in_default(&self) -> bool { self.2 }
+        fn query(&self, q: &str, _limit: usize) -> Vec<Item> {
+            vec![Item {
+                id: format!("{}:{}", self.0, q),
+                title: format!("{}-{}", self.0, q),
+                subtitle: String::new(),
+                kind: Kind::App,
+                action: Action::Copy(q.into()),
+                score: 10,
+            }]
+        }
+    }
+
+    #[test]
+    fn prefix_routes_exclusively() {
+        let engine = Engine::with_providers(
+            vec![Box::new(Fake("a", None, true)), Box::new(Fake("f", Some("f"), false))],
+            History::in_memory(),
+            10,
+        );
+        let results = engine.search("f report");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "f:report");
+        let results = engine.search("editor");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "a:editor");
+    }
+
+    #[test]
+    fn history_boosts_ranking() {
+        let engine = Engine::with_providers(
+            vec![Box::new(Fake("a", None, true)), Box::new(Fake("b", None, true))],
+            History::in_memory(),
+            10,
+        );
+        let items = engine.search("x");
+        let second = items[1].clone();
+        for _ in 0..3 {
+            assert_eq!(engine.activate(&second).unwrap(), Outcome::CopyText("x".into()));
+        }
+        assert_eq!(engine.search("x")[0].id, second.id);
+    }
+}

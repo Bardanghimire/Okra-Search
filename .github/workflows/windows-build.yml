@@ -1,0 +1,27 @@
+name: Windows build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run tests
+        run: cargo test --workspace
+      - name: Build release executable
+        run: cargo build --release -p okra-brown-search
+      - name: Upload executable and icon
+        uses: actions/upload-artifact@v4
+        with:
+          name: okra-brown-search-windows-x64
+          path: |
+            target/release/okra-brown-search.exe
+            assets/okra-brown-search.ico
+            README.md
