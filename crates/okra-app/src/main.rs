@@ -1,19 +1,27 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-use eframe::egui::{self, Color32, Key, Modifiers, RichText, Stroke, Vec2};
-use okra_core::{Config, Engine, FileBackendKind, Item, Outcome, ThemeKind};
+use eframe::egui::{self, Align2, Color32, FontId, Key, Modifiers, Pos2, RichText, Sense, Stroke, Vec2};
+use okra_core::{Config, Engine, FileBackendKind, Item, Kind, Outcome, ThemeKind};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
-const BG_LIGHT: Color32 = Color32::from_rgb(247, 240, 224);
-const PANEL_LIGHT: Color32 = Color32::from_rgb(255, 251, 241);
-const TEXT_LIGHT: Color32 = Color32::from_rgb(64, 43, 31);
-const MUTED_LIGHT: Color32 = Color32::from_rgb(133, 112, 91);
-const GREEN: Color32 = Color32::from_rgb(104, 133, 51);
-const BG_DARK: Color32 = Color32::from_rgb(35, 29, 26);
-const PANEL_DARK: Color32 = Color32::from_rgb(49, 41, 36);
-const TEXT_DARK: Color32 = Color32::from_rgb(246, 237, 220);
-const MUTED_DARK: Color32 = Color32::from_rgb(185, 167, 146);
+/// macOS system blue. Change this one constant to re-tint the selection and section accents.
+const ACCENT: Color32 = Color32::from_rgb(10, 132, 255);
+const WINDOW_WIDTH: f32 = 680.0;
+const BAR_HEIGHT: f32 = 66.0;
+const ROW_HEIGHT: f32 = 48.0;
+const MAX_LIST_HEIGHT: f32 = 400.0;
+const SETTINGS_HEIGHT: f32 = 540.0;
+
+#[derive(Clone, Copy)]
+struct Palette {
+    bg: Color32,
+    border: Color32,
+    text: Color32,
+    muted: Color32,
+    sep: Color32,
+    hover: Color32,
+}
 
 struct App {
     engine: Arc<Engine>,
@@ -33,9 +41,9 @@ struct App {
     show_requested: Arc<std::sync::atomic::AtomicBool>,
     /// Set by the background app scanner when a fresh application list is available.
     index_refreshed: Arc<std::sync::atomic::AtomicBool>,
-    brand: egui::TextureHandle,
     start_hidden: bool,
     resident_initialized: bool,
+    last_height: f32,
     #[cfg(windows)]
     _resident: Option<ResidentControls>,
 }
@@ -158,8 +166,9 @@ impl ResidentControls {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, engine: Arc<Engine>, config: Config, start_hidden: bool) -> Self {
+        #[cfg(windows)]
+        load_system_font(&cc.egui_ctx);
         apply_theme(&cc.egui_ctx, config.theme);
-        let brand = load_brand_texture(&cc.egui_ctx);
 
         // Search runs on a worker thread; rapid typing replaces stale queued queries.
         let (q_tx, q_rx) = channel::<(u64, String)>();
@@ -208,9 +217,9 @@ impl App {
             settings_open: false,
             show_requested,
             index_refreshed,
-            brand,
             start_hidden,
             resident_initialized: false,
+            last_height: 0.0,
             #[cfg(windows)]
             _resident: None,
         };
@@ -245,82 +254,119 @@ impl App {
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.heading(RichText::new("Settings").size(23.0).strong());
-        ui.label(RichText::new("Configure search behavior and appearance.").color(muted_color(self.config.theme)));
-        ui.add_space(16.0);
+        let pal = palette(self.config.theme);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let section = |ui: &mut egui::Ui, text: &str| {
+                ui.add_space(14.0);
+                ui.label(RichText::new(text).size(12.0).strong().color(pal.muted));
+                ui.add_space(2.0);
+            };
 
-        ui.label(RichText::new("APPEARANCE").small().strong().color(GREEN));
-        let mut theme_changed = false;
-        egui::ComboBox::from_id_source("okra-theme")
-            .selected_text(self.config.theme.label())
-            .show_ui(ui, |ui| {
-                theme_changed |= ui.selectable_value(&mut self.config.theme, ThemeKind::WarmLight, "Warm light").changed();
-                theme_changed |= ui.selectable_value(&mut self.config.theme, ThemeKind::Dark, "Dark").changed();
-            });
-        if theme_changed {
-            apply_theme(ui.ctx(), self.config.theme);
-        }
+            ui.add_space(2.0);
+            ui.label(RichText::new("Settings").size(22.0).strong().color(pal.text));
 
-        ui.add_space(18.0);
-        ui.label(RichText::new("FILE SEARCH").small().strong().color(GREEN));
-        egui::ComboBox::from_id_source("okra-file-backend")
-            .selected_text(self.config.file_backend.label())
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.config.file_backend, FileBackendKind::Auto, "Automatic (recommended)");
-                ui.selectable_value(&mut self.config.file_backend, FileBackendKind::Everything, "Everything only");
-                ui.selectable_value(&mut self.config.file_backend, FileBackendKind::Builtin, "Built-in index only");
-            });
-        ui.label(RichText::new("Automatic uses the Everything SDK, then es.exe, then the local index.").small().color(muted_color(self.config.theme)));
-
-        ui.add_space(18.0);
-        ui.label(RichText::new("RESULTS").small().strong().color(GREEN));
-        ui.add(egui::Slider::new(&mut self.config.max_results, 10..=80).text("Maximum results"));
-
-        ui.add_space(18.0);
-        ui.label(RichText::new("QUICK ACCESS").small().strong().color(GREEN));
-        ui.checkbox(&mut self.config.start_with_windows, "Launch when I sign in to Windows");
-        ui.label("Global shortcut: Ctrl + Alt + Space");
-        ui.label("Escape: hide the search window");
-        ui.label("The app stays in the notification area until you choose Exit.");
-
-        ui.add_space(18.0);
-        let restart_needed = self.config.file_backend != self.initial_backend || self.config.max_results != self.initial_max_results;
-        if ui.button(RichText::new("Save settings").strong()).clicked() {
-            if self.config.start_with_windows != self.initial_start_with_windows {
-                #[cfg(windows)]
-                if let Err(error) = set_startup_registration(self.config.start_with_windows) {
-                    self.status = error;
-                    return;
-                }
-                #[cfg(not(windows))]
-                if self.config.start_with_windows {
-                    self.status = "Windows sign-in launch is available in the Windows build".into();
-                    return;
-                }
+            section(ui, "Appearance");
+            let mut theme_changed = false;
+            egui::ComboBox::from_id_source("okra-theme")
+                .selected_text(self.config.theme.label())
+                .show_ui(ui, |ui| {
+                    theme_changed |= ui.selectable_value(&mut self.config.theme, ThemeKind::WarmLight, "Light").changed();
+                    theme_changed |= ui.selectable_value(&mut self.config.theme, ThemeKind::Dark, "Dark").changed();
+                });
+            if theme_changed {
+                apply_theme(ui.ctx(), self.config.theme);
             }
-            match self.config.save() {
-                Ok(()) => {
-                    self.status = "Settings saved".into();
-                    // The search engine is already running with its original backend
-                    // and result limit, so keep the restart notice until relaunch.
-                    self.initial_start_with_windows = self.config.start_with_windows;
+
+            section(ui, "File search");
+            egui::ComboBox::from_id_source("okra-file-backend")
+                .selected_text(self.config.file_backend.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.config.file_backend, FileBackendKind::Auto, "Automatic (recommended)");
+                    ui.selectable_value(&mut self.config.file_backend, FileBackendKind::Everything, "Everything only");
+                    ui.selectable_value(&mut self.config.file_backend, FileBackendKind::Builtin, "Built-in index only");
+                });
+            ui.label(RichText::new("Automatic uses the Everything SDK, then es.exe, then the local index.").size(12.0).color(pal.muted));
+
+            section(ui, "Results");
+            ui.add(egui::Slider::new(&mut self.config.max_results, 10..=80).text("Maximum results"));
+
+            section(ui, "General");
+            ui.checkbox(&mut self.config.start_with_windows, "Open at login");
+            ui.add_space(4.0);
+            ui.label(RichText::new("Shortcut: Ctrl + Alt + Space   ·   Esc hides the window").size(12.0).color(pal.muted));
+            ui.label(RichText::new("Prefixes: a apps · f files · s settings · win windows").size(12.0).color(pal.muted));
+            ui.label(RichText::new("The app stays in the notification area until you choose Exit.").size(12.0).color(pal.muted));
+
+            ui.add_space(16.0);
+            let restart_needed = self.config.file_backend != self.initial_backend || self.config.max_results != self.initial_max_results;
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(RichText::new("Save").strong().color(Color32::WHITE)).fill(ACCENT).rounding(6.0_f32)).clicked() {
+                    self.save_settings();
                 }
-                Err(error) => self.status = error,
+                if ui.button("Done").clicked() {
+                    self.settings_open = false;
+                    self.query.clear();
+                    self.search_again();
+                }
+            });
+            if restart_needed {
+                ui.add_space(4.0);
+                ui.label(RichText::new("File backend and result-count changes apply the next time the app starts.").size(12.0).color(pal.muted));
+            }
+        });
+    }
+
+    fn save_settings(&mut self) {
+        if self.config.start_with_windows != self.initial_start_with_windows {
+            #[cfg(windows)]
+            if let Err(error) = set_startup_registration(self.config.start_with_windows) {
+                self.status = error;
+                return;
+            }
+            #[cfg(not(windows))]
+            if self.config.start_with_windows {
+                self.status = "Windows sign-in launch is available in the Windows build".into();
+                return;
             }
         }
-        if restart_needed {
-            ui.label(RichText::new("File backend and result-count changes apply the next time the app starts.").small().color(muted_color(self.config.theme)));
+        match self.config.save() {
+            Ok(()) => {
+                self.status = "Settings saved".into();
+                // The search engine is already running with its original backend
+                // and result limit, so keep the restart notice until relaunch.
+                self.initial_start_with_windows = self.config.start_with_windows;
+            }
+            Err(error) => self.status = error,
         }
-        if ui.button("Back to search").clicked() {
-            self.settings_open = false;
-            self.query.clear();
-            self.search_again();
+    }
+
+    /// Window height for the current state: just the search bar when idle, growing with results.
+    fn desired_height(&self) -> f32 {
+        if self.settings_open {
+            return SETTINGS_HEIGHT;
         }
+        if self.results.is_empty() {
+            return if self.query.trim().is_empty() { BAR_HEIGHT } else { BAR_HEIGHT + 64.0 };
+        }
+        let mut total = 0.0;
+        let mut prev: Option<Kind> = None;
+        for (index, item) in self.results.iter().enumerate() {
+            total += ROW_HEIGHT + 4.0;
+            if index == 0 || prev != Some(item.kind) {
+                total += 28.0;
+            }
+            prev = Some(item.kind);
+        }
+        BAR_HEIGHT + 24.0 + total.min(MAX_LIST_HEIGHT)
     }
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Transparent window; the panel paints its own rounded background.
+        egui::Rgba::TRANSPARENT.to_array()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Register native controls on the first UI frame, after eframe has entered
         // the Win32 event loop required by the global-hotkey backend.
@@ -389,90 +435,149 @@ impl eframe::App for App {
             }
         }
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(background_color(self.config.theme)).inner_margin(egui::Margin::same(18.0)))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Image::new((self.brand.id(), Vec2::splat(40.0))));
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("Okra Brown Search").size(19.0).strong().color(text_color(self.config.theme)));
-                        ui.label(RichText::new("Find anything on this PC").small().color(muted_color(self.config.theme)));
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Hide").clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                        }
-                        if ui.small_button("Settings").clicked() {
-                            self.settings_open = true;
-                        }
-                    });
-                });
+        let pal = palette(self.config.theme);
+        let height = self.desired_height();
+        if (height - self.last_height).abs() > 0.5 {
+            self.last_height = height;
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(WINDOW_WIDTH, height)));
+        }
 
-                ui.add_space(16.0);
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(pal.bg)
+                    .rounding(14.0_f32)
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
+            )
+            .show(ctx, |ui| {
                 if self.settings_open {
                     self.settings_ui(ui);
-                } else {
+                    return;
+                }
+
+                // Search row: magnifier (also the drag handle), borderless field, settings gear.
+                ui.horizontal(|ui| {
+                    ui.set_min_height(46.0);
+                    let (icon_rect, icon_response) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::drag());
+                    if icon_response.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                    paint_magnifier(ui, icon_rect.center(), pal.muted);
+
+                    let field_width = (ui.available_width() - 36.0).max(100.0);
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut self.query)
-                            .hint_text("Search apps, files, settings, and open windows…")
-                            .desired_width(f32::INFINITY)
-                            .font(egui::TextStyle::Heading),
+                            .hint_text(RichText::new("Search").size(24.0).color(pal.muted))
+                            .font(FontId::proportional(24.0))
+                            .text_color(pal.text)
+                            .frame(false)
+                            .desired_width(field_width),
                     );
                     response.request_focus();
                     if response.changed() {
+                        self.status.clear();
                         self.search_again();
                     }
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("Prefixes: a apps  ·  f files  ·  s settings  ·  win windows")
-                        .small().color(muted_color(self.config.theme)));
-                    ui.add_space(5.0);
 
+                    if ui
+                        .add(egui::Button::new(RichText::new("\u{2699}").size(18.0).color(pal.muted)).frame(false))
+                        .on_hover_text("Settings")
+                        .clicked()
+                    {
+                        self.settings_open = true;
+                    }
+                });
+
+                let searching = !self.query.trim().is_empty();
+                if self.results.is_empty() {
+                    if searching {
+                        ui.separator();
+                        ui.add_space(10.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new("No Results").size(16.0).color(pal.muted));
+                        });
+                    }
+                } else {
+                    ui.separator();
                     let selected = self.selected;
                     let mut clicked = None;
-                    if self.results.is_empty() {
-                        ui.add_space(18.0);
-                        ui.label(RichText::new("No matching results").color(muted_color(self.config.theme)));
-                    }
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        let mut prev: Option<Kind> = None;
                         for (index, item) in self.results.iter().enumerate() {
-                            let fill = if index == selected { selected_color(self.config.theme) } else { panel_color(self.config.theme) };
-                            let row = egui::Frame::none()
-                                .fill(fill)
-                                .rounding(8.0)
-                                .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.label(RichText::new(&item.title).size(15.0).strong().color(text_color(self.config.theme)));
-                                    ui.label(RichText::new(format!("{}  ·  {}", item.kind.label(), item.subtitle))
-                                        .small().color(muted_color(self.config.theme)));
-                                });
-                            let response = ui.interact(row.response.rect, egui::Id::new(("result", index)), egui::Sense::click());
+                            let heading = if index == 0 {
+                                Some("Top Hit")
+                            } else if prev != Some(item.kind) {
+                                Some(kind_heading(item.kind))
+                            } else {
+                                None
+                            };
+                            prev = Some(item.kind);
+                            if let Some(heading) = heading {
+                                ui.add_space(if index == 0 { 2.0 } else { 8.0 });
+                                ui.label(RichText::new(heading).size(12.0).strong().color(pal.muted));
+                                ui.add_space(2.0);
+                            }
+
+                            let (rect, response) =
+                                ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::click());
+                            let is_selected = index == selected;
+                            if is_selected {
+                                ui.painter().rect_filled(rect, 8.0_f32, ACCENT);
+                            } else if response.hovered() {
+                                ui.painter().rect_filled(rect, 8.0_f32, pal.hover);
+                            }
+                            let (title_color, sub_color) = if is_selected {
+                                (Color32::WHITE, Color32::from_rgba_unmultiplied(255, 255, 255, 190))
+                            } else {
+                                (pal.text, pal.muted)
+                            };
+
+                            let tile = egui::Rect::from_min_size(
+                                Pos2::new(rect.left() + 8.0, rect.center().y - 17.0),
+                                Vec2::splat(34.0),
+                            );
+                            ui.painter().rect_filled(tile, 8.0_f32, kind_color(item.kind));
+                            let letter = item.title.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+                            ui.painter().text(
+                                tile.center(),
+                                Align2::CENTER_CENTER,
+                                letter,
+                                FontId::proportional(17.0),
+                                Color32::WHITE,
+                            );
+
+                            let text_x = tile.right() + 12.0;
+                            let text_painter = ui.painter().with_clip_rect(rect.shrink2(Vec2::new(4.0, 0.0)));
+                            let subtitle = if item.subtitle.is_empty() { item.kind.label().to_string() } else { shorten(&item.subtitle, 74) };
+                            text_painter.text(
+                                Pos2::new(text_x, rect.center().y - 8.0),
+                                Align2::LEFT_CENTER,
+                                &item.title,
+                                FontId::proportional(15.5),
+                                title_color,
+                            );
+                            text_painter.text(
+                                Pos2::new(text_x, rect.center().y + 10.0),
+                                Align2::LEFT_CENTER,
+                                subtitle,
+                                FontId::proportional(12.0),
+                                sub_color,
+                            );
+
                             if response.clicked() {
                                 clicked = Some(index);
                             }
-                            if moved && index == selected {
-                                ui.scroll_to_rect(row.response.rect, None);
+                            if moved && is_selected {
+                                ui.scroll_to_rect(rect, None);
                             }
-                            ui.add_space(5.0);
+                            ui.add_space(2.0);
                         }
                     });
                     if let Some(index) = clicked {
                         activate = Some(index);
                     }
                 }
-
-                if !self.status.is_empty() {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(&self.status).small().color(muted_color(self.config.theme)));
-                }
-                ui.add_space(6.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Ctrl + Alt + Space  ·  Open launcher").small().color(muted_color(self.config.theme)));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new("Esc  ·  Hide").small().color(muted_color(self.config.theme)));
-                    });
-                });
             });
 
         if let Some(index) = activate {
@@ -482,45 +587,95 @@ impl eframe::App for App {
 }
 
 fn apply_theme(ctx: &egui::Context, theme: ThemeKind) {
+    let pal = palette(theme);
     let mut visuals = match theme {
         ThemeKind::WarmLight => egui::Visuals::light(),
         ThemeKind::Dark => egui::Visuals::dark(),
     };
     visuals.window_rounding = 12.0.into();
-    visuals.panel_fill = background_color(theme);
-    visuals.window_fill = panel_color(theme);
-    visuals.widgets.noninteractive.bg_fill = panel_color(theme);
-    visuals.selection.bg_fill = selected_color(theme);
-    visuals.selection.stroke = Stroke::new(1.0_f32, GREEN);
+    visuals.panel_fill = pal.bg;
+    visuals.window_fill = pal.bg;
+    visuals.override_text_color = Some(pal.text);
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, pal.sep);
+    visuals.widgets.noninteractive.bg_fill = pal.bg;
+    visuals.selection.bg_fill = ACCENT.linear_multiply(0.45);
+    visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
     ctx.set_visuals(visuals);
+    ctx.style_mut(|style| {
+        style.spacing.item_spacing = Vec2::new(8.0, 4.0);
+    });
 }
 
-fn background_color(theme: ThemeKind) -> Color32 {
-    match theme { ThemeKind::WarmLight => BG_LIGHT, ThemeKind::Dark => BG_DARK }
-}
-fn panel_color(theme: ThemeKind) -> Color32 {
-    match theme { ThemeKind::WarmLight => PANEL_LIGHT, ThemeKind::Dark => PANEL_DARK }
-}
-fn text_color(theme: ThemeKind) -> Color32 {
-    match theme { ThemeKind::WarmLight => TEXT_LIGHT, ThemeKind::Dark => TEXT_DARK }
-}
-fn muted_color(theme: ThemeKind) -> Color32 {
-    match theme { ThemeKind::WarmLight => MUTED_LIGHT, ThemeKind::Dark => MUTED_DARK }
-}
-fn selected_color(theme: ThemeKind) -> Color32 {
+fn palette(theme: ThemeKind) -> Palette {
     match theme {
-        ThemeKind::WarmLight => Color32::from_rgb(222, 231, 202),
-        ThemeKind::Dark => Color32::from_rgb(70, 83, 53),
+        ThemeKind::WarmLight => Palette {
+            bg: Color32::from_rgb(246, 246, 248),
+            border: Color32::from_rgb(214, 214, 219),
+            text: Color32::from_rgb(28, 28, 30),
+            muted: Color32::from_rgb(120, 120, 128),
+            sep: Color32::from_rgb(223, 223, 228),
+            hover: Color32::from_rgb(232, 232, 237),
+        },
+        ThemeKind::Dark => Palette {
+            bg: Color32::from_rgb(38, 38, 41),
+            border: Color32::from_rgb(70, 70, 75),
+            text: Color32::from_rgb(245, 245, 247),
+            muted: Color32::from_rgb(152, 152, 158),
+            sep: Color32::from_rgb(62, 62, 66),
+            hover: Color32::from_rgb(54, 54, 58),
+        },
     }
 }
 
-fn load_brand_texture(ctx: &egui::Context) -> egui::TextureHandle {
-    let rgba = image::load_from_memory(include_bytes!("../../../assets/okra-mark.png"))
-        .expect("bundled logo is a valid PNG")
-        .into_rgba8();
-    let size = [rgba.width() as usize, rgba.height() as usize];
-    let image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-    ctx.load_texture("okra-brand", image, egui::TextureOptions::LINEAR)
+fn kind_heading(kind: Kind) -> &'static str {
+    match kind {
+        Kind::App => "Applications",
+        Kind::File => "Documents",
+        Kind::Folder => "Folders",
+        Kind::Setting => "System Settings",
+        Kind::Window => "Open Windows",
+    }
+}
+
+fn kind_color(kind: Kind) -> Color32 {
+    match kind {
+        Kind::App => Color32::from_rgb(88, 86, 214),
+        Kind::File => Color32::from_rgb(142, 142, 147),
+        Kind::Folder => Color32::from_rgb(50, 173, 230),
+        Kind::Setting => Color32::from_rgb(99, 99, 102),
+        Kind::Window => Color32::from_rgb(52, 199, 89),
+    }
+}
+
+/// Keeps the tail of long paths, which is the informative part.
+fn shorten(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let tail: String = text.chars().skip(count - (max_chars - 1)).collect();
+    format!("\u{2026}{tail}")
+}
+
+fn paint_magnifier(ui: &egui::Ui, center: Pos2, color: Color32) {
+    let painter = ui.painter();
+    painter.circle_stroke(center + Vec2::new(-2.0, -2.0), 7.5, Stroke::new(2.2_f32, color));
+    painter.line_segment(
+        [center + Vec2::new(3.5, 3.5), center + Vec2::new(9.5, 9.5)],
+        Stroke::new(2.4_f32, color),
+    );
+}
+
+/// Segoe UI is what Windows itself uses; it looks far less "toolkit" than egui's bundled font.
+#[cfg(windows)]
+fn load_system_font(ctx: &egui::Context) {
+    let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") else { return };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("segoe-ui".to_owned(), egui::FontData::from_owned(bytes));
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        family.insert(0, "segoe-ui".to_owned());
+    }
+    ctx.set_fonts(fonts);
 }
 
 #[cfg(windows)]
@@ -593,9 +748,10 @@ fn main() -> eframe::Result<()> {
     let engine = Arc::new(Engine::new(&config));
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Okra Brown Search")
-        .with_inner_size([760.0, 560.0])
-        .with_min_inner_size([560.0, 390.0])
+        .with_inner_size([WINDOW_WIDTH, BAR_HEIGHT])
         .with_decorations(false)
+        .with_transparent(true)
+        .with_resizable(false)
         .with_always_on_top()
         .with_visible(true);
 
@@ -605,7 +761,7 @@ fn main() -> eframe::Result<()> {
         viewport = viewport.with_icon(Arc::new(egui::IconData { rgba: rgba.into_raw(), width, height }));
     }
 
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    let options = eframe::NativeOptions { viewport, centered: true, ..Default::default() };
     eframe::run_native(
         "Okra Brown Search",
         options,

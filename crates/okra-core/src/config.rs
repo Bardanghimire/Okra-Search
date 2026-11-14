@@ -34,7 +34,7 @@ pub enum ThemeKind {
 impl ThemeKind {
     pub fn label(self) -> &'static str {
         match self {
-            Self::WarmLight => "Warm light",
+            Self::WarmLight => "Light",
             Self::Dark => "Dark",
         }
     }
