@@ -209,6 +209,15 @@ fn clean_exec(s: &str) -> String {
         .replace("%%", "%")
 }
 
+/// Start Menu folders also hold uninstallers, readmes and license links that are never what
+/// someone searching for an application wants.
+fn is_start_menu_noise(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    ["uninstall", "readme", "read me", "release notes", "license", "licence", "changelog"]
+        .iter()
+        .any(|word| lower.contains(word))
+}
+
 fn scan_windows(out: &mut Vec<AppEntry>) {
     let rel = Path::new("Microsoft").join("Windows").join("Start Menu").join("Programs");
     for var in ["ProgramData", "APPDATA"] {
@@ -217,7 +226,7 @@ fn scan_windows(out: &mut Vec<AppEntry>) {
             let p = e.path();
             let is_lnk = p.extension().and_then(|x| x.to_str()).map_or(false, |x| x.eq_ignore_ascii_case("lnk"));
             let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-            if is_lnk && !stem.to_lowercase().contains("uninstall") {
+            if is_lnk && !is_start_menu_noise(&stem) {
                 out.push(AppEntry { name: stem, target: AppTarget::Shortcut { path: p.to_path_buf(), exec: None } });
             }
         }

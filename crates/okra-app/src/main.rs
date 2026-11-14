@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use eframe::egui::{self, Align2, Color32, FontId, Key, Modifiers, Pos2, RichText, Sense, Stroke, Vec2};
+use okra_core::matcher::{fuzzy_with, Query};
 use okra_core::{Config, Engine, FileBackendKind, Item, Kind, Outcome, ThemeKind};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -44,6 +45,8 @@ struct App {
     start_hidden: bool,
     resident_initialized: bool,
     last_height: f32,
+    /// True once the window has actually been focused; losing focus after that hides it.
+    had_focus: bool,
     #[cfg(windows)]
     _resident: Option<ResidentControls>,
 }
@@ -220,9 +223,11 @@ impl App {
             start_hidden,
             resident_initialized: false,
             last_height: 0.0,
+            had_focus: false,
             #[cfg(windows)]
             _resident: None,
         };
+        app.results = app.engine.search("");
         app.search_again();
         app
     }
@@ -235,20 +240,30 @@ impl App {
     fn show(&mut self, ctx: &egui::Context) {
         self.settings_open = false;
         self.query.clear();
+        self.status.clear();
+        self.had_focus = false;
+        // Suggestions are cheap, so fill them in before the first frame instead of flashing stale results.
+        self.results = self.engine.search("");
+        self.selected = 0;
         self.search_again();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         ctx.request_repaint();
     }
 
+    fn hide(&mut self, ctx: &egui::Context) {
+        self.had_focus = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
     fn activate(&mut self, ctx: &egui::Context, idx: usize) {
         let Some(item) = self.results.get(idx).cloned() else { return };
-        match self.engine.activate(&item) {
+        match self.engine.activate_for(&item, &self.query) {
             Ok(Outcome::CopyText(text)) => {
                 ctx.output_mut(|output| output.copied_text = text);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.hide(ctx);
             }
-            Ok(Outcome::Done) => ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false)),
+            Ok(Outcome::Done) => self.hide(ctx),
             Err(error) => self.status = error,
         }
     }
@@ -345,8 +360,9 @@ impl App {
         if self.settings_open {
             return SETTINGS_HEIGHT;
         }
+        let status = if self.status.is_empty() { 0.0 } else { 22.0 };
         if self.results.is_empty() {
-            return if self.query.trim().is_empty() { BAR_HEIGHT } else { BAR_HEIGHT + 64.0 };
+            return if self.query.trim().is_empty() { BAR_HEIGHT + status } else { BAR_HEIGHT + 64.0 + status };
         }
         let mut total = 0.0;
         let mut prev: Option<Kind> = None;
@@ -357,7 +373,7 @@ impl App {
             }
             prev = Some(item.kind);
         }
-        BAR_HEIGHT + 24.0 + total.min(MAX_LIST_HEIGHT)
+        BAR_HEIGHT + 24.0 + status + total.min(MAX_LIST_HEIGHT)
     }
 }
 
@@ -404,6 +420,14 @@ impl eframe::App for App {
             self.search_again();
         }
 
+        // Click anywhere outside (or switch away) and the launcher goes away, like Spotlight.
+        let focused = ctx.input(|input| input.viewport().focused).unwrap_or(false);
+        if focused {
+            self.had_focus = true;
+        } else if self.had_focus {
+            self.hide(ctx);
+        }
+
         let (down, up, enter, escape) = ctx.input_mut(|input| {
             (
                 input.consume_key(Modifiers::NONE, Key::ArrowDown),
@@ -431,7 +455,7 @@ impl eframe::App for App {
             if self.settings_open {
                 self.settings_open = false;
             } else {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.hide(ctx);
             }
         }
 
@@ -489,7 +513,12 @@ impl eframe::App for App {
                     }
                 });
 
+                if !self.status.is_empty() {
+                    ui.label(RichText::new(&self.status).size(12.0).color(pal.muted));
+                }
                 let searching = !self.query.trim().is_empty();
+                let highlight = Query::new(strip_route_prefix(&self.query));
+                let suggestions = !searching;
                 if self.results.is_empty() {
                     if searching {
                         ui.separator();
@@ -506,7 +535,7 @@ impl eframe::App for App {
                         let mut prev: Option<Kind> = None;
                         for (index, item) in self.results.iter().enumerate() {
                             let heading = if index == 0 {
-                                Some("Top Hit")
+                                Some(if suggestions { "Suggestions" } else { "Top Hit" })
                             } else if prev != Some(item.kind) {
                                 Some(kind_heading(item.kind))
                             } else {
@@ -537,7 +566,7 @@ impl eframe::App for App {
                                 Pos2::new(rect.left() + 8.0, rect.center().y - 17.0),
                                 Vec2::splat(34.0),
                             );
-                            ui.painter().rect_filled(tile, 8.0_f32, kind_color(item.kind));
+                            ui.painter().rect_filled(tile, 8.0_f32, tile_color(item));
                             let letter = item.title.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
                             ui.painter().text(
                                 tile.center(),
@@ -550,12 +579,19 @@ impl eframe::App for App {
                             let text_x = tile.right() + 12.0;
                             let text_painter = ui.painter().with_clip_rect(rect.shrink2(Vec2::new(4.0, 0.0)));
                             let subtitle = if item.subtitle.is_empty() { item.kind.label().to_string() } else { shorten(&item.subtitle, 74) };
-                            text_painter.text(
-                                Pos2::new(text_x, rect.center().y - 8.0),
-                                Align2::LEFT_CENTER,
-                                &item.title,
-                                FontId::proportional(15.5),
-                                title_color,
+                            let matched: Vec<usize> = if highlight.is_empty() || item.kind == Kind::Calculation {
+                                Vec::new()
+                            } else {
+                                fuzzy_with(&highlight, &item.title).map(|m| m.indices).unwrap_or_default()
+                            };
+                            let title_rect = egui::Rect::from_min_max(
+                                Pos2::new(text_x, rect.center().y - 18.0),
+                                Pos2::new(rect.right() - 12.0, rect.center().y + 2.0),
+                            );
+                            let mut title_ui = ui.child_ui(title_rect, egui::Layout::left_to_right(egui::Align::Center));
+                            title_ui.add(
+                                egui::Label::new(title_job(&item.title, &matched, title_color, is_selected, item.kind == Kind::Calculation))
+                                    .truncate(true),
                             );
                             text_painter.text(
                                 Pos2::new(text_x, rect.center().y + 10.0),
@@ -603,6 +639,7 @@ fn apply_theme(ctx: &egui::Context, theme: ThemeKind) {
     ctx.set_visuals(visuals);
     ctx.style_mut(|style| {
         style.spacing.item_spacing = Vec2::new(8.0, 4.0);
+        style.interaction.selectable_labels = false;
     });
 }
 
@@ -634,17 +671,63 @@ fn kind_heading(kind: Kind) -> &'static str {
         Kind::Folder => "Folders",
         Kind::Setting => "System Settings",
         Kind::Window => "Open Windows",
+        Kind::Calculation => "Calculator",
     }
 }
 
-fn kind_color(kind: Kind) -> Color32 {
-    match kind {
-        Kind::App => Color32::from_rgb(88, 86, 214),
-        Kind::File => Color32::from_rgb(142, 142, 147),
-        Kind::Folder => Color32::from_rgb(50, 173, 230),
-        Kind::Setting => Color32::from_rgb(99, 99, 102),
-        Kind::Window => Color32::from_rgb(52, 199, 89),
+/// Apps get a stable per-name colour so the list reads as distinct icons rather than a grey wall.
+fn tile_color(item: &Item) -> Color32 {
+    const APP_COLORS: [(u8, u8, u8); 8] = [
+        (88, 86, 214),
+        (255, 149, 0),
+        (52, 199, 89),
+        (255, 69, 58),
+        (50, 173, 230),
+        (175, 82, 222),
+        (255, 55, 95),
+        (48, 176, 199),
+    ];
+    let (r, g, b) = match item.kind {
+        Kind::App => {
+            let hash = item.title.bytes().fold(5381u32, |acc, byte| acc.wrapping_mul(33).wrapping_add(byte as u32));
+            APP_COLORS[hash as usize % APP_COLORS.len()]
+        }
+        Kind::File => (142, 142, 147),
+        Kind::Folder => (50, 173, 230),
+        Kind::Setting => (99, 99, 102),
+        Kind::Window => (52, 199, 89),
+        Kind::Calculation => (255, 149, 0),
+    };
+    Color32::from_rgb(r, g, b)
+}
+
+/// The text after a provider prefix such as `f ` or `win `, which is what is actually matched.
+fn strip_route_prefix(query: &str) -> &str {
+    let query = query.trim_start();
+    for prefix in ["win ", "a ", "f ", "s "] {
+        if let Some(rest) = query.strip_prefix(prefix) {
+            return rest.trim();
+        }
     }
+    query.trim()
+}
+
+/// Title text with the matched letters emphasised.
+fn title_job(title: &str, matched: &[usize], color: Color32, selected: bool, large: bool) -> egui::text::LayoutJob {
+    let size = if large { 20.0 } else { 15.5 };
+    let plain = egui::TextFormat { font_id: FontId::proportional(size), color, ..Default::default() };
+    let mut emphasised = plain.clone();
+    if selected {
+        emphasised.underline = Stroke::new(1.0_f32, color);
+    } else {
+        emphasised.color = ACCENT;
+    }
+    let mut job = egui::text::LayoutJob::default();
+    for (index, ch) in title.chars().enumerate() {
+        let format = if matched.contains(&index) { emphasised.clone() } else { plain.clone() };
+        job.append(&ch.to_string(), 0.0, format);
+    }
+    job
 }
 
 /// Keeps the tail of long paths, which is the informative part.
@@ -751,7 +834,8 @@ fn main() -> eframe::Result<()> {
         .with_inner_size([WINDOW_WIDTH, BAR_HEIGHT])
         .with_decorations(false)
         .with_transparent(true)
-        .with_resizable(false)
+        .with_min_inner_size([WINDOW_WIDTH, BAR_HEIGHT])
+        .with_max_inner_size([WINDOW_WIDTH, 800.0])
         .with_always_on_top()
         .with_visible(true);
 

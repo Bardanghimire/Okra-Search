@@ -2,10 +2,11 @@ use crate::config::Config;
 use crate::history::History;
 use crate::providers::{
     apps::{AppsProvider, RefreshCallback},
+    calc::CalcProvider,
     files::FilesProvider,
     settings::SettingsProvider,
     windows::WindowsProvider,
-    Action, Item, Provider,
+    Action, Item, Kind, Provider,
 };
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
@@ -34,6 +35,7 @@ impl Engine {
         // and is refreshed on a background thread (see `set_on_index_refresh`).
         let on_index_refresh: Arc<OnceLock<RefreshCallback>> = Arc::new(OnceLock::new());
         let providers: Vec<Box<dyn Provider>> = vec![
+            Box::new(CalcProvider),
             Box::new(AppsProvider::start(on_index_refresh.clone())),
             Box::new(FilesProvider::new(cfg)),
             Box::new(SettingsProvider),
@@ -66,13 +68,27 @@ impl Engine {
         (self.providers.iter().filter(|p| p.in_default()).map(|p| p.as_ref()).collect(), raw.trim())
     }
 
+    /// Applications first: someone typing "chr" wants Chrome, not `chrome_installer.log`.
+    fn kind_bias(kind: Kind) -> i64 {
+        match kind {
+            Kind::Calculation => 0,
+            Kind::App => 70,
+            Kind::Window => 40,
+            Kind::Setting => 10,
+            Kind::Folder | Kind::File => 0,
+        }
+    }
+
     pub fn search(&self, raw: &str) -> Vec<Item> {
+        if raw.trim().is_empty() {
+            return self.suggestions();
+        }
         let (providers, query) = self.route(raw.trim_start());
         let mut items: Vec<Item> = providers.iter().flat_map(|p| p.query(query, self.max_results)).collect();
         {
             let history = self.history.lock().unwrap();
             for item in &mut items {
-                item.score += history.boost(&item.id);
+                item.score += Self::kind_bias(item.kind) + history.boost_for_query(&item.id, raw);
             }
         }
         items.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
@@ -82,7 +98,53 @@ impl Engine {
         items
     }
 
+    /// What to show before anything is typed: the apps used most and most recently, topped up
+    /// with a few well-known ones so a fresh install is never an empty box.
+    fn suggestions(&self) -> Vec<Item> {
+        const COUNT: usize = 7;
+        const DEFAULTS: [&str; 10] = [
+            "File Explorer",
+            "Google Chrome",
+            "Microsoft Edge",
+            "Firefox",
+            "Visual Studio Code",
+            "Notepad",
+            "Calculator",
+            "Terminal",
+            "Settings",
+            "Task Manager",
+        ];
+        let mut apps: Vec<Item> = self
+            .providers
+            .iter()
+            .filter(|p| p.name() == "Applications")
+            .flat_map(|p| p.query("", usize::MAX))
+            .collect();
+        {
+            let history = self.history.lock().unwrap();
+            for item in &mut apps {
+                item.score = history.boost(&item.id);
+            }
+        }
+        apps.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
+        let mut out: Vec<Item> = apps.iter().filter(|item| item.score > 0).take(COUNT).cloned().collect();
+        for wanted in DEFAULTS {
+            if out.len() >= COUNT {
+                break;
+            }
+            if let Some(item) = apps.iter().find(|item| item.score <= 0 && item.title.eq_ignore_ascii_case(wanted)) {
+                out.push(item.clone());
+            }
+        }
+        out
+    }
+
     pub fn activate(&self, item: &Item) -> Result<Outcome, String> {
+        self.activate_for(item, "")
+    }
+
+    /// Like [`activate`], remembering which `query` led to this pick so it ranks higher next time.
+    pub fn activate_for(&self, item: &Item, query: &str) -> Result<Outcome, String> {
         match &item.action {
             Action::Launch { path, exec } => {
                 if let Some(command) = exec {
@@ -136,14 +198,14 @@ impl Engine {
                 open::that_detached(uri).map_err(|e| format!("Could not open {uri}: {e}"))?;
             }
             Action::Copy(text) => {
-                self.history.lock().unwrap().record(&item.id);
+                self.history.lock().unwrap().record(&item.id, query);
                 return Ok(Outcome::CopyText(text.clone()));
             }
             Action::FocusWindow(hwnd) => {
                 crate::providers::windows::WindowsProvider::focus(*hwnd)?;
             }
         }
-        self.history.lock().unwrap().record(&item.id);
+        self.history.lock().unwrap().record(&item.id, query);
         Ok(Outcome::Done)
     }
 }

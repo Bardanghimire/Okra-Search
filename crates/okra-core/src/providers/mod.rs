@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 pub mod apps;
+pub mod calc;
 pub mod everything;
 pub mod files;
 pub mod settings;
@@ -13,6 +14,7 @@ pub enum Kind {
     Folder,
     Setting,
     Window,
+    Calculation,
 }
 
 impl Kind {
@@ -23,6 +25,7 @@ impl Kind {
             Kind::Folder => "Folder",
             Kind::Setting => "Windows setting",
             Kind::Window => "Open window",
+            Kind::Calculation => "Calculation",
         }
     }
 }
