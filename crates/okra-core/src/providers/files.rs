@@ -2,7 +2,7 @@ use super::everything::{EsCli, EverythingSdk};
 use super::{Action, Item, Kind, Provider};
 use crate::config::{Config, FileBackendKind};
 use crate::matcher::{char_mask, is_subsequence, lc, score, score_with_lower, Query};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use walkdir::WalkDir;
 
@@ -63,32 +63,128 @@ fn skip(name: &str) -> bool {
         || matches!(name, "node_modules" | "target" | "__pycache__" | "$RECYCLE.BIN" | "AppData" | "Library")
 }
 
+/// Walks `roots` and hands the entries found to `sink` in batches (the sink drains each batch).
+fn scan(roots: &[PathBuf], max_depth: usize, sink: &mut dyn FnMut(&mut Vec<FileEntry>)) {
+    for root in roots {
+        let mut batch: Vec<FileEntry> = Vec::with_capacity(4096);
+        let walker = WalkDir::new(root)
+            .max_depth(max_depth)
+            .into_iter()
+            .filter_entry(|e| e.depth() == 0 || !skip(&e.file_name().to_string_lossy()));
+        for e in walker.flatten() {
+            if e.depth() == 0 {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            batch.push(FileEntry {
+                lower: name.chars().map(lc).collect(),
+                name,
+                path: e.path().to_path_buf(),
+                is_dir: e.file_type().is_dir(),
+            });
+            if batch.len() >= 4096 {
+                sink(&mut batch);
+            }
+        }
+        sink(&mut batch);
+    }
+}
+
+// The index is saved between runs, so the launcher can search the moment it starts instead of
+// waiting for a full scan. The file is plain text: a header line, then `F<TAB>path` or `D<TAB>path`.
+const CACHE_MAGIC: &str = "okra-index-v1";
+/// How long the resident app waits before scanning again to pick up new and deleted files.
+const RESCAN_EVERY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+fn cache_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("okra-brown-search").join("file-index.tsv"))
+}
+
+/// Identifies what the cache was built from; a cache for other folders or another depth is ignored.
+fn cache_header(roots: &[PathBuf], max_depth: usize) -> String {
+    let roots: Vec<String> = roots.iter().map(|r| r.to_string_lossy().into_owned()).collect();
+    format!("{CACHE_MAGIC}\t{max_depth}\t{}", roots.join("|"))
+}
+
+fn serialize_index(data: &IndexData, roots: &[PathBuf], max_depth: usize) -> String {
+    let mut text = cache_header(roots, max_depth);
+    text.push('\n');
+    for entry in &data.entries {
+        // Names that could not survive a text line are simply left out of the cache.
+        let Some(path) = entry.path.to_str() else { continue };
+        if path.contains(['\t', '\n', '\r']) {
+            continue;
+        }
+        text.push(if entry.is_dir { 'D' } else { 'F' });
+        text.push('\t');
+        text.push_str(path);
+        text.push('\n');
+    }
+    text
+}
+
+/// `None` when the text is not a cache for exactly these roots and depth, or is damaged.
+fn parse_index(text: &str, roots: &[PathBuf], max_depth: usize) -> Option<IndexData> {
+    let mut lines = text.lines();
+    if lines.next()? != cache_header(roots, max_depth) {
+        return None;
+    }
+    let mut entries: Vec<FileEntry> = Vec::new();
+    for line in lines {
+        let (flag, path) = line.split_once('\t')?;
+        let path = PathBuf::from(path);
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+        entries.push(FileEntry { lower: name.chars().map(lc).collect(), name, path, is_dir: flag == "D" });
+    }
+    let mut data = IndexData::default();
+    data.extend(entries);
+    Some(data)
+}
+
+/// Writes next to the real file and renames, so a crash never leaves half a cache behind.
+fn write_cache(path: &Path, text: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let temp = path.with_extension("tmp");
+    if std::fs::write(&temp, text).is_ok() {
+        let _ = std::fs::rename(&temp, path);
+    }
+}
+
 fn build_index(roots: Vec<PathBuf>, max_depth: usize) -> Index {
     let index: Index = Arc::new(RwLock::new(IndexData::default()));
-    let i2 = index.clone();
+    let shared = index.clone();
     std::thread::spawn(move || {
-        for root in roots {
-            let mut batch: Vec<FileEntry> = Vec::with_capacity(4096);
-            let walker = WalkDir::new(&root)
-                .max_depth(max_depth)
-                .into_iter()
-                .filter_entry(|e| e.depth() == 0 || !skip(&e.file_name().to_string_lossy()));
-            for e in walker.flatten() {
-                if e.depth() == 0 {
-                    continue;
-                }
-                let name = e.file_name().to_string_lossy().to_string();
-                batch.push(FileEntry {
-                    lower: name.chars().map(lc).collect(),
-                    name,
-                    path: e.path().to_path_buf(),
-                    is_dir: e.file_type().is_dir(),
-                });
-                if batch.len() >= 4096 {
-                    i2.write().unwrap().extend(batch.drain(..));
-                }
+        let cache_file = cache_path();
+        // A saved index answers searches right away; the scan below then replaces it.
+        let mut warm = false;
+        if let Some(path) = &cache_file {
+            if let Some(data) = std::fs::read_to_string(path).ok().and_then(|text| parse_index(&text, &roots, max_depth)) {
+                *shared.write().unwrap() = data;
+                warm = true;
             }
-            i2.write().unwrap().extend(batch.drain(..));
+        }
+        loop {
+            let mut fresh = IndexData::default();
+            scan(&roots, max_depth, &mut |batch: &mut Vec<FileEntry>| {
+                if warm {
+                    // Keep serving the old index until the new one is complete.
+                    fresh.extend(batch.drain(..));
+                } else {
+                    // First ever scan: results become searchable as they are found.
+                    shared.write().unwrap().extend(batch.drain(..));
+                }
+            });
+            if warm {
+                *shared.write().unwrap() = fresh;
+            }
+            warm = true;
+            if let Some(path) = &cache_file {
+                let text = serialize_index(&shared.read().unwrap(), &roots, max_depth);
+                write_cache(path, &text);
+            }
+            std::thread::sleep(RESCAN_EVERY);
         }
     });
     index
@@ -287,6 +383,33 @@ mod tests {
         data.extend(entries);
         let _ = b.index.set(Arc::new(RwLock::new(data)));
         b
+    }
+
+    #[test]
+    fn saved_index_round_trips_and_rejects_other_settings() {
+        let dir = std::env::temp_dir().join(format!("okra-index-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        std::fs::write(dir.join("sub").join("b.txt"), "y").unwrap();
+
+        let roots = vec![dir.clone()];
+        let mut scanned = IndexData::default();
+        scan(&roots, 8, &mut |batch: &mut Vec<FileEntry>| scanned.extend(batch.drain(..)));
+        assert_eq!(scanned.entries.len(), 3); // a.txt, sub, sub/b.txt
+
+        let text = serialize_index(&scanned, &roots, 8);
+        let loaded = parse_index(&text, &roots, 8).unwrap();
+        assert_eq!(loaded.entries.len(), 3);
+        assert_eq!(loaded.masks.len(), 3);
+        assert!(loaded.entries.iter().any(|e| e.name == "b.txt" && !e.is_dir));
+        assert!(loaded.entries.iter().any(|e| e.name == "sub" && e.is_dir));
+
+        assert!(parse_index(&text, &roots, 3).is_none()); // other depth
+        assert!(parse_index(&text, &[PathBuf::from("elsewhere")], 8).is_none()); // other folders
+        assert!(parse_index("garbage", &roots, 8).is_none());
+        let damaged = format!("{}\nno tab on this line\n", cache_header(&roots, 8));
+        assert!(parse_index(&damaged, &roots, 8).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `cargo test --release -p okra-core -- --ignored --nocapture bench_builtin`
