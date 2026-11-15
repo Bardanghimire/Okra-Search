@@ -13,6 +13,7 @@ A minimal desktop search launcher written in Rust, focused on Windows. It search
 - **Ranking:** fuzzy matching, prefix/word-boundary weighting, and a small local usage-history boost.
 - **Resident launcher:** Ctrl + Alt + Space opens the search window and pressing it again closes it; Escape or a click elsewhere also hides it. The app remains in the notification area until Exit is selected from the tray menu. It can optionally launch hidden when you sign in to Windows (the window is never shown in that case, so there is no flash), and a single-instance guard prevents duplicate copies.
 - **Quick open:** the first nine results show `Ctrl+1` ... `Ctrl+9`; pressing one opens that result without the arrow keys.
+- **Preview pane:** the window is split like macOS Spotlight: results on the left, details of the selected result on the right. Files and folders show their icon, type, size (or item count), modified and created dates and location; PNG, JPEG, GIF and BMP images show a thumbnail and their pixel size; text files show their first lines; apps show where they live and how often you opened them; settings show what they open; calculator answers are shown large. File details are read on a worker thread, so moving through results never waits on the disk.
 - **Starts empty:** the launcher opens as just the search bar, centred on the screen where the mouse is, with no results until you type. The window itself keeps a fixed size so the bar never jumps while you type.
 - **Appearance:** warm-light and dark themes, a choice of the bundled Inter font or the system Segoe UI, plus a compact settings screen.
 - **Heads-up messages:** if the Ctrl + Alt + Space shortcut is already taken by another program, or Everything is missing so file search is slower, a short note shows in the bar for the first few opens.
@@ -106,6 +107,6 @@ This build includes the resident launcher and Windows top-level window switching
 ## Project layout
 
 - `crates/okra-core` — providers, Everything integration, fuzzy matching, settings catalog, activation, and usage history.
-- `crates/okra-app` — egui interface, resident global hotkey (toggle), tray menu, single-instance guard, startup integration, and settings UI. The window is found by process and title and cached, not looked up by title alone.
+- `crates/okra-app` — egui interface (`preview.rs` is the preview pane), resident global hotkey (toggle), tray menu, single-instance guard, startup integration, and settings UI. The window is found by process and title and cached, not looked up by title alone.
 - `assets` — logo and icons (window/app icon, `.ico`, in-app mark, tray icon).
 - `tools/make_icons.py` — regenerates every file in `assets` from one definition (`pip install pillow numpy`, then `python tools/make_icons.py`).

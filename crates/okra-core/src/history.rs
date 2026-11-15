@@ -80,6 +80,12 @@ impl History {
         frequency + recency
     }
 
+    /// How often an item was opened and when (unix seconds) it last was; None if never.
+    pub fn usage(&self, id: &str) -> Option<(u32, u64)> {
+        let count = *self.data.counts.get(id)?;
+        Some((count, self.data.last.get(id).copied().unwrap_or(0)))
+    }
+
     /// `boost` plus a bonus when this item was picked before for this query (or a prefix of it).
     pub fn boost_for_query(&self, id: &str, query: &str) -> i64 {
         self.for_query(query).boost(id)
