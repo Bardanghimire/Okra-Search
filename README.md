@@ -11,8 +11,11 @@ A minimal desktop search launcher written in Rust, focused on Windows. It search
 - **Windows Settings:** direct shortcuts to common `ms-settings:` pages plus useful administrative tools such as Task Manager, Device Manager, Disk Management, Services, and Event Viewer.
 - **Open windows:** enumerate visible top-level windows and bring the selected window to the foreground.
 - **Ranking:** fuzzy matching, prefix/word-boundary weighting, and a small local usage-history boost.
-- **Resident launcher:** Ctrl + Alt + Space opens the search window; Escape hides it. The app remains in the notification area until Exit is selected from the tray menu. It can optionally launch hidden when you sign in to Windows, and a single-instance guard prevents duplicate copies.
-- **Appearance:** warm-light and dark themes, plus a compact settings screen.
+- **Resident launcher:** Ctrl + Alt + Space opens the search window and pressing it again closes it; Escape or a click elsewhere also hides it. The app remains in the notification area until Exit is selected from the tray menu. It can optionally launch hidden when you sign in to Windows (the window is never shown in that case, so there is no flash), and a single-instance guard prevents duplicate copies.
+- **Quick open:** the first nine results show `Ctrl+1` ... `Ctrl+9`; pressing one opens that result without the arrow keys.
+- **Starts empty:** the launcher opens as just the search bar, centred on the screen where the mouse is, with no results until you type. The window itself keeps a fixed size so the bar never jumps while you type.
+- **Appearance:** warm-light and dark themes, a choice of the bundled Inter font or the system Segoe UI, plus a compact settings screen.
+- **Heads-up messages:** if the Ctrl + Alt + Space shortcut is already taken by another program, or Everything is missing so file search is slower, a short note shows in the bar for the first few opens.
 
 ## Search syntax
 
@@ -41,6 +44,7 @@ The file query is passed to Everything unchanged, so Everything operators are av
 - **Cheap ranking.** Usage history is resolved once per search (not once per result), so scoring hundreds of results allocates nothing. History is saved by a background thread with an atomic write-then-rename, so opening a result never waits on the disk.
 - **Draw once, not every frame.** Highlight ranges and shortened paths are computed on the search thread when results arrive; the UI only draws them.
 - **Real program icons, off the UI thread.** Results show each program's own icon (Start-menu shortcuts, Store apps, and per-type icons for files and folders), fetched from the shell by a worker thread, rows on screen first and cached for the session. Rows appear instantly with a coloured letter tile that is swapped for the icon as it arrives, so typing never waits on icons. Settings, open windows and calculator results keep the tile.
+- **Open windows are listed once per moment, not once per key.** The list of open windows is reused for under a second while you type.
 - **Closes when you click away.** On Windows the launcher asks the OS which window is in the foreground and is woken by a foreground-change hook, so there is no polling while it is open. If something misbehaves, set `OKRA_DEBUG=1` to log show/hide/focus events to `%TEMP%\okra-debug.log`.
 - **Everything is still the fast path.** When Everything is running, file queries are answered by its own index; the built-in index is only a fallback.
 
@@ -76,7 +80,7 @@ The default `auto` mode tries:
 2. `es.exe` on `PATH`, under the Everything installation folder, or the configured `es_exe` path. This is only probed when the DLL is not found, because both talk to the same running Everything instance.
 3. The built-in filename index over the configured `file_roots`.
 
-Configuration is stored in `%APPDATA%\okra-brown-search\config.json` (or the platform config directory for non-Windows builds). The Settings page also lets you select the backend, theme, maximum result count, and optional Windows sign-in startup. Enabling sign-in startup adds an `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` entry; disabling it removes that entry. Backend and result-count changes are applied on the next launch.
+Configuration is stored in `%APPDATA%\okra-brown-search\config.json` (or the platform config directory for non-Windows builds). The Settings page also lets you select the backend, theme, font, maximum result count, and optional Windows sign-in startup. Enabling sign-in startup adds an `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` entry; disabling it removes that entry. Backend and result-count changes are applied on the next launch.
 
 Example configuration:
 
@@ -89,6 +93,7 @@ Example configuration:
   "file_max_depth": 8,
   "max_results": 40,
   "theme": "warm_light",
+  "font": "inter",
   "start_with_windows": false
 }
 ```
@@ -100,6 +105,6 @@ This build includes the resident launcher and Windows top-level window switching
 ## Project layout
 
 - `crates/okra-core` — providers, Everything integration, fuzzy matching, settings catalog, activation, and usage history.
-- `crates/okra-app` — egui interface, resident global hotkey, tray menu, single-instance guard, startup integration, and settings UI.
+- `crates/okra-app` — egui interface, resident global hotkey (toggle), tray menu, single-instance guard, startup integration, and settings UI. The window is found by process and title and cached, not looked up by title alone.
 - `assets` — logo and icons (window/app icon, `.ico`, in-app mark, tray icon).
 - `tools/make_icons.py` — regenerates every file in `assets` from one definition (`pip install pillow numpy`, then `python tools/make_icons.py`).

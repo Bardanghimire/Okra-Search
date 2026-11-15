@@ -24,6 +24,8 @@ pub struct Engine {
     history: Mutex<History>,
     max_results: usize,
     on_index_refresh: Arc<OnceLock<RefreshCallback>>,
+    /// Something the user should know about from the start (for example: no Everything found).
+    notice: Option<String>,
 }
 
 impl Engine {
@@ -34,20 +36,28 @@ impl Engine {
         // Construction never blocks on slow discovery: the app list comes from an on-disk cache
         // and is refreshed on a background thread (see `set_on_index_refresh`).
         let on_index_refresh: Arc<OnceLock<RefreshCallback>> = Arc::new(OnceLock::new());
+        let files = FilesProvider::new(cfg);
+        let notice = files.startup_notice();
         let providers: Vec<Box<dyn Provider>> = vec![
             Box::new(CalcProvider),
             Box::new(AppsProvider::start(on_index_refresh.clone())),
-            Box::new(FilesProvider::new(cfg)),
+            Box::new(files),
             Box::new(SettingsProvider),
-            Box::new(WindowsProvider),
+            Box::new(WindowsProvider::default()),
         ];
         let mut engine = Self::with_providers(providers, History::load(), cfg.max_results);
         engine.on_index_refresh = on_index_refresh;
+        engine.notice = notice;
         engine
     }
 
+    /// A one-line heads-up decided at startup (None when everything is as expected).
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
     pub fn with_providers(providers: Vec<Box<dyn Provider>>, history: History, max_results: usize) -> Self {
-        Self { providers, history: Mutex::new(history), max_results, on_index_refresh: Arc::new(OnceLock::new()) }
+        Self { providers, history: Mutex::new(history), max_results, on_index_refresh: Arc::new(OnceLock::new()), notice: None }
     }
 
     /// Register a callback fired (from a background thread) whenever the application list has been

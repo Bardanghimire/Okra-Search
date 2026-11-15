@@ -8,6 +8,6 @@ pub mod history;
 pub mod matcher;
 pub mod providers;
 
-pub use config::{Config, FileBackendKind, ThemeKind};
+pub use config::{Config, FileBackendKind, FontKind, ThemeKind};
 pub use engine::{Engine, Outcome};
 pub use providers::{Action, Item, Kind, Provider};

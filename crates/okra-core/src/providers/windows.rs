@@ -1,7 +1,16 @@
 use super::{Action, Item, Kind, Provider};
 use crate::matcher::{score, Query};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-pub struct WindowsProvider;
+/// How long one window list is reused. Typing a query asks for the list on every keystroke, and
+/// the set of open windows does not change between two keystrokes.
+const WINDOW_LIST_TTL: Duration = Duration::from_millis(750);
+
+#[derive(Default)]
+pub struct WindowsProvider {
+    cache: Mutex<Option<(Instant, Vec<WindowEntry>)>>,
+}
 
 #[derive(Clone)]
 struct WindowEntry {
@@ -100,6 +109,20 @@ impl WindowsProvider {
     pub fn focus(hwnd: isize) -> Result<(), String> {
         native::focus(hwnd)
     }
+
+    /// The open windows, listed afresh at most once per [`WINDOW_LIST_TTL`]. A window that closed
+    /// in the meantime is caught by `focus`, which checks the handle before using it.
+    fn entries(&self) -> Vec<WindowEntry> {
+        let mut cache = self.cache.lock().unwrap();
+        if let Some((listed_at, list)) = cache.as_ref() {
+            if listed_at.elapsed() < WINDOW_LIST_TTL {
+                return list.clone();
+            }
+        }
+        let list = native::enumerate();
+        *cache = Some((Instant::now(), list.clone()));
+        list
+    }
 }
 
 impl Provider for WindowsProvider {
@@ -111,7 +134,8 @@ impl Provider for WindowsProvider {
     }
     fn query(&self, q: &str, limit: usize) -> Vec<Item> {
         let query = Query::new(q);
-        let mut items: Vec<Item> = native::enumerate()
+        let mut items: Vec<Item> = self
+            .entries()
             .into_iter()
             .filter_map(|window| {
                 let rank = if query.is_empty() { 0 } else { score(&query, &window.title)? + 25 };

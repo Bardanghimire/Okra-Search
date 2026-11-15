@@ -2,9 +2,9 @@
 
 use eframe::egui::{self, Align2, Color32, FontId, Key, Modifiers, Pos2, RichText, Sense, Stroke, Vec2};
 use okra_core::matcher::{fuzzy_with, Query};
-use okra_core::{Config, Engine, FileBackendKind, Item, Kind, Outcome, ThemeKind};
+use okra_core::{Config, Engine, FileBackendKind, FontKind, Item, Kind, Outcome, ThemeKind};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 mod icons;
@@ -16,6 +16,16 @@ const BAR_HEIGHT: f32 = 66.0;
 const ROW_HEIGHT: f32 = 48.0;
 const MAX_LIST_HEIGHT: f32 = 400.0;
 const SETTINGS_HEIGHT: f32 = 540.0;
+/// The title of the launcher window. The app finds its own window by process and this title.
+const WINDOW_TITLE: &str = "Okra Brown Search";
+
+/// True while the launcher is on screen. The hotkey handler (it runs outside the UI loop) reads
+/// this to decide whether the shortcut should open the launcher or close it.
+static LAUNCHER_OPEN: AtomicBool = AtomicBool::new(false);
+/// Set by the hotkey handler when the shortcut is pressed while the launcher is open.
+static HIDE_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Set once the first frame has registered the hotkey and tray icon.
+static RESIDENT_READY: AtomicBool = AtomicBool::new(false);
 /// The window never changes size: resizing it on every keystroke made the bar jump and flicker.
 /// It is always tall enough for the biggest list (or the settings page); the panel is painted
 /// only as tall as the content needs, and the rest of the window stays transparent.
@@ -73,6 +83,9 @@ struct App {
     #[cfg(windows)]
     foreground_hook: bool,
     start_hidden: bool,
+    /// Startup heads-ups (no Everything, hotkey taken...), shown in the bar for the first few opens.
+    notice: String,
+    notice_shows_left: u8,
     resident_initialized: bool,
     /// True once the window has actually been focused; losing focus after that hides it.
     had_focus: bool,
@@ -111,17 +124,26 @@ impl ResidentControls {
                         let flag = show_requested.clone();
                         GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
                             if event.id == hotkey_id && event.state == HotKeyState::Pressed {
-                                flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                                bring_to_front(true);
-context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                                context.send_viewport_cmd(egui::ViewportCommand::Focus);
-                                context.request_repaint();
+                                if LAUNCHER_OPEN.load(Ordering::SeqCst) {
+                                    // Already open: the shortcut closes it again, like a toggle.
+                                    HIDE_REQUESTED.store(true, Ordering::SeqCst);
+                                    context.request_repaint();
+                                } else {
+                                    LAUNCHER_OPEN.store(true, Ordering::SeqCst);
+                                    flag.store(true, Ordering::SeqCst);
+                                    bring_to_front(true);
+                                    context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                                    context.send_viewport_cmd(egui::ViewportCommand::Focus);
+                                    context.request_repaint();
+                                }
                             }
                         }));
                         Some(manager)
                     }
                     Err(error) => {
-                        messages.push(format!("Global hotkey unavailable: {error}"));
+                        // Usually another program already owns Ctrl+Alt+Space.
+                        debug_log(&format!("hotkey registration failed: {error}"));
+                        messages.push("Global hotkey unavailable (Ctrl+Alt+Space is taken): use the tray icon".to_string());
                         Some(manager)
                     }
                 }
@@ -203,8 +225,23 @@ context_for_tray.send_viewport_cmd(egui::ViewportCommand::Visible(true));
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, engine: Arc<Engine>, config: Config, start_hidden: bool) -> Self {
-        load_fonts(&cc.egui_ctx);
+        load_fonts(&cc.egui_ctx, config.font);
         apply_theme(&cc.egui_ctx, config.theme);
+
+        // The window starts hidden when launched with --background, which relies on the first
+        // frame running anyway (that is where the hotkey and tray get registered). If that frame
+        // never comes, show the window so a frame is forced and the app cannot stay dead.
+        if start_hidden {
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(2500));
+                if !RESIDENT_READY.load(Ordering::SeqCst) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.request_repaint();
+                }
+            });
+        }
+        let notice = engine.notice().map(str::to_owned).unwrap_or_default();
 
         // Search runs on a worker thread; rapid typing replaces stale queued queries. Results are
         // streamed: instant sources (apps, settings, windows, calculator) show up at once and the
@@ -264,6 +301,8 @@ impl App {
             #[cfg(windows)]
             foreground_hook: false,
             start_hidden,
+            notice,
+            notice_shows_left: 0,
             resident_initialized: false,
             had_focus: false,
             focus_retry_until: None,
@@ -304,8 +343,13 @@ impl App {
         self.settings_open = false;
         self.query.clear();
         self.status.clear();
+        if self.notice_shows_left > 0 {
+            self.notice_shows_left -= 1;
+            self.status = self.notice.clone();
+        }
         self.had_focus = false;
         self.reset_results();
+        LAUNCHER_OPEN.store(true, Ordering::SeqCst);
         debug_log("show");
         #[cfg(windows)]
         {
@@ -320,6 +364,7 @@ impl App {
 
     fn hide(&mut self, ctx: &egui::Context) {
         debug_log("hide");
+        LAUNCHER_OPEN.store(false, Ordering::SeqCst);
         #[cfg(windows)]
         foreground::watch(false);
         self.had_focus = false;
@@ -367,6 +412,18 @@ impl App {
                 apply_theme(ui.ctx(), self.config.theme);
             }
 
+            section(ui, "Font");
+            let mut font_changed = false;
+            egui::ComboBox::from_id_source("okra-font")
+                .selected_text(self.config.font.label())
+                .show_ui(ui, |ui| {
+                    font_changed |= ui.selectable_value(&mut self.config.font, FontKind::Inter, FontKind::Inter.label()).changed();
+                    font_changed |= ui.selectable_value(&mut self.config.font, FontKind::SegoeUi, FontKind::SegoeUi.label()).changed();
+                });
+            if font_changed {
+                load_fonts(ui.ctx(), self.config.font);
+            }
+
             section(ui, "File search");
             egui::ComboBox::from_id_source("okra-file-backend")
                 .selected_text(self.config.file_backend.label())
@@ -383,7 +440,7 @@ impl App {
             section(ui, "General");
             ui.checkbox(&mut self.config.start_with_windows, "Open at login");
             ui.add_space(4.0);
-            ui.label(RichText::new("Shortcut: Ctrl + Alt + Space   ·   Esc hides the window").size(12.0).color(pal.muted));
+            ui.label(RichText::new("Shortcut: Ctrl + Alt + Space opens and closes   ·   Esc hides   ·   Ctrl + 1-9 opens a result").size(12.0).color(pal.muted));
             ui.label(RichText::new("Prefixes: a apps · f files · s settings · win windows").size(12.0).color(pal.muted));
             ui.label(RichText::new("The app stays in the notification area until you choose Exit.").size(12.0).color(pal.muted));
 
@@ -468,7 +525,11 @@ impl eframe::App for App {
                 let controls_failed = status.contains("Global hotkey unavailable")
                     && status.contains("System tray unavailable");
                 self._resident = Some(resident);
-                self.status = status;
+                if !status.is_empty() {
+                    self.notice = if self.notice.is_empty() { status } else { format!("{} · {}", self.notice, status) };
+                }
+                self.notice_shows_left = if self.notice.is_empty() { 0 } else { 5 };
+                self.status = self.notice.clone();
                 self.foreground_hook = foreground::install(ctx);
                 debug_log(&format!("foreground hook installed: {}", self.foreground_hook));
                 if self.start_hidden && !controls_failed {
@@ -477,6 +538,7 @@ impl eframe::App for App {
                     // Started by hand: centre it and arm the same focus and click-away handling
                     // as a hotkey open. Without this a launch that Windows declined to focus
                     // sat on screen forever: no focus, so no Esc, and no click-away to close it.
+                    LAUNCHER_OPEN.store(true, Ordering::SeqCst);
                     bring_to_front(true);
                     foreground::watch(true);
                     self.focus_retry_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(1000));
@@ -488,6 +550,7 @@ impl eframe::App for App {
                 self.status = "Global hotkey and tray are available in the Windows build".into();
             }
             self.resident_initialized = true;
+            RESIDENT_READY.store(true, Ordering::SeqCst);
         }
 
         self.icons.poll();
@@ -505,6 +568,9 @@ impl eframe::App for App {
             }
         }
 
+        if HIDE_REQUESTED.swap(false, Ordering::SeqCst) && LAUNCHER_OPEN.load(Ordering::SeqCst) {
+            self.hide(ctx);
+        }
         if self.show_requested.swap(false, std::sync::atomic::Ordering::SeqCst) {
             self.show(ctx);
         }
@@ -549,12 +615,33 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
 
-        let (down, up, enter, escape) = ctx.input_mut(|input| {
+        let (down, up, enter, escape, quick) = ctx.input_mut(|input| {
+            // Ctrl+1 ... Ctrl+9 open the matching row (the number is drawn on the row).
+            let mut quick = None;
+            for (slot, key) in [
+                Key::Num1,
+                Key::Num2,
+                Key::Num3,
+                Key::Num4,
+                Key::Num5,
+                Key::Num6,
+                Key::Num7,
+                Key::Num8,
+                Key::Num9,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if input.consume_key(Modifiers::COMMAND, key) {
+                    quick = Some(slot);
+                }
+            }
             (
                 input.consume_key(Modifiers::NONE, Key::ArrowDown),
                 input.consume_key(Modifiers::NONE, Key::ArrowUp),
                 input.consume_key(Modifiers::NONE, Key::Enter),
                 input.consume_key(Modifiers::NONE, Key::Escape),
+                quick,
             )
         });
         let mut activate = None;
@@ -570,6 +657,11 @@ impl eframe::App for App {
             }
             if enter && !self.rows.is_empty() {
                 activate = Some(self.selected);
+            }
+            if let Some(slot) = quick {
+                if slot < self.rows.len() {
+                    activate = Some(slot);
+                }
             }
         }
         if escape {
@@ -642,7 +734,8 @@ impl eframe::App for App {
                 });
 
                 if !self.status.is_empty() {
-                    ui.label(RichText::new(&self.status).size(12.0).color(pal.muted));
+                    // One line only: the panel height assumes it, so a long message is cut, not wrapped.
+                    ui.add(egui::Label::new(RichText::new(&self.status).size(12.0).color(pal.muted)).truncate(true));
                 }
                 // "No Results" only once the search has actually answered, never in between keystrokes.
                 let searching = !self.query.trim().is_empty() && !self.pending;
@@ -719,9 +812,11 @@ impl eframe::App for App {
 
                             let text_x = tile.right() + 12.0;
                             let text_painter = ui.painter().with_clip_rect(rect.shrink2(Vec2::new(4.0, 0.0)));
+                            // Leave room on the right of the first nine rows for their Ctrl+N hint.
+                            let hint_room = if index < 9 { 58.0 } else { 0.0 };
                             let title_rect = egui::Rect::from_min_max(
                                 Pos2::new(text_x, rect.center().y - 18.0),
-                                Pos2::new(rect.right() - 12.0, rect.center().y + 2.0),
+                                Pos2::new(rect.right() - 12.0 - hint_room, rect.center().y + 2.0),
                             );
                             let mut title_ui = ui.child_ui(title_rect, egui::Layout::left_to_right(egui::Align::Center));
                             title_ui.add(
@@ -736,6 +831,15 @@ impl eframe::App for App {
                                 sub_color,
                             );
 
+                            if index < 9 {
+                                text_painter.text(
+                                    Pos2::new(rect.right() - 12.0, rect.center().y - 8.0),
+                                    Align2::RIGHT_CENTER,
+                                    format!("Ctrl+{}", index + 1),
+                                    FontId::proportional(11.5),
+                                    sub_color,
+                                );
+                            }
                             if response.clicked() {
                                 clicked = Some(index);
                             }
@@ -1034,13 +1138,15 @@ mod foreground {
 /// the macOS system font. It is bundled, so it looks the same everywhere and costs no file read at
 /// startup. On Windows, Segoe UI and Nirmala UI are kept as fallbacks for scripts Inter lacks
 /// (for example Devanagari file names).
-fn load_fonts(ctx: &egui::Context) {
+fn load_fonts(ctx: &egui::Context, kind: FontKind) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         "inter".to_owned(),
         egui::FontData::from_static(include_bytes!("../../../assets/fonts/Inter-Regular.otf")),
     );
-    let mut order = vec!["inter".to_owned()];
+    // System fonts found on this machine, in fallback order (empty off Windows).
+    #[allow(unused_mut)]
+    let mut system: Vec<String> = Vec::new();
     #[cfg(windows)]
     {
         let dir = std::env::var_os("WINDIR")
@@ -1050,8 +1156,20 @@ fn load_fonts(ctx: &egui::Context) {
         for (key, file) in [("segoe-ui", "segoeui.ttf"), ("nirmala-ui", "Nirmala.ttf")] {
             if let Ok(bytes) = std::fs::read(dir.join(file)) {
                 fonts.font_data.insert(key.to_owned(), egui::FontData::from_owned(bytes));
-                order.push(key.to_owned());
+                system.push(key.to_owned());
             }
+        }
+    }
+    // Whichever is chosen goes first; the other stays behind it for characters it lacks.
+    let mut order: Vec<String> = Vec::new();
+    match kind {
+        FontKind::Inter => {
+            order.push("inter".to_owned());
+            order.extend(system);
+        }
+        FontKind::SegoeUi => {
+            order.extend(system);
+            order.push("inter".to_owned());
         }
     }
     if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
@@ -1062,14 +1180,64 @@ fn load_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// Windows only lets the process that currently owns the foreground steal focus, so after another
-/// app was launched from here a plain "focus" request is silently refused and the launcher shows
-/// up unfocused. This borrows the foreground thread's input right (the usual launcher trick).
+/// The launcher's own top-level window. Looked up among this process's windows (so another
+/// program's window that happens to have the same title can never be mistaken for it) and
+/// remembered, so the lookup is not repeated on every show.
+#[cfg(windows)]
+mod own_window {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumWindows(callback: Option<unsafe extern "system" fn(*mut c_void, isize) -> i32>, data: isize) -> i32;
+        fn GetWindowThreadProcessId(hwnd: *mut c_void, process_id: *mut u32) -> u32;
+        fn GetWindowTextW(hwnd: *mut c_void, text: *mut u16, max_count: i32) -> i32;
+        fn IsWindow(hwnd: *mut c_void) -> i32;
+    }
+
+    static CACHED: AtomicIsize = AtomicIsize::new(0);
+
+    struct Search {
+        process_id: u32,
+        found: isize,
+    }
+
+    unsafe extern "system" fn visit(hwnd: *mut c_void, data: isize) -> i32 {
+        let search = &mut *(data as *mut Search);
+        let mut process_id = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut process_id);
+        if process_id != search.process_id {
+            return 1;
+        }
+        let mut buffer = [0u16; 64];
+        let length = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+        if length > 0 && String::from_utf16_lossy(&buffer[..length as usize]) == super::WINDOW_TITLE {
+            search.found = hwnd as isize;
+            return 0; // stop enumerating
+        }
+        1
+    }
+
+    /// Null if the window does not exist (yet).
+    pub fn handle() -> *mut c_void {
+        let cached = CACHED.load(Ordering::Relaxed);
+        if cached != 0 && unsafe { IsWindow(cached as *mut c_void) } != 0 {
+            return cached as *mut c_void;
+        }
+        let mut search = Search { process_id: std::process::id(), found: 0 };
+        unsafe {
+            EnumWindows(Some(visit), &mut search as *mut Search as isize);
+        }
+        CACHED.store(search.found, Ordering::Relaxed);
+        search.found as *mut c_void
+    }
+}
+
 /// Clip the window to a rounded rectangle `height` points tall, anchored at its top edge.
 #[cfg(windows)]
 fn set_window_region(height: f32) {
     use std::ffi::c_void;
-    use std::os::windows::ffi::OsStrExt;
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -1081,7 +1249,6 @@ fn set_window_region(height: f32) {
     }
     #[link(name = "user32")]
     extern "system" {
-        fn FindWindowW(class: *const u16, title: *const u16) -> *mut c_void;
         fn GetWindowRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
         fn SetWindowRgn(hwnd: *mut c_void, region: *mut c_void, redraw: i32) -> i32;
     }
@@ -1090,12 +1257,8 @@ fn set_window_region(height: f32) {
         fn CreateRoundRectRgn(left: i32, top: i32, right: i32, bottom: i32, ellipse_width: i32, ellipse_height: i32) -> *mut c_void;
     }
 
-    let title: Vec<u16> = std::ffi::OsStr::new("Okra Brown Search")
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
     unsafe {
-        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        let hwnd = own_window::handle();
         if hwnd.is_null() {
             return;
         }
@@ -1118,10 +1281,12 @@ fn set_window_region(height: f32) {
     }
 }
 
+/// Windows only lets the process that currently owns the foreground steal focus, so after another
+/// app was launched from here a plain "focus" request is silently refused and the launcher shows
+/// up unfocused. This borrows the foreground thread's input right (the usual launcher trick).
 #[cfg(windows)]
 fn bring_to_front(reposition: bool) {
     use std::ffi::c_void;
-    use std::os::windows::ffi::OsStrExt;
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -1147,7 +1312,6 @@ fn bring_to_front(reposition: bool) {
 
     #[link(name = "user32")]
     extern "system" {
-        fn FindWindowW(class: *const u16, title: *const u16) -> *mut c_void;
         fn ShowWindow(hwnd: *mut c_void, command: i32) -> i32;
         fn SetForegroundWindow(hwnd: *mut c_void) -> i32;
         fn GetForegroundWindow() -> *mut c_void;
@@ -1166,24 +1330,17 @@ fn bring_to_front(reposition: bool) {
     }
     const SW_SHOW: i32 = 5;
     const VK_MENU: u8 = 0x12;
+    /// An unassigned virtual key: counts as input, but does nothing in the app underneath.
+    const VK_UNASSIGNED: u8 = 0xE8;
     const KEYEVENTF_KEYUP: u32 = 2;
     const MONITOR_DEFAULTTONEAREST: u32 = 2;
     const SWP_NOSIZE: u32 = 0x0001;
     const SWP_NOZORDER: u32 = 0x0004;
     const SWP_NOACTIVATE: u32 = 0x0010;
 
-    let title: Vec<u16> = std::ffi::OsStr::new("Okra Brown Search")
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
     unsafe {
-        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        let hwnd = own_window::handle();
         if hwnd.is_null() {
-            return;
-        }
-        let mut process_id = 0u32;
-        GetWindowThreadProcessId(hwnd, &mut process_id);
-        if process_id != std::process::id() {
             return;
         }
 
@@ -1217,12 +1374,6 @@ fn bring_to_front(reposition: bool) {
         if GetForegroundWindow() == hwnd {
             return;
         }
-        if reposition {
-            // A synthetic Alt tap marks this process as having just received input. Only on the
-            // first attempt: repeating it on every retry would keep poking the app underneath.
-            keybd_event(VK_MENU, 0, 0, 0);
-            keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
-        }
         let foreground = GetForegroundWindow();
         let foreground_thread = if foreground.is_null() {
             0
@@ -1231,7 +1382,21 @@ fn bring_to_front(reposition: bool) {
         };
         let ours = GetCurrentThreadId();
         let attached = foreground_thread != 0 && foreground_thread != ours && AttachThreadInput(ours, foreground_thread, 1) != 0;
+        if reposition {
+            // A synthetic key event marks this process as having just received input, which is
+            // what lets SetForegroundWindow succeed. Only on the first attempt: repeating it on
+            // every retry would keep poking the app underneath. The key is an unassigned one, so
+            // unlike an Alt tap it cannot open the menu bar of the app that had the focus.
+            keybd_event(VK_UNASSIGNED, 0, 0, 0);
+            keybd_event(VK_UNASSIGNED, 0, KEYEVENTF_KEYUP, 0);
+        }
         SetForegroundWindow(hwnd);
+        if reposition && GetForegroundWindow() != hwnd {
+            // Last resort, as before: an Alt tap. It only runs when the quiet way was refused.
+            keybd_event(VK_MENU, 0, 0, 0);
+            keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+            SetForegroundWindow(hwnd);
+        }
         if attached {
             AttachThreadInput(ours, foreground_thread, 0);
         }
@@ -1307,14 +1472,15 @@ fn main() -> eframe::Result<()> {
     let config = Config::load_or_default();
     let engine = Arc::new(Engine::new(&config));
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Okra Brown Search")
+        .with_title(WINDOW_TITLE)
         .with_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
         .with_decorations(false)
         .with_transparent(true)
         .with_min_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
         .with_max_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
         .with_always_on_top()
-        .with_visible(true);
+        // Launched with --background (sign-in start): never show the window, so there is no flash.
+        .with_visible(!start_hidden);
 
     if let Ok(icon) = image::load_from_memory(include_bytes!("../../../assets/okra-brown-search.png")) {
         let rgba = icon.to_rgba8();

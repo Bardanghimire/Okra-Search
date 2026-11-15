@@ -140,12 +140,14 @@ impl FileBackend for Builtin {
 pub struct FilesProvider {
     backends: Vec<Box<dyn FileBackend>>,
     active: Mutex<&'static str>,
+    notice: Option<String>,
 }
 
 impl FilesProvider {
     pub fn new(cfg: &Config) -> Self {
         let builtin = || Builtin { roots: cfg.file_roots.clone(), depth: cfg.file_max_depth, index: OnceLock::new() };
         let mut backends: Vec<Box<dyn FileBackend>> = Vec::new();
+        let mut notice: Option<String> = None;
         let use_everything = !matches!(cfg.file_backend, FileBackendKind::Builtin);
         if use_everything {
             // es.exe talks to the same running Everything instance as the SDK DLL, so it can only
@@ -155,6 +157,17 @@ impl FilesProvider {
                 backends.push(Box::new(sdk));
             } else if let Some(es) = EsCli::find(cfg.es_exe.as_deref()) {
                 backends.push(Box::new(es));
+                notice = Some(
+                    "Everything64.dll not found: using the slower es.exe for files".to_string(),
+                );
+            } else {
+                notice = Some(
+                    match cfg.file_backend {
+                        FileBackendKind::Everything => "Everything not found: file search is unavailable",
+                        _ => "Everything not found: using the built-in file index (slower)",
+                    }
+                    .to_string(),
+                );
             }
         }
         match cfg.file_backend {
@@ -173,7 +186,12 @@ impl FilesProvider {
             }
             FileBackendKind::Everything => {}
         }
-        Self { backends, active: Mutex::new("none") }
+        Self { backends, active: Mutex::new("none"), notice }
+    }
+
+    /// Set when the fast Everything path is not available, so the app can tell the user once.
+    pub fn startup_notice(&self) -> Option<String> {
+        self.notice.clone()
     }
 
     /// Which backend answered the most recent query (for diagnostics / status lines).
