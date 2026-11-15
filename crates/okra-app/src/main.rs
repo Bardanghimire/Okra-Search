@@ -585,6 +585,11 @@ impl App {
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Test switch: `OKRA_OPAQUE=1` fills the window with the panel colour instead of clearing
+        // it to transparent (some Windows setups flicker when a transparent window redraws).
+        if opaque_mode() {
+            return palette(self.config.theme).bg.to_normalized_gamma_f32();
+        }
         // Transparent window; the panel paints its own rounded background.
         egui::Rgba::TRANSPARENT.to_array()
     }
@@ -1595,6 +1600,12 @@ fn set_startup_registration(enabled: bool) -> Result<(), String> {
     }
 }
 
+/// True when the launcher was started with the environment variable `OKRA_OPAQUE` set.
+fn opaque_mode() -> bool {
+    static OPAQUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OPAQUE.get_or_init(|| std::env::var_os("OKRA_OPAQUE").is_some())
+}
+
 fn main() -> eframe::Result<()> {
     #[cfg(windows)]
     if already_running() {
@@ -1607,7 +1618,7 @@ fn main() -> eframe::Result<()> {
         .with_title(WINDOW_TITLE)
         .with_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
         .with_decorations(false)
-        .with_transparent(true)
+        .with_transparent(!opaque_mode())
         .with_min_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
         .with_max_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
         .with_always_on_top()
