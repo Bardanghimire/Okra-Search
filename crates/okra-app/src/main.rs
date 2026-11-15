@@ -16,6 +16,10 @@ const BAR_HEIGHT: f32 = 66.0;
 const ROW_HEIGHT: f32 = 48.0;
 const MAX_LIST_HEIGHT: f32 = 400.0;
 const SETTINGS_HEIGHT: f32 = 540.0;
+/// The window never changes size: resizing it on every keystroke made the bar jump and flicker.
+/// It is always tall enough for the biggest list (or the settings page); the panel is painted
+/// only as tall as the content needs, and the rest of the window stays transparent.
+const WINDOW_HEIGHT: f32 = SETTINGS_HEIGHT;
 
 /// A result plus everything drawing it needs that depends only on the result and the query that
 /// produced it. Built once on the search thread, instead of on every frame for every row.
@@ -68,7 +72,6 @@ struct App {
     foreground_hook: bool,
     start_hidden: bool,
     resident_initialized: bool,
-    last_height: f32,
     /// True once the window has actually been focused; losing focus after that hides it.
     had_focus: bool,
     /// After showing, keep asking Windows for focus until it is granted (or this time passes).
@@ -259,7 +262,6 @@ impl App {
             foreground_hook: false,
             start_hidden,
             resident_initialized: false,
-            last_height: 0.0,
             had_focus: false,
             focus_retry_until: None,
             #[cfg(windows)]
@@ -319,13 +321,10 @@ impl App {
         foreground::watch(false);
         self.had_focus = false;
         self.focus_retry_until = None;
-        // Leave nothing behind: the next open must show an empty bar at bar height, not flash the
-        // previous query's tall window for a frame.
+        // Leave nothing behind: the next open starts as an empty bar.
         self.settings_open = false;
         self.query.clear();
         self.reset_results();
-        self.last_height = BAR_HEIGHT;
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(WINDOW_WIDTH, BAR_HEIGHT)));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
@@ -580,20 +579,19 @@ impl eframe::App for App {
 
         let pal = palette(self.config.theme);
         let height = self.desired_height();
-        if (height - self.last_height).abs() > 0.5 {
-            self.last_height = height;
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(WINDOW_WIDTH, height)));
-        }
+        let mut panel_rect: Option<egui::Rect> = None;
 
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(pal.bg)
-                    .rounding(14.0_f32)
-                    .stroke(Stroke::new(1.0_f32, pal.border))
-                    .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
-            )
+            .frame(egui::Frame::none())
             .show(ctx, |ui| {
+                // Paint the rounded panel at the height the content needs and lay the content out
+                // inside it. The window itself stays one fixed size, so nothing ever resizes.
+                let full = ui.max_rect();
+                let panel = egui::Rect::from_min_size(full.min, Vec2::new(full.width(), height));
+                ui.painter().rect(panel, 14.0_f32, pal.bg, Stroke::new(1.0_f32, pal.border));
+                panel_rect = Some(panel);
+                let mut content = ui.child_ui(panel.shrink2(Vec2::new(16.0, 10.0)), egui::Layout::top_down(egui::Align::LEFT));
+                let ui = &mut content;
                 if self.settings_open {
                     self.settings_ui(ui);
                     return;
@@ -741,6 +739,16 @@ impl eframe::App for App {
                     }
                 }
             });
+
+        // The window is taller than the panel; a click in the transparent part is a click outside.
+        if let Some(rect) = panel_rect {
+            let pressed_outside = ctx.input(|input| {
+                input.pointer.any_pressed() && input.pointer.interact_pos().map_or(false, |pos| !rect.contains(pos))
+            });
+            if pressed_outside {
+                self.hide(ctx);
+            }
+        }
 
         if let Some(index) = activate {
             self.activate(ctx, index);
@@ -1118,8 +1126,8 @@ fn bring_to_front(reposition: bool) {
         if reposition {
             // Centre the search bar on the screen the mouse is on. Everything here is in physical
             // pixels, so the window's own width tells us the DPI scale. The bar sits at the exact
-            // centre; the result list grows downwards from it. On a short screen the top edge is
-            // lifted just enough to keep the tallest list on screen.
+            // centre; the result list is drawn below it inside the fixed-size window. On a short
+            // screen the top edge is lifted just enough to keep the whole window on screen.
             let mut cursor = Point::default();
             let mut window = Rect::default();
             let mut info = MonitorInfo { size: std::mem::size_of::<MonitorInfo>() as u32, monitor: Rect::default(), work: Rect::default(), flags: 0 };
@@ -1130,7 +1138,7 @@ fn bring_to_front(reposition: bool) {
                     if width > 0 {
                         let scale = width as f32 / WINDOW_WIDTH;
                         let bar = (BAR_HEIGHT * scale).round() as i32;
-                        let tallest = ((BAR_HEIGHT + 24.0 + 22.0 + MAX_LIST_HEIGHT) * scale).round() as i32;
+                        let tallest = (WINDOW_HEIGHT * scale).round() as i32;
                         let work = info.work;
                         let x = work.left + ((work.right - work.left) - width) / 2;
                         let centred_y = work.top + ((work.bottom - work.top) - bar) / 2;
@@ -1236,11 +1244,11 @@ fn main() -> eframe::Result<()> {
     let engine = Arc::new(Engine::new(&config));
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Okra Brown Search")
-        .with_inner_size([WINDOW_WIDTH, BAR_HEIGHT])
+        .with_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
         .with_decorations(false)
         .with_transparent(true)
-        .with_min_inner_size([WINDOW_WIDTH, BAR_HEIGHT])
-        .with_max_inner_size([WINDOW_WIDTH, 800.0])
+        .with_min_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
+        .with_max_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
         .with_always_on_top()
         .with_visible(true);
 
