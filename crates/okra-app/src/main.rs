@@ -58,6 +58,8 @@ struct App {
     shown: u64,
     /// Generation of the newest query; the search thread polls it to drop work that is stale.
     latest_gen: Arc<AtomicU64>,
+    /// Panel height the window's visible region was last cut to (Windows).
+    region_height: f32,
     /// A query is in flight and nothing has come back for it yet (so "No Results" is premature).
     pending: bool,
     q_tx: Sender<(u64, String)>,
@@ -252,6 +254,7 @@ impl App {
             gen: 0,
             shown: 0,
             latest_gen,
+            region_height: 0.0,
             pending: false,
             q_tx,
             r_rx,
@@ -579,6 +582,14 @@ impl eframe::App for App {
 
         let pal = palette(self.config.theme);
         let height = self.desired_height();
+        // Windows ignores the window's transparency here (the unused part showed up black), so
+        // instead the window is cut to the panel's rounded shape. Same fixed window size, no
+        // resizing, and clicks in the cut-away part fall through to whatever is underneath.
+        #[cfg(windows)]
+        if (height - self.region_height).abs() > 0.5 {
+            self.region_height = height;
+            set_window_region(height);
+        }
         let mut panel_rect: Option<egui::Rect> = None;
 
         egui::CentralPanel::default()
@@ -1054,6 +1065,59 @@ fn load_fonts(ctx: &egui::Context) {
 /// Windows only lets the process that currently owns the foreground steal focus, so after another
 /// app was launched from here a plain "focus" request is silently refused and the launcher shows
 /// up unfocused. This borrows the foreground thread's input right (the usual launcher trick).
+/// Clip the window to a rounded rectangle `height` points tall, anchored at its top edge.
+#[cfg(windows)]
+fn set_window_region(height: f32) {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn FindWindowW(class: *const u16, title: *const u16) -> *mut c_void;
+        fn GetWindowRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
+        fn SetWindowRgn(hwnd: *mut c_void, region: *mut c_void, redraw: i32) -> i32;
+    }
+    #[link(name = "gdi32")]
+    extern "system" {
+        fn CreateRoundRectRgn(left: i32, top: i32, right: i32, bottom: i32, ellipse_width: i32, ellipse_height: i32) -> *mut c_void;
+    }
+
+    let title: Vec<u16> = std::ffi::OsStr::new("Okra Brown Search")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd.is_null() {
+            return;
+        }
+        let mut rect = Rect::default();
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return;
+        }
+        let width = rect.right - rect.left;
+        if width <= 0 {
+            return;
+        }
+        let scale = width as f32 / WINDOW_WIDTH;
+        let bottom = (height * scale).round() as i32;
+        let diameter = (28.0 * scale).round() as i32; // 14 pt corner radius, as the panel is painted
+        let region = CreateRoundRectRgn(0, 0, width + 1, bottom + 1, diameter, diameter);
+        if !region.is_null() {
+            // The system owns the region after this call.
+            SetWindowRgn(hwnd, region, 1);
+        }
+    }
+}
+
 #[cfg(windows)]
 fn bring_to_front(reposition: bool) {
     use std::ffi::c_void;
