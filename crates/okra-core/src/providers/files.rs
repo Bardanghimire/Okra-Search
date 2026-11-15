@@ -195,7 +195,10 @@ impl Provider for FilesProvider {
             return vec![];
         }
         for b in &self.backends {
-            let Some(hits) = b.search(q, 200) else { continue };
+            // Ask for a few times what can be shown rather than a flat 200: every extra hit is
+            // fetched, scored and sorted on each keystroke.
+            let want = limit.saturating_mul(3).clamp(60, 200);
+            let Some(hits) = b.search(q, want) else { continue };
             *self.active.lock().unwrap() = b.name();
             let mut items: Vec<Item> = hits
                 .into_iter()

@@ -79,12 +79,45 @@ impl Engine {
         }
     }
 
+    /// Blocking search: the final, fully ranked list.
     pub fn search(&self, raw: &str) -> Vec<Item> {
+        let mut all = Vec::new();
+        self.search_progressive(raw, &mut |items| all = items, &|| false);
+        all
+    }
+
+    /// Search that hands results over as soon as they exist. Instant sources (calculator, apps,
+    /// settings, open windows) are ranked and emitted first; the file search, the only slow one,
+    /// follows with the complete list. `stale` is polled between the phases so a query the user
+    /// has already typed past never pays for the file search. An empty query emits nothing:
+    /// the launcher shows only its search bar until something is typed.
+    pub fn search_progressive(&self, raw: &str, emit: &mut dyn FnMut(Vec<Item>), stale: &dyn Fn() -> bool) {
         if raw.trim().is_empty() {
-            return self.suggestions();
+            emit(Vec::new());
+            return;
         }
         let (providers, query) = self.route(raw.trim_start());
-        let mut items: Vec<Item> = providers.iter().flat_map(|p| p.query(query, self.max_results)).collect();
+        let (slow, fast): (Vec<&dyn Provider>, Vec<&dyn Provider>) =
+            providers.into_iter().partition(|p| p.name() == "Files");
+        let mut items: Vec<Item> = fast.iter().flat_map(|p| p.query(query, self.max_results)).collect();
+        if slow.is_empty() {
+            emit(self.rank(items, raw));
+            return;
+        }
+        if !items.is_empty() {
+            emit(self.rank(items.clone(), raw));
+        }
+        if stale() {
+            return;
+        }
+        for provider in &slow {
+            items.extend(provider.query(query, self.max_results));
+        }
+        emit(self.rank(items, raw));
+    }
+
+    /// Apply usage history and kind bias, order, drop duplicate ids and cap the list.
+    fn rank(&self, mut items: Vec<Item>, raw: &str) -> Vec<Item> {
         {
             let history = self.history.lock().unwrap();
             let boost = history.for_query(raw);
@@ -102,59 +135,6 @@ impl Engine {
         items.retain(|_| keep.next().unwrap_or(true));
         items.truncate(self.max_results);
         items
-    }
-
-    /// What to show before anything is typed: the apps used most and most recently, topped up
-    /// with a few well-known ones so a fresh install is never an empty box.
-    fn suggestions(&self) -> Vec<Item> {
-        const COUNT: usize = 7;
-        const DEFAULTS: [&str; 10] = [
-            "File Explorer",
-            "Google Chrome",
-            "Microsoft Edge",
-            "Firefox",
-            "Visual Studio Code",
-            "Notepad",
-            "Calculator",
-            "Terminal",
-            "Settings",
-            "Task Manager",
-        ];
-        let mut apps: Vec<Item> = self
-            .providers
-            .iter()
-            .filter(|p| p.name() == "Applications")
-            .flat_map(|p| p.query("", usize::MAX))
-            .collect();
-        {
-            let history = self.history.lock().unwrap();
-            let boost = history.for_query("");
-            for item in &mut apps {
-                item.score = boost.boost(&item.id);
-            }
-        }
-        apps.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
-        let mut out: Vec<Item> = apps.iter().filter(|item| item.score > 0).take(COUNT).cloned().collect();
-        for wanted in DEFAULTS {
-            if out.len() >= COUNT {
-                break;
-            }
-            if let Some(item) = apps.iter().find(|item| item.score <= 0 && item.title.eq_ignore_ascii_case(wanted)) {
-                out.push(item.clone());
-            }
-        }
-        // Nothing used yet and none of the usual suspects installed: still show something.
-        if out.len() < COUNT {
-            let missing: Vec<Item> = apps
-                .iter()
-                .filter(|item| !out.iter().any(|picked| picked.id == item.id))
-                .take(COUNT - out.len())
-                .cloned()
-                .collect();
-            out.extend(missing);
-        }
-        out.extend(recent_files(4));
-        out
     }
 
     pub fn activate(&self, item: &Item) -> Result<Outcome, String> {
@@ -228,39 +208,6 @@ impl Engine {
     }
 }
 
-/// The files Windows lists under "Recent", newest first. Opening the shortcut opens the file.
-fn recent_files(limit: usize) -> Vec<Item> {
-    let Some(dir) = dirs::data_dir().map(|d| d.join("Microsoft").join("Windows").join("Recent")) else {
-        return Vec::new();
-    };
-    let Ok(read) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = read
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            let is_lnk = path.extension().and_then(|x| x.to_str()).map_or(false, |x| x.eq_ignore_ascii_case("lnk"));
-            if !is_lnk {
-                return None;
-            }
-            let modified = entry.metadata().ok()?.modified().ok()?;
-            Some((modified, path))
-        })
-        .collect();
-    entries.sort_by(|a, b| b.0.cmp(&a.0));
-    entries
-        .into_iter()
-        .take(limit)
-        .map(|(_, path)| Item {
-            id: format!("recent:{}", path.display()),
-            title: path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
-            subtitle: "Recently opened".to_string(),
-            kind: Kind::File,
-            action: Action::OpenPath(path),
-            score: 0,
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +244,29 @@ mod tests {
         let results = engine.search("editor");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "a:editor");
+    }
+
+    #[test]
+    fn fast_results_arrive_before_slow_ones_and_stale_queries_skip_the_slow_phase() {
+        let engine = Engine::with_providers(
+            vec![Box::new(Fake("a", None, true)), Box::new(Fake("Files", None, true))],
+            History::in_memory(),
+            10,
+        );
+        let mut batches: Vec<Vec<String>> = Vec::new();
+        engine.search_progressive("x", &mut |items| batches.push(items.into_iter().map(|i| i.id).collect()), &|| false);
+        assert_eq!(batches.len(), 2, "instant results first, then everything");
+        assert_eq!(batches[0], vec!["a:x".to_string()]);
+        assert_eq!(batches[1].len(), 2);
+
+        let mut emitted = 0;
+        engine.search_progressive("x", &mut |_| emitted += 1, &|| true);
+        assert_eq!(emitted, 1, "a stale query only runs the instant phase");
+
+        let mut idle = Vec::new();
+        engine.search_progressive("   ", &mut |items| idle.push(items.len()), &|| false);
+        assert_eq!(idle, vec![0], "an empty query shows nothing");
+        assert!(engine.search("").is_empty());
     }
 
     #[test]

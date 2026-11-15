@@ -4,6 +4,7 @@ use eframe::egui::{self, Align2, Color32, FontId, Key, Modifiers, Pos2, RichText
 use okra_core::matcher::{fuzzy_with, Query};
 use okra_core::{Config, Engine, FileBackendKind, Item, Kind, Outcome, ThemeKind};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 mod icons;
@@ -51,6 +52,10 @@ struct App {
     status: String,
     gen: u64,
     shown: u64,
+    /// Generation of the newest query; the search thread polls it to drop work that is stale.
+    latest_gen: Arc<AtomicU64>,
+    /// A query is in flight and nothing has come back for it yet (so "No Results" is premature).
+    pending: bool,
     q_tx: Sender<(u64, String)>,
     r_rx: Receiver<(u64, Vec<Row>)>,
     settings_open: bool,
@@ -102,7 +107,7 @@ impl ResidentControls {
                         GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
                             if event.id == hotkey_id && event.state == HotKeyState::Pressed {
                                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                                bring_to_front();
+                                bring_to_front(true);
 context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                                 context.send_viewport_cmd(egui::ViewportCommand::Focus);
                                 context.request_repaint();
@@ -147,7 +152,7 @@ context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     context_for_menu.request_repaint();
                 } else if event.id == show_id {
                     flag_for_menu.store(true, std::sync::atomic::Ordering::SeqCst);
-                    bring_to_front();
+                    bring_to_front(true);
 context_for_menu.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     context_for_menu.send_viewport_cmd(egui::ViewportCommand::Focus);
                     context_for_menu.request_repaint();
@@ -164,7 +169,7 @@ context_for_menu.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 };
                 if should_show {
                     flag_for_tray.store(true, std::sync::atomic::Ordering::SeqCst);
-                    bring_to_front();
+                    bring_to_front(true);
 context_for_tray.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     context_for_tray.send_viewport_cmd(egui::ViewportCommand::Focus);
                     context_for_tray.request_repaint();
@@ -193,24 +198,27 @@ context_for_tray.send_viewport_cmd(egui::ViewportCommand::Visible(true));
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, engine: Arc<Engine>, config: Config, start_hidden: bool) -> Self {
-        #[cfg(windows)]
-        load_system_font(&cc.egui_ctx);
+        load_fonts(&cc.egui_ctx);
         apply_theme(&cc.egui_ctx, config.theme);
 
-        // Search runs on a worker thread; rapid typing replaces stale queued queries.
+        // Search runs on a worker thread; rapid typing replaces stale queued queries. Results are
+        // streamed: instant sources (apps, settings, windows, calculator) show up at once and the
+        // slower file search is added when it finishes, or skipped if the user has typed on.
         let (q_tx, q_rx) = channel::<(u64, String)>();
         let (r_tx, r_rx) = channel::<(u64, Vec<Row>)>();
-        let (eng, ctx) = (engine.clone(), cc.egui_ctx.clone());
+        let latest_gen = Arc::new(AtomicU64::new(0));
+        let (eng, ctx, newest) = (engine.clone(), cc.egui_ctx.clone(), latest_gen.clone());
         std::thread::spawn(move || {
-            while let Ok(mut latest) = q_rx.recv() {
+            while let Ok(mut job) = q_rx.recv() {
                 while let Ok(newer) = q_rx.try_recv() {
-                    latest = newer;
+                    job = newer;
                 }
-                let rows = build_rows(eng.search(&latest.1), &latest.1);
-                if r_tx.send((latest.0, rows)).is_err() {
-                    break;
-                }
-                ctx.request_repaint();
+                let (generation, query) = job;
+                let mut emit = |items: Vec<Item>| {
+                    let _ = r_tx.send((generation, build_rows(items, &query)));
+                    ctx.request_repaint();
+                };
+                eng.search_progressive(&query, &mut emit, &|| newest.load(Ordering::Relaxed) != generation);
             }
         });
 
@@ -227,7 +235,7 @@ impl App {
             });
         }
 
-        let mut app = Self {
+        Self {
             engine,
             initial_backend: config.file_backend,
             initial_max_results: config.max_results,
@@ -237,9 +245,11 @@ impl App {
             rows: Vec::new(),
             icons: icons::Icons::new(&cc.egui_ctx),
             selected: 0,
-            status: "Starting resident search controls…".into(),
+            status: String::new(),
             gen: 0,
             shown: 0,
+            latest_gen,
+            pending: false,
             q_tx,
             r_rx,
             settings_open: false,
@@ -254,20 +264,18 @@ impl App {
             focus_retry_until: None,
             #[cfg(windows)]
             _resident: None,
-        };
-        app.show_suggestions();
-        app
+        }
     }
 
-    /// Fill in the idle suggestions right away (so there is never a frame of stale results) and
-    /// disown any older query still in flight on the search thread. This replaces a synchronous
-    /// search plus an identical queued one, which did the same work twice on every show.
-    fn show_suggestions(&mut self) {
-        let rows = build_rows(self.engine.search(""), "");
-        self.set_rows(rows);
+    /// Back to the idle state: just the search bar, no results. Also disowns any query still in
+    /// flight on the search thread, so a late answer can never pop a stale list back up.
+    fn reset_results(&mut self) {
+        self.rows.clear();
         self.selected = 0;
+        self.pending = false;
         self.gen += 1;
         self.shown = self.gen;
+        self.latest_gen.store(self.gen, Ordering::Relaxed);
     }
 
     /// Show a new result list and start fetching the icons it needs (rows on screen first).
@@ -277,7 +285,13 @@ impl App {
     }
 
     fn search_again(&mut self) {
+        if self.query.trim().is_empty() {
+            self.reset_results();
+            return;
+        }
         self.gen += 1;
+        self.pending = true;
+        self.latest_gen.store(self.gen, Ordering::Relaxed);
         let _ = self.q_tx.send((self.gen, self.query.clone()));
     }
 
@@ -286,12 +300,12 @@ impl App {
         self.query.clear();
         self.status.clear();
         self.had_focus = false;
-        self.show_suggestions();
+        self.reset_results();
         debug_log("show");
         #[cfg(windows)]
         {
             foreground::watch(true);
-            bring_to_front();
+            bring_to_front(false);
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -305,6 +319,13 @@ impl App {
         foreground::watch(false);
         self.had_focus = false;
         self.focus_retry_until = None;
+        // Leave nothing behind: the next open must show an empty bar at bar height, not flash the
+        // previous query's tall window for a frame.
+        self.settings_open = false;
+        self.query.clear();
+        self.reset_results();
+        self.last_height = BAR_HEIGHT;
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(WINDOW_WIDTH, BAR_HEIGHT)));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
@@ -414,7 +435,7 @@ impl App {
         }
         let status = if self.status.is_empty() { 0.0 } else { 22.0 };
         if self.rows.is_empty() {
-            return if self.query.trim().is_empty() { BAR_HEIGHT + status } else { BAR_HEIGHT + 64.0 + status };
+            return if self.query.trim().is_empty() || self.pending { BAR_HEIGHT + status } else { BAR_HEIGHT + 64.0 + status };
         }
         let mut total = 0.0;
         let mut prev: Option<Kind> = None;
@@ -451,7 +472,13 @@ impl eframe::App for App {
                 if self.start_hidden && !controls_failed {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 } else {
+                    // Started by hand: centre it and arm the same focus and click-away handling
+                    // as a hotkey open. Without this a launch that Windows declined to focus
+                    // sat on screen forever: no focus, so no Esc, and no click-away to close it.
+                    bring_to_front(true);
                     foreground::watch(true);
+                    self.focus_retry_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(1000));
+                    ctx.request_repaint();
                 }
             }
             #[cfg(not(windows))]
@@ -464,9 +491,15 @@ impl eframe::App for App {
         self.icons.poll();
         while let Ok((generation, rows)) = self.r_rx.try_recv() {
             if generation >= self.shown {
+                // A later batch for the same query (the file results joining the instant ones)
+                // keeps the selection where the user left it; a new query starts at the top.
+                let new_query = generation > self.shown;
                 self.shown = generation;
                 self.set_rows(rows);
-                self.selected = 0;
+                self.selected = if new_query { 0 } else { self.selected.min(self.rows.len().saturating_sub(1)) };
+                if generation == self.gen {
+                    self.pending = false;
+                }
             }
         }
 
@@ -503,7 +536,7 @@ impl eframe::App for App {
                 self.hide(ctx);
             } else {
                 #[cfg(windows)]
-                bring_to_front();
+                bring_to_front(false);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 ctx.request_repaint_after(std::time::Duration::from_millis(60));
             }
@@ -602,8 +635,8 @@ impl eframe::App for App {
                 if !self.status.is_empty() {
                     ui.label(RichText::new(&self.status).size(12.0).color(pal.muted));
                 }
-                let searching = !self.query.trim().is_empty();
-                let suggestions = !searching;
+                // "No Results" only once the search has actually answered, never in between keystrokes.
+                let searching = !self.query.trim().is_empty() && !self.pending;
                 if self.rows.is_empty() {
                     if searching {
                         ui.separator();
@@ -621,7 +654,7 @@ impl eframe::App for App {
                         for (index, row) in self.rows.iter().enumerate() {
                             let item = &row.item;
                             let heading = if index == 0 {
-                                Some(if suggestions { "Suggestions" } else { "Top Hit" })
+                                Some("Top Hit")
                             } else if prev != Some(item.kind) {
                                 Some(kind_heading(item.kind))
                             } else {
@@ -978,14 +1011,34 @@ mod foreground {
     }
 }
 
-/// Segoe UI is what Windows itself uses; it looks far less "toolkit" than egui's bundled font.
-#[cfg(windows)]
-fn load_system_font(ctx: &egui::Context) {
-    let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") else { return };
+/// Inter (SIL Open Font License, see `assets/fonts/`): a clean, modern UI typeface in the spirit of
+/// the macOS system font. It is bundled, so it looks the same everywhere and costs no file read at
+/// startup. On Windows, Segoe UI and Nirmala UI are kept as fallbacks for scripts Inter lacks
+/// (for example Devanagari file names).
+fn load_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert("segoe-ui".to_owned(), egui::FontData::from_owned(bytes));
+    fonts.font_data.insert(
+        "inter".to_owned(),
+        egui::FontData::from_static(include_bytes!("../../../assets/fonts/Inter-Regular.otf")),
+    );
+    let mut order = vec!["inter".to_owned()];
+    #[cfg(windows)]
+    {
+        let dir = std::env::var_os("WINDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+            .join("Fonts");
+        for (key, file) in [("segoe-ui", "segoeui.ttf"), ("nirmala-ui", "Nirmala.ttf")] {
+            if let Ok(bytes) = std::fs::read(dir.join(file)) {
+                fonts.font_data.insert(key.to_owned(), egui::FontData::from_owned(bytes));
+                order.push(key.to_owned());
+            }
+        }
+    }
     if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-        family.insert(0, "segoe-ui".to_owned());
+        for (position, name) in order.into_iter().enumerate() {
+            family.insert(position.min(family.len()), name);
+        }
     }
     ctx.set_fonts(fonts);
 }
@@ -994,9 +1047,32 @@ fn load_system_font(ctx: &egui::Context) {
 /// app was launched from here a plain "focus" request is silently refused and the launcher shows
 /// up unfocused. This borrows the foreground thread's input right (the usual launcher trick).
 #[cfg(windows)]
-fn bring_to_front() {
+fn bring_to_front(reposition: bool) {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    #[repr(C)]
+    struct MonitorInfo {
+        size: u32,
+        monitor: Rect,
+        work: Rect,
+        flags: u32,
+    }
+
     #[link(name = "user32")]
     extern "system" {
         fn FindWindowW(class: *const u16, title: *const u16) -> *mut c_void;
@@ -1006,6 +1082,11 @@ fn bring_to_front() {
         fn GetWindowThreadProcessId(hwnd: *mut c_void, process_id: *mut u32) -> u32;
         fn AttachThreadInput(from: u32, to: u32, attach: i32) -> i32;
         fn keybd_event(vk: u8, scan: u8, flags: u32, extra: usize);
+        fn GetCursorPos(point: *mut Point) -> i32;
+        fn MonitorFromPoint(point: Point, flags: u32) -> *mut c_void;
+        fn GetMonitorInfoW(monitor: *mut c_void, info: *mut MonitorInfo) -> i32;
+        fn GetWindowRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
+        fn SetWindowPos(hwnd: *mut c_void, after: *mut c_void, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
     }
     #[link(name = "kernel32")]
     extern "system" {
@@ -1014,6 +1095,10 @@ fn bring_to_front() {
     const SW_SHOW: i32 = 5;
     const VK_MENU: u8 = 0x12;
     const KEYEVENTF_KEYUP: u32 = 2;
+    const MONITOR_DEFAULTTONEAREST: u32 = 2;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_NOACTIVATE: u32 = 0x0010;
 
     let title: Vec<u16> = std::ffi::OsStr::new("Okra Brown Search")
         .encode_wide()
@@ -1029,10 +1114,43 @@ fn bring_to_front() {
         if process_id != std::process::id() {
             return;
         }
+
+        if reposition {
+            // Centre the search bar on the screen the mouse is on. Everything here is in physical
+            // pixels, so the window's own width tells us the DPI scale. The bar sits at the exact
+            // centre; the result list grows downwards from it. On a short screen the top edge is
+            // lifted just enough to keep the tallest list on screen.
+            let mut cursor = Point::default();
+            let mut window = Rect::default();
+            let mut info = MonitorInfo { size: std::mem::size_of::<MonitorInfo>() as u32, monitor: Rect::default(), work: Rect::default(), flags: 0 };
+            if GetCursorPos(&mut cursor) != 0 {
+                let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+                if !monitor.is_null() && GetMonitorInfoW(monitor, &mut info) != 0 && GetWindowRect(hwnd, &mut window) != 0 {
+                    let width = window.right - window.left;
+                    if width > 0 {
+                        let scale = width as f32 / WINDOW_WIDTH;
+                        let bar = (BAR_HEIGHT * scale).round() as i32;
+                        let tallest = ((BAR_HEIGHT + 24.0 + 22.0 + MAX_LIST_HEIGHT) * scale).round() as i32;
+                        let work = info.work;
+                        let x = work.left + ((work.right - work.left) - width) / 2;
+                        let centred_y = work.top + ((work.bottom - work.top) - bar) / 2;
+                        let y = centred_y.min(work.bottom - tallest).max(work.top);
+                        SetWindowPos(hwnd, std::ptr::null_mut(), x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                    }
+                }
+            }
+        }
+
         ShowWindow(hwnd, SW_SHOW);
-        // A synthetic Alt tap marks this process as having just received input.
-        keybd_event(VK_MENU, 0, 0, 0);
-        keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+        if GetForegroundWindow() == hwnd {
+            return;
+        }
+        if reposition {
+            // A synthetic Alt tap marks this process as having just received input. Only on the
+            // first attempt: repeating it on every retry would keep poking the app underneath.
+            keybd_event(VK_MENU, 0, 0, 0);
+            keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+        }
         let foreground = GetForegroundWindow();
         let foreground_thread = if foreground.is_null() {
             0
