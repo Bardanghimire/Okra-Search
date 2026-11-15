@@ -525,9 +525,21 @@ impl App {
         let item = &row.item;
         let is_file = matches!(item.kind, Kind::File | Kind::Folder);
         let loaded = if is_file { self.previews.get(&item.id) } else { None };
-        // Until the worker answers, a file shows just where it lives.
+        // Until the worker answers, a file shows the same rows with "..." for the values, so the
+        // pane keeps its shape instead of jumping when the details arrive.
+        let is_dir = item.kind == Kind::Folder;
+        let pending_label = match &item.action {
+            Action::OpenPath(path) if is_file && loaded.is_none() => Some(preview::kind_label_for(path, is_dir)),
+            _ => None,
+        };
         let pending: Vec<(String, String)> = if is_file && loaded.is_none() {
-            vec![("Where".to_string(), shorten(&item.subtitle, 52))]
+            let dots = "\u{2026}".to_string();
+            vec![
+                ((if is_dir { "Contains" } else { "Size" }).to_string(), dots.clone()),
+                ("Modified".to_string(), dots.clone()),
+                ("Created".to_string(), dots),
+                ("Where".to_string(), shorten(&item.subtitle, 52)),
+            ]
         } else {
             Vec::new()
         };
@@ -537,7 +549,7 @@ impl App {
         };
         let view = preview::View {
             title: &item.title,
-            kind_label: loaded.map(|found| found.kind_label.as_str()).unwrap_or_else(|| item.kind.label()),
+            kind_label: loaded.map(|found| found.kind_label.as_str()).or(pending_label.as_deref()).unwrap_or_else(|| item.kind.label()),
             large: item.kind == Kind::Calculation,
             icon: row.icon.as_ref().and_then(|(key, _)| self.icons.texture(key)),
             thumb: loaded.and_then(|found| found.thumb.as_ref()),
@@ -844,7 +856,8 @@ impl eframe::App for App {
                             let is_selected = index == selected;
                             if is_selected {
                                 ui.painter().rect_filled(rect, 8.0_f32, ACCENT);
-                            } else if response.hovered() {
+                            } else if response.hovered() || ui.rect_contains_pointer(rect.expand2(Vec2::new(0.0, 1.0))) {
+                                // Also lit in the 2 px gap between rows, so the highlight never blinks off.
                                 ui.painter().rect_filled(rect, 8.0_f32, pal.hover);
                             }
                             let (title_color, sub_color) = if is_selected {

@@ -109,16 +109,22 @@ impl Previews {
     }
 }
 
-/// Reads what the pane shows about a file or folder. Runs on the worker thread.
-pub fn load(path: &Path, is_dir: bool) -> Details {
-    let extension = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
-    let kind_label = if is_dir {
+/// `Folder`, `JPG file`, `File`: worked out from the name alone, so it can be shown instantly.
+pub fn kind_label_for(path: &Path, is_dir: bool) -> String {
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    if is_dir {
         "Folder".to_string()
     } else if extension.is_empty() {
         "File".to_string()
     } else {
         format!("{} file", extension.to_ascii_uppercase())
-    };
+    }
+}
+
+/// Reads what the pane shows about a file or folder. Runs on the worker thread.
+pub fn load(path: &Path, is_dir: bool) -> Details {
+    let extension = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
+    let kind_label = kind_label_for(path, is_dir);
     let mut details = Details { kind_label, rows: Vec::new(), text: None, image: None };
     let Ok(meta) = std::fs::metadata(path) else {
         details.rows.push(("Status".to_string(), "Not found or not accessible".to_string()));
@@ -345,7 +351,11 @@ pub struct View<'a> {
 }
 
 pub fn show(ui: &mut egui::Ui, view: &View, text: Color32, muted: Color32) {
-    egui::ScrollArea::vertical().id_source("okra-preview-scroll").auto_shrink([false, false]).show(ui, |ui| {
+    // No scroll bar: one that appears and disappears changes the width and makes the pane jump.
+    egui::ScrollArea::vertical()
+        .id_source("okra-preview-scroll")
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .auto_shrink([false, false]).show(ui, |ui| {
         ui.add_space(6.0);
         if view.large {
             ui.add_space(18.0);
