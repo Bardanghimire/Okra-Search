@@ -87,13 +87,19 @@ impl Engine {
         let mut items: Vec<Item> = providers.iter().flat_map(|p| p.query(query, self.max_results)).collect();
         {
             let history = self.history.lock().unwrap();
+            let boost = history.for_query(raw);
             for item in &mut items {
-                item.score += Self::kind_bias(item.kind) + history.boost_for_query(&item.id, raw);
+                item.score += Self::kind_bias(item.kind) + boost.boost(&item.id);
             }
         }
         items.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
-        let mut seen = HashSet::new();
-        items.retain(|item| seen.insert(item.id.clone()));
+        // Drop duplicate ids (first, i.e. best, wins) without cloning every id into a set.
+        let keep: Vec<bool> = {
+            let mut seen = HashSet::with_capacity(items.len());
+            items.iter().map(|item| seen.insert(item.id.as_str())).collect()
+        };
+        let mut keep = keep.into_iter();
+        items.retain(|_| keep.next().unwrap_or(true));
         items.truncate(self.max_results);
         items
     }
@@ -122,8 +128,9 @@ impl Engine {
             .collect();
         {
             let history = self.history.lock().unwrap();
+            let boost = history.for_query("");
             for item in &mut apps {
-                item.score = history.boost(&item.id);
+                item.score = boost.boost(&item.id);
             }
         }
         apps.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
@@ -305,5 +312,47 @@ mod tests {
             assert_eq!(engine.activate(&second).unwrap(), Outcome::CopyText("x".into()));
         }
         assert_eq!(engine.search("x")[0].id, second.id);
+    }
+
+    struct Many(usize);
+    impl Provider for Many {
+        fn name(&self) -> &'static str { "many" }
+        fn query(&self, q: &str, _limit: usize) -> Vec<Item> {
+            (0..self.0)
+                .map(|i| Item {
+                    id: format!("item:{i}"),
+                    title: format!("item {i} {q}"),
+                    subtitle: String::new(),
+                    kind: Kind::File,
+                    action: Action::Copy(String::new()),
+                    score: (i % 97) as i64,
+                })
+                .collect()
+        }
+    }
+
+    /// `cargo test --release -p okra-core -- --ignored --nocapture bench_engine_overhead`
+    #[test]
+    #[ignore]
+    fn bench_engine_overhead() {
+        let mut history = History::in_memory();
+        for n in 0..600 {
+            history.record(&format!("item:{}", n % 300), &format!("query{n}"));
+        }
+        let engine = Engine::with_providers(vec![Box::new(Many(300))], history, 40);
+        let provider = Many(300);
+        let reps = 3000;
+        let _ = engine.search("chromium");
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            std::hint::black_box(provider.query("chromium", 40));
+        }
+        let provider_us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            std::hint::black_box(engine.search("chromium"));
+        }
+        let total_us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+        println!("engine.search, 300 results: total {total_us:.1} us, provider alone {provider_us:.1} us, engine overhead {:.1} us", total_us - provider_us);
     }
 }
