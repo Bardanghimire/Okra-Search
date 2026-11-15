@@ -6,6 +6,8 @@ use okra_core::{Config, Engine, FileBackendKind, Item, Kind, Outcome, ThemeKind}
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
+mod icons;
+
 /// macOS system blue. Change this one constant to re-tint the selection and section accents.
 const ACCENT: Color32 = Color32::from_rgb(10, 132, 255);
 const WINDOW_WIDTH: f32 = 680.0;
@@ -22,6 +24,8 @@ struct Row {
     subtitle: String,
     /// `(start, end, emphasised)` byte ranges of the title; emphasised = matched by the query.
     title_runs: Vec<(usize, usize, bool)>,
+    /// What to ask Windows for this row's real icon (None: keep the coloured letter tile).
+    icon: Option<icons::IconRequest>,
 }
 
 #[derive(Clone, Copy)]
@@ -42,6 +46,7 @@ struct App {
     initial_start_with_windows: bool,
     query: String,
     rows: Vec<Row>,
+    icons: icons::Icons,
     selected: usize,
     status: String,
     gen: u64,
@@ -52,7 +57,6 @@ struct App {
     show_requested: Arc<std::sync::atomic::AtomicBool>,
     /// Set by the background app scanner when a fresh application list is available.
     index_refreshed: Arc<std::sync::atomic::AtomicBool>,
-    brand: egui::TextureHandle,
     /// Windows wakes us when another window takes the foreground (see `foreground`); if the hook
     /// could not be installed we fall back to a slow poll while the launcher is open.
     #[cfg(windows)]
@@ -192,7 +196,6 @@ impl App {
         #[cfg(windows)]
         load_system_font(&cc.egui_ctx);
         apply_theme(&cc.egui_ctx, config.theme);
-        let brand = load_brand_texture(&cc.egui_ctx);
 
         // Search runs on a worker thread; rapid typing replaces stale queued queries.
         let (q_tx, q_rx) = channel::<(u64, String)>();
@@ -232,6 +235,7 @@ impl App {
             config,
             query: String::new(),
             rows: Vec::new(),
+            icons: icons::Icons::new(&cc.egui_ctx),
             selected: 0,
             status: "Starting resident search controls…".into(),
             gen: 0,
@@ -241,7 +245,6 @@ impl App {
             settings_open: false,
             show_requested,
             index_refreshed,
-            brand,
             #[cfg(windows)]
             foreground_hook: false,
             start_hidden,
@@ -260,10 +263,17 @@ impl App {
     /// disown any older query still in flight on the search thread. This replaces a synchronous
     /// search plus an identical queued one, which did the same work twice on every show.
     fn show_suggestions(&mut self) {
-        self.rows = build_rows(self.engine.search(""), "");
+        let rows = build_rows(self.engine.search(""), "");
+        self.set_rows(rows);
         self.selected = 0;
         self.gen += 1;
         self.shown = self.gen;
+    }
+
+    /// Show a new result list and start fetching the icons it needs (rows on screen first).
+    fn set_rows(&mut self, rows: Vec<Row>) {
+        self.icons.request(rows.iter().filter_map(|row| row.icon.as_ref()));
+        self.rows = rows;
     }
 
     fn search_again(&mut self) {
@@ -451,10 +461,11 @@ impl eframe::App for App {
             self.resident_initialized = true;
         }
 
+        self.icons.poll();
         while let Ok((generation, rows)) = self.r_rx.try_recv() {
             if generation >= self.shown {
                 self.shown = generation;
-                self.rows = rows;
+                self.set_rows(rows);
                 self.selected = 0;
             }
         }
@@ -555,19 +566,14 @@ impl eframe::App for App {
                     return;
                 }
 
-                // Search row: app logo (also the drag handle), borderless field, settings gear.
+                // Search row: magnifier (also the drag handle), borderless field, settings gear.
                 ui.horizontal(|ui| {
                     ui.set_min_height(46.0);
-                    let (icon_rect, icon_response) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::drag());
+                    let (icon_rect, icon_response) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::drag());
                     if icon_response.drag_started() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
-                    ui.painter().image(
-                        self.brand.id(),
-                        icon_rect,
-                        egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
+                    paint_magnifier(ui, icon_rect.center(), pal.muted);
 
                     let field_width = (ui.available_width() - 36.0).max(100.0);
                     let response = ui.add(
@@ -646,15 +652,28 @@ impl eframe::App for App {
                                 Pos2::new(rect.left() + 8.0, rect.center().y - 17.0),
                                 Vec2::splat(34.0),
                             );
-                            ui.painter().rect_filled(tile, 8.0_f32, tile_color(item));
-                            let letter = item.title.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
-                            ui.painter().text(
-                                tile.center(),
-                                Align2::CENTER_CENTER,
-                                letter,
-                                FontId::proportional(17.0),
-                                Color32::WHITE,
-                            );
+                            match row.icon.as_ref().and_then(|(key, _)| self.icons.texture(key)) {
+                                Some(texture) => {
+                                    ui.painter().image(
+                                        texture.id(),
+                                        tile,
+                                        egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+                                }
+                                None => {
+                                    // Until the real icon arrives (or for items that have none).
+                                    ui.painter().rect_filled(tile, 8.0_f32, tile_color(item));
+                                    let letter = item.title.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+                                    ui.painter().text(
+                                        tile.center(),
+                                        Align2::CENTER_CENTER,
+                                        letter,
+                                        FontId::proportional(17.0),
+                                        Color32::WHITE,
+                                    );
+                                }
+                            }
 
                             let text_x = tile.right() + 12.0;
                             let text_painter = ui.painter().with_clip_rect(rect.shrink2(Vec2::new(4.0, 0.0)));
@@ -841,7 +860,8 @@ fn build_rows(items: Vec<Item>, query: &str) -> Vec<Row> {
             };
             let subtitle = if item.subtitle.is_empty() { item.kind.label().to_string() } else { shorten(&item.subtitle, 74) };
             let title_runs = highlight_runs(&item.title, &matched);
-            Row { item, subtitle, title_runs }
+            let icon = icons::icon_request(&item);
+            Row { item, subtitle, title_runs, icon }
         })
         .collect()
 }
@@ -856,14 +876,13 @@ fn shorten(text: &str, max_chars: usize) -> String {
     format!("\u{2026}{tail}")
 }
 
-fn load_brand_texture(ctx: &egui::Context) -> egui::TextureHandle {
-    // A dedicated 64 px render: drawn at ~30 points it is at most a 2x downscale, so it stays crisp.
-    let rgba = image::load_from_memory(include_bytes!("../../../assets/okra-search.png"))
-        .expect("bundled logo is a valid PNG")
-        .into_rgba8();
-    let size = [rgba.width() as usize, rgba.height() as usize];
-    let image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-    ctx.load_texture("okra-brand", image, egui::TextureOptions::LINEAR)
+fn paint_magnifier(ui: &egui::Ui, center: Pos2, color: Color32) {
+    let painter = ui.painter();
+    painter.circle_stroke(center + Vec2::new(-2.0, -2.0), 7.5, Stroke::new(2.2_f32, color));
+    painter.line_segment(
+        [center + Vec2::new(3.5, 3.5), center + Vec2::new(9.5, 9.5)],
+        Stroke::new(2.4_f32, color),
+    );
 }
 
 /// Set `OKRA_DEBUG=1` to append show/hide/focus transitions to `%TEMP%\okra-debug.log`
