@@ -3,9 +3,12 @@
 
     python tools/make_icons.py            (needs: pip install pillow numpy)
 
-Design: a macOS-style continuous-corner squircle with a soft vertical okra-brown gradient, one
-cream magnifying glass, and a single okra-green accent (the handle). No text, no pod illustration.
-Small sizes are rendered natively with slightly heavier strokes so they stay crisp in the tray.
+Design: a bold, flat magnifying glass on a transparent background. The lens is a solid disc with a
+soft diagonal okra-green gradient and a faint glossy highlight; the handle is two-tone brown (a
+light collar and a darker grip) with a rounded end. No ring, no text, no container shape.
+Small sizes are rendered natively with a smaller lens and a longer, thicker handle so they still
+read as a magnifier in the tray.
+Change the colours below and re-run to re-tint everything.
 """
 import math
 from pathlib import Path
@@ -15,97 +18,90 @@ from PIL import Image, ImageDraw, ImageFilter
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
 
-TOP = (132, 92, 66)       # gradient top
-BOTTOM = (50, 31, 21)     # gradient bottom
-CREAM = (251, 244, 228)
-GREEN = (142, 176, 74)
+LENS_LIGHT = (190, 230, 98)    # lens gradient, top-left
+LENS_DARK = (88, 154, 26)      # lens gradient, bottom-right
+COLLAR = (201, 146, 94)        # handle, part next to the lens
+GRIP = (110, 66, 36)           # handle, outer part
 
 SS = 4  # supersampling factor
 
 
-def squircle_mask(px: int, margin: float, n: float = 5.0) -> Image.Image:
-    """Superellipse |x|^n + |y|^n = 1 (n=5 approximates Apple's continuous-corner shape)."""
-    s = px * SS
-    half = s * (0.5 - margin)
-    c = s / 2
-    pts = []
-    for i in range(720):
-        t = 2 * math.pi * i / 720
-        ct, st = math.cos(t), math.sin(t)
-        x = c + half * math.copysign(abs(ct) ** (2 / n), ct)
-        y = c + half * math.copysign(abs(st) ** (2 / n), st)
-        pts.append((x, y))
-    m = Image.new("L", (s, s), 0)
-    ImageDraw.Draw(m).polygon(pts, fill=255)
-    return m
+def lens_layer(s: int, cx: float, cy: float, r: float) -> Image.Image:
+    """Solid disc filled with a diagonal gradient, plus a soft highlight near the top-left."""
+    yy, xx = np.mgrid[0:s, 0:s].astype(np.float32)
+    # Project every pixel onto the top-left -> bottom-right diagonal of the disc, 0..1.
+    t = ((xx - (cx - r)) + (yy - (cy - r))) / (4 * r)
+    t = np.clip(t, 0, 1)[..., None]
+    light, dark = np.array(LENS_LIGHT, np.float32), np.array(LENS_DARK, np.float32)
+    rgb = light * (1 - t) + dark * t
+    img = Image.fromarray(rgb.astype(np.uint8), "RGB").convert("RGBA")
+
+    # Glossy highlight: a soft white ellipse up and to the left of centre.
+    gloss = Image.new("L", (s, s), 0)
+    ImageDraw.Draw(gloss).ellipse(
+        [cx - 0.78 * r, cy - 0.80 * r, cx - 0.05 * r, cy - 0.30 * r], fill=95
+    )
+    gloss = gloss.filter(ImageFilter.GaussianBlur(0.10 * r))
+    white = Image.new("RGBA", (s, s), (255, 255, 255, 0))
+    white.putalpha(gloss)
+    img = Image.alpha_composite(img, white)
+
+    mask = Image.new("L", (s, s), 0)
+    ImageDraw.Draw(mask).ellipse([cx - r, cy - r, cx + r, cy + r], fill=255)
+    out = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    out.paste(img, (0, 0), mask)
+    return out
 
 
-def gradient(px: int) -> Image.Image:
-    s = px * SS
-    t = np.linspace(0, 1, s)[:, None, None]
-    top, bot = np.array(TOP)[None, None, :], np.array(BOTTOM)[None, None, :]
-    arr = (top * (1 - t) + bot * t).repeat(s, axis=1)
-    return Image.fromarray(arr.astype(np.uint8), "RGB").convert("RGBA")
-
-
-def glyph(px: int, heavy: float) -> Image.Image:
-    """Magnifying glass on a transparent layer, geometry expressed as fractions of the canvas."""
-    s = px * SS
+def handle_layer(s: int, cx: float, cy: float, r: float, width: float, reach: float = 1.92) -> Image.Image:
+    """Two-tone handle at 45 degrees: collar (starts under the lens) then grip with a round end."""
     layer = Image.new("RGBA", (s, s), (0, 0, 0, 0))
     d = ImageDraw.Draw(layer)
-    cx, cy = 0.43 * s, 0.42 * s          # lens centre
-    r_out = 0.215 * s                     # lens outer radius
-    ring = 0.062 * s * heavy              # ring thickness
-    hw = 0.070 * s * heavy                # handle thickness
-    ux = uy = math.sqrt(0.5)
-    # Handle first, starting inside the ring band, so the cream ring overlaps its end and the
-    # joint follows the ring's curve instead of showing a flat cut.
-    x0, y0 = cx + ux * (r_out - ring), cy + uy * (r_out - ring)
-    x1, y1 = cx + ux * (r_out + 0.235 * s), cy + uy * (r_out + 0.235 * s)
-    d.line([(x0, y0), (x1, y1)], fill=GREEN + (255,), width=round(hw))
-    d.ellipse([x1 - hw / 2, y1 - hw / 2, x1 + hw / 2, y1 + hw / 2], fill=GREEN + (255,))
-    d.ellipse([cx - r_out, cy - r_out, cx + r_out, cy + r_out], outline=CREAM + (255,), width=round(ring))
+    u = math.sqrt(0.5)
+
+    def at(dist: float):
+        return cx + u * dist, cy + u * dist
+
+    start, split, end = at(0.78 * r), at(1.42 * r + 0.0 * r), at(reach * r)
+    d.line([start, split], fill=COLLAR + (255,), width=round(width))
+    d.line([split, end], fill=GRIP + (255,), width=round(width))
+    ex, ey = end
+    d.ellipse([ex - width / 2, ey - width / 2, ex + width / 2, ey + width / 2], fill=GRIP + (255,))
     return layer
 
 
 def render(px: int) -> Image.Image:
-    small = px <= 48
-    margin = 0.02 if small else 0.045     # Windows icons fill more of the canvas than macOS ones
-    heavy = 1.18 if px <= 32 else (1.08 if small else 1.0)
     s = px * SS
+    if px <= 32:
+        # Tray sizes: a smaller lens with a longer, thicker handle, so it still reads as a magnifier.
+        centre, radius, thickness, reach = 0.395, 0.295, 0.155, 2.22
+    elif px <= 48:
+        centre, radius, thickness, reach = 0.405, 0.310, 0.125, 2.05
+    else:
+        centre, radius, thickness, reach = 0.415, 0.325, 0.105, 1.92
+    cx = cy = centre * s          # lens centre; glyph is optically centred on the canvas
+    r = radius * s                # lens radius
+    width = thickness * s         # handle thickness
 
-    base = gradient(px)
-    # Gentle top sheen, the one bit of "depth" (skipped on tiny sizes where it only adds mud).
-    if px >= 64:
-        sheen = np.zeros((s, s, 4), np.uint8)
-        a = np.clip(1 - np.linspace(0, 1, s) / 0.55, 0, 1) ** 2 * 34
-        sheen[..., :3] = 255
-        sheen[..., 3] = a[:, None].astype(np.uint8)
-        base = Image.alpha_composite(base, Image.fromarray(sheen, "RGBA"))
+    glyph = Image.alpha_composite(handle_layer(s, cx, cy, r, width, reach), lens_layer(s, cx, cy, r))
 
-    g = glyph(px, heavy)
-    if px >= 64:  # soft drop shadow under the glyph
+    canvas = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    if px >= 64:  # soft drop shadow so the glyph also sits well on light backgrounds
         shadow = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-        shadow.putalpha(g.getchannel("A").point(lambda v: int(v * 0.30)))
+        shadow.putalpha(glyph.getchannel("A").point(lambda v: int(v * 0.28)))
         shadow = shadow.filter(ImageFilter.GaussianBlur(0.012 * s))
-        shadow = Image.alpha_composite(Image.new("RGBA", (s, s), (0, 0, 0, 0)),
-                                       Image.eval(shadow, lambda v: v))
-        offset = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-        offset.paste(shadow, (0, round(0.014 * s)))
-        base = Image.alpha_composite(base, offset)
-    base = Image.alpha_composite(base, g)
-
-    mask = squircle_mask(px, margin)
-    out = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    out.paste(base, (0, 0), mask)
-    return out.resize((px, px), Image.LANCZOS)
+        shifted = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        shifted.paste(shadow, (0, round(0.016 * s)))
+        canvas = Image.alpha_composite(canvas, shifted)
+    canvas = Image.alpha_composite(canvas, glyph)
+    return canvas.resize((px, px), Image.LANCZOS)
 
 
 def main():
     ASSETS.mkdir(exist_ok=True)
     render(1024).save(ASSETS / "okra-logo.png")
-    render(256).save(ASSETS / "okra-brown-search.png")       # window icon
-    render(128).save(ASSETS / "okra-mark.png")               # in-app header mark
+    render(256).save(ASSETS / "okra-brown-search.png")       # window icon, README banner
+    render(128).save(ASSETS / "okra-mark.png")
     render(32).save(ASSETS / "okra-tray.png")                # notification-area icon
     sizes = [16, 24, 32, 48, 64, 128, 256]
     frames = [render(s) for s in sizes]
