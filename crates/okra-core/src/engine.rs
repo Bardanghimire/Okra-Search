@@ -51,6 +51,11 @@ impl Engine {
         engine
     }
 
+    /// How many times an item was opened and when it last was (unix seconds), for the preview pane.
+    pub fn usage(&self, id: &str) -> Option<(u32, u64)> {
+        self.history.lock().unwrap().usage(id)
+    }
+
     /// A one-line heads-up decided at startup (None when everything is as expected).
     pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()

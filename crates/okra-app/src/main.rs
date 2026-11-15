@@ -2,16 +2,21 @@
 
 use eframe::egui::{self, Align2, Color32, FontId, Key, Modifiers, Pos2, RichText, Sense, Stroke, Vec2};
 use okra_core::matcher::{fuzzy_with, Query};
-use okra_core::{Config, Engine, FileBackendKind, FontKind, Item, Kind, Outcome, ThemeKind};
+use okra_core::{Action, Config, Engine, FileBackendKind, FontKind, Item, Kind, Outcome, ThemeKind};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 mod icons;
+mod preview;
 
 /// macOS system blue. Change this one constant to re-tint the selection and section accents.
 const ACCENT: Color32 = Color32::from_rgb(10, 132, 255);
-const WINDOW_WIDTH: f32 = 680.0;
+/// Wide enough for the result list on the left and the preview pane on the right.
+const WINDOW_WIDTH: f32 = 860.0;
+const LIST_WIDTH: f32 = 320.0;
+/// The preview needs some room even when there are only one or two results.
+const PREVIEW_MIN_HEIGHT: f32 = 250.0;
 const BAR_HEIGHT: f32 = 66.0;
 const ROW_HEIGHT: f32 = 48.0;
 const MAX_LIST_HEIGHT: f32 = 400.0;
@@ -62,6 +67,12 @@ struct App {
     query: String,
     rows: Vec<Row>,
     icons: icons::Icons,
+    /// File details for the preview pane, loaded off the UI thread.
+    previews: preview::Previews,
+    /// Id of the result the cached `preview_extra` belongs to.
+    preview_id: String,
+    /// Preview rows that need no disk access (location, what a setting opens, usage...).
+    preview_extra: Vec<(String, String)>,
     selected: usize,
     status: String,
     gen: u64,
@@ -286,6 +297,9 @@ impl App {
             query: String::new(),
             rows: Vec::new(),
             icons: icons::Icons::new(&cc.egui_ctx),
+            previews: preview::Previews::new(&cc.egui_ctx),
+            preview_id: String::new(),
+            preview_extra: Vec::new(),
             selected: 0,
             status: String::new(),
             gen: 0,
@@ -373,6 +387,8 @@ impl App {
         self.settings_open = false;
         self.query.clear();
         self.reset_results();
+        self.previews.clear();
+        self.preview_id.clear();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
@@ -487,6 +503,52 @@ impl App {
         }
     }
 
+    /// Keep the preview pane in step with the selection: build the cheap rows when the selected
+    /// result changes, and ask the worker for file details.
+    fn refresh_preview(&mut self) {
+        let Some(row) = self.rows.get(self.selected) else {
+            self.preview_id.clear();
+            return;
+        };
+        let item = &row.item;
+        if item.id != self.preview_id {
+            self.preview_id = item.id.clone();
+            self.preview_extra = build_extra(&self.engine, item);
+        }
+        if let (Kind::File | Kind::Folder, Action::OpenPath(path)) = (item.kind, &item.action) {
+            self.previews.request(&item.id, path, item.kind == Kind::Folder);
+        }
+    }
+
+    fn draw_preview(&self, ui: &mut egui::Ui, pal: Palette) {
+        let Some(row) = self.rows.get(self.selected) else { return };
+        let item = &row.item;
+        let is_file = matches!(item.kind, Kind::File | Kind::Folder);
+        let loaded = if is_file { self.previews.get(&item.id) } else { None };
+        // Until the worker answers, a file shows just where it lives.
+        let pending: Vec<(String, String)> = if is_file && loaded.is_none() {
+            vec![("Where".to_string(), shorten(&item.subtitle, 52))]
+        } else {
+            Vec::new()
+        };
+        let rows: &[(String, String)] = match loaded {
+            Some(found) => &found.rows,
+            None => &pending,
+        };
+        let view = preview::View {
+            title: &item.title,
+            kind_label: loaded.map(|found| found.kind_label.as_str()).unwrap_or_else(|| item.kind.label()),
+            large: item.kind == Kind::Calculation,
+            icon: row.icon.as_ref().and_then(|(key, _)| self.icons.texture(key)),
+            thumb: loaded.and_then(|found| found.thumb.as_ref()),
+            tile: tile_color(item),
+            rows,
+            extra: &self.preview_extra,
+            text: loaded.and_then(|found| found.text.as_deref()),
+        };
+        preview::show(ui, &view, pal.text, pal.muted);
+    }
+
     /// Window height for the current state: just the search bar when idle, growing with results.
     fn desired_height(&self) -> f32 {
         if self.settings_open {
@@ -505,7 +567,7 @@ impl App {
             }
             prev = Some(row.item.kind);
         }
-        BAR_HEIGHT + 24.0 + status + total.min(MAX_LIST_HEIGHT)
+        BAR_HEIGHT + 24.0 + status + total.min(MAX_LIST_HEIGHT).max(PREVIEW_MIN_HEIGHT)
     }
 }
 
@@ -554,6 +616,7 @@ impl eframe::App for App {
         }
 
         self.icons.poll();
+        self.previews.poll();
         while let Ok((generation, rows)) = self.r_rx.try_recv() {
             if generation >= self.shown {
                 // A later batch for the same query (the file results joining the instant ones)
@@ -672,6 +735,7 @@ impl eframe::App for App {
             }
         }
 
+        self.refresh_preview();
         let pal = palette(self.config.theme);
         let height = self.desired_height();
         // Windows ignores the window's transparency here (the unused part showed up black), so
@@ -751,7 +815,13 @@ impl eframe::App for App {
                     ui.separator();
                     let selected = self.selected;
                     let mut clicked = None;
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    // Left: the result list. Right: the preview of the selected result.
+                    let area = ui.available_rect_before_wrap();
+                    let list_rect = egui::Rect::from_min_size(area.min, Vec2::new(LIST_WIDTH, area.height()));
+                    let preview_rect = egui::Rect::from_min_max(Pos2::new(list_rect.right() + 16.0, area.top()), area.max);
+                    ui.painter().vline(list_rect.right() + 8.0, area.y_range(), Stroke::new(1.0_f32, pal.sep));
+                    let mut list_ui = ui.child_ui_with_id_source(list_rect, egui::Layout::top_down(egui::Align::LEFT), "okra-list");
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(&mut list_ui, |ui| {
                         let mut prev: Option<Kind> = None;
                         for (index, row) in self.rows.iter().enumerate() {
                             let item = &row.item;
@@ -813,7 +883,7 @@ impl eframe::App for App {
                             let text_x = tile.right() + 12.0;
                             let text_painter = ui.painter().with_clip_rect(rect.shrink2(Vec2::new(4.0, 0.0)));
                             // Leave room on the right of the first nine rows for their Ctrl+N hint.
-                            let hint_room = if index < 9 { 58.0 } else { 0.0 };
+                            let hint_room = if index < 9 { 44.0 } else { 0.0 };
                             let title_rect = egui::Rect::from_min_max(
                                 Pos2::new(text_x, rect.center().y - 18.0),
                                 Pos2::new(rect.right() - 12.0 - hint_room, rect.center().y + 2.0),
@@ -849,6 +919,9 @@ impl eframe::App for App {
                             ui.add_space(2.0);
                         }
                     });
+                    let mut preview_ui =
+                        ui.child_ui_with_id_source(preview_rect, egui::Layout::top_down(egui::Align::LEFT), "okra-preview");
+                    self.draw_preview(&mut preview_ui, pal);
                     if let Some(index) = clicked {
                         activate = Some(index);
                     }
@@ -1014,12 +1087,58 @@ fn build_rows(items: Vec<Item>, query: &str) -> Vec<Row> {
             } else {
                 fuzzy_with(&highlight, &item.title).map(|m| m.indices).unwrap_or_default()
             };
-            let subtitle = if item.subtitle.is_empty() { item.kind.label().to_string() } else { shorten(&item.subtitle, 74) };
+            let subtitle = if item.subtitle.is_empty() { item.kind.label().to_string() } else { shorten(&item.subtitle, 40) };
             let title_runs = highlight_runs(&item.title, &matched);
             let icon = icons::icon_request(&item);
             Row { item, subtitle, title_runs, icon }
         })
         .collect()
+}
+
+/// Preview rows that need no disk access: where an app lives, what a setting opens, how often the
+/// result was opened before.
+fn build_extra(engine: &Engine, item: &Item) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    match (&item.kind, &item.action) {
+        (Kind::App, Action::Launch { path, .. }) => rows.push(("Where".to_string(), shorten(&path.display().to_string(), 52))),
+        (Kind::App, Action::LaunchAppId(_)) => rows.push(("Source".to_string(), "Microsoft Store app".to_string())),
+        (Kind::Setting, Action::OpenUri(uri)) => rows.push(("Opens".to_string(), uri.clone())),
+        (Kind::Setting, Action::Run { program, args }) => {
+            let command = if args.is_empty() { program.clone() } else { format!("{program} {}", args.join(" ")) };
+            rows.push(("Runs".to_string(), shorten(&command, 52)));
+        }
+        (Kind::Window, _) => rows.push(("Details".to_string(), item.subtitle.clone())),
+        (Kind::Calculation, _) => {
+            let expression = item.subtitle.split('\u{b7}').next().unwrap_or("").trim().to_string();
+            rows.push(("Expression".to_string(), expression));
+            rows.push(("Press Enter".to_string(), "to copy the answer".to_string()));
+        }
+        _ => {}
+    }
+    if item.kind != Kind::Calculation {
+        if let Some((count, last)) = engine.usage(&item.id) {
+            let times = if count == 1 { "1 time".to_string() } else { format!("{count} times") };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            rows.push(("Opened".to_string(), if last > 0 { format!("{times}, last {}", ago(now.saturating_sub(last))) } else { times }));
+        }
+    }
+    rows
+}
+
+/// `just now`, `5 min ago`, `3 h ago`, `2 days ago`.
+fn ago(seconds: u64) -> String {
+    match seconds {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => format!("{} min ago", seconds / 60),
+        3_600..=86_399 => format!("{} h ago", seconds / 3_600),
+        _ => {
+            let days = seconds / 86_400;
+            if days == 1 { "1 day ago".to_string() } else { format!("{days} days ago") }
+        }
+    }
 }
 
 /// Keeps the tail of long paths, which is the informative part.
