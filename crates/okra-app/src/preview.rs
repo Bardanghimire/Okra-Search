@@ -17,6 +17,9 @@ const MAX_CACHED: usize = 60;
 /// Height reserved above the title for the icon or image thumbnail.
 const VISUAL_HEIGHT: f32 = 150.0;
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+/// Larger pictures still show their size, but are not decoded (a huge image would need hundreds of MB).
+const MAX_IMAGE_PIXELS: u64 = 60_000_000;
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp"];
 const TEXT_EXTENSIONS: &[&str] = &[
     "txt", "md", "log", "csv", "json", "toml", "yml", "yaml", "ini", "cfg", "conf", "xml", "html", "htm", "css", "js", "ts",
     "rs", "py", "c", "h", "cpp", "hpp", "java", "cs", "go", "bat", "cmd", "ps1", "sh", "sql", "tex", "srt",
@@ -125,25 +128,30 @@ pub fn load(path: &Path, is_dir: bool) -> Details {
     if is_dir {
         let count = std::fs::read_dir(path).map(|entries| entries.take(1000).count()).unwrap_or(0);
         let shown = if count >= 1000 { "1000+".to_string() } else { count.to_string() };
-        details.rows.push(("Contains".to_string(), format!("{shown} items")));
+        let noun = if count == 1 { "item" } else { "items" };
+        details.rows.push(("Contains".to_string(), format!("{shown} {noun}")));
     } else {
         details.rows.push(("Size".to_string(), human_size(meta.len())));
     }
-    let offset = local_offset_minutes();
     if let Ok(time) = meta.modified() {
-        details.rows.push(("Modified".to_string(), format_time(time, offset)));
+        details.rows.push(("Modified".to_string(), format_time(time, local_offset_minutes(time))));
     }
     if let Ok(time) = meta.created() {
-        details.rows.push(("Created".to_string(), format_time(time, offset)));
+        details.rows.push(("Created".to_string(), format_time(time, local_offset_minutes(time))));
     }
 
     if !is_dir {
-        if extension == "png" && meta.len() <= MAX_IMAGE_BYTES {
-            if let Ok(picture) = image::open(path) {
-                details.rows.push(("Dimensions".to_string(), format!("{} \u{d7} {}", picture.width(), picture.height())));
-                let small = picture.thumbnail(480, 480).to_rgba8();
-                let size = [small.width() as usize, small.height() as usize];
-                details.image = Some(egui::ColorImage::from_rgba_unmultiplied(size, small.as_raw()));
+        if IMAGE_EXTENSIONS.contains(&extension.as_str()) {
+            // The header alone gives the size, so even a picture that is too big to decode shows it.
+            if let Ok((width, height)) = image::image_dimensions(path) {
+                details.rows.push(("Dimensions".to_string(), format!("{width} \u{d7} {height}")));
+                if meta.len() <= MAX_IMAGE_BYTES && u64::from(width) * u64::from(height) <= MAX_IMAGE_PIXELS {
+                    if let Ok(picture) = image::open(path) {
+                        let small = picture.thumbnail(480, 480).to_rgba8();
+                        let size = [small.width() as usize, small.height() as usize];
+                        details.image = Some(egui::ColorImage::from_rgba_unmultiplied(size, small.as_raw()));
+                    }
+                }
             }
         } else if TEXT_EXTENSIONS.contains(&extension.as_str()) {
             details.text = read_snippet(path);
@@ -158,6 +166,7 @@ pub fn load(path: &Path, is_dir: bool) -> Details {
 /// The first lines of a text file (None for an empty or binary file).
 fn read_snippet(path: &Path) -> Option<String> {
     use std::io::Read;
+    const MAX_LINES: usize = 14;
     let mut file = std::fs::File::open(path).ok()?;
     let mut buffer = vec![0u8; 4096];
     let read = file.read(&mut buffer).ok()?;
@@ -165,23 +174,33 @@ fn read_snippet(path: &Path) -> Option<String> {
     if buffer.is_empty() || buffer.contains(&0) {
         return None;
     }
-    let text = String::from_utf8_lossy(&buffer);
-    let lines: Vec<String> = text
+    // Skip a UTF-8 byte order mark, and drop a character that the 4 KB cut in half.
+    let bytes = buffer.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&buffer);
+    let text = match std::str::from_utf8(bytes) {
+        Ok(valid) => valid.to_string(),
+        Err(error) if error.error_len().is_none() => String::from_utf8_lossy(&bytes[..error.valid_up_to()]).into_owned(),
+        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+    };
+    let mut lines: Vec<String> = text
         .lines()
-        .take(14)
+        .take(MAX_LINES + 1)
         .map(|line| line.chars().take(100).collect::<String>().replace('\t', "    "))
         .collect();
+    if lines.len() > MAX_LINES {
+        lines.truncate(MAX_LINES);
+        lines.push("\u{2026}".to_string());
+    }
     Some(lines.join("\n"))
 }
 
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
     if bytes < 1024 {
-        return format!("{bytes} bytes");
+        return if bytes == 1 { "1 byte".to_string() } else { format!("{bytes} bytes") };
     }
     let mut value = bytes as f64 / 1024.0;
     let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
+    while value >= 1023.5 && unit + 1 < UNITS.len() {
         value /= 1024.0;
         unit += 1;
     }
@@ -216,9 +235,65 @@ pub fn format_time(time: SystemTime, offset_minutes: i64) -> String {
     format!("{day} {} {year}, {:02}:{:02}", MONTHS[(month - 1) as usize], in_day / 3600, (in_day % 3600) / 60)
 }
 
-/// Minutes to add to UTC to get this PC's local time.
+/// Days since 1970-01-01 for a calendar date (the inverse of [`civil_from_days`]).
+#[cfg(any(windows, test))]
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month_index = (if month > 2 { month - 3 } else { month + 9 }) as i64;
+    let day_of_year = (153 * month_index + 2) / 5 + day as i64 - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Minutes to add to UTC to get this PC's local time at `time`. Uses the time zone rules for that
+/// date, so a file saved in summer shows summer time even when it is winter now.
 #[cfg(windows)]
-fn local_offset_minutes() -> i64 {
+fn local_offset_minutes(time: SystemTime) -> i64 {
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Parts {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        millis: u16,
+    }
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn FileTimeToSystemTime(file_time: *const FileTime, system_time: *mut Parts) -> i32;
+        fn SystemTimeToTzSpecificLocalTime(zone: *const std::ffi::c_void, universal: *const Parts, local: *mut Parts) -> i32;
+    }
+    let minutes = |p: &Parts| days_from_civil(i64::from(p.year), u32::from(p.month), u32::from(p.day)) * 1440 + i64::from(p.hour) * 60 + i64::from(p.minute);
+    let Ok(since_epoch) = time.duration_since(UNIX_EPOCH) else { return current_offset_minutes() };
+    // FILETIME counts 100 ns ticks since 1601-01-01.
+    let ticks = (since_epoch.as_secs() + 11_644_473_600) * 10_000_000;
+    let file_time = FileTime { low: ticks as u32, high: (ticks >> 32) as u32 };
+    let mut universal = Parts::default();
+    let mut local = Parts::default();
+    let converted = unsafe {
+        FileTimeToSystemTime(&file_time, &mut universal) != 0
+            && SystemTimeToTzSpecificLocalTime(std::ptr::null(), &universal, &mut local) != 0
+    };
+    if converted {
+        minutes(&local) - minutes(&universal)
+    } else {
+        current_offset_minutes()
+    }
+}
+
+/// The offset in force right now (fallback when the per-date conversion fails).
+#[cfg(windows)]
+fn current_offset_minutes() -> i64 {
     #[repr(C)]
     struct SystemTimeParts {
         parts: [u16; 8],
@@ -250,7 +325,7 @@ fn local_offset_minutes() -> i64 {
 }
 
 #[cfg(not(windows))]
-fn local_offset_minutes() -> i64 {
+fn local_offset_minutes(_time: SystemTime) -> i64 {
     0
 }
 
@@ -308,7 +383,7 @@ pub fn show(ui: &mut egui::Ui, view: &View, text: Color32, muted: Color32) {
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(4.0);
-            egui::Grid::new("okra-preview-grid").num_columns(2).spacing(Vec2::new(14.0, 6.0)).show(ui, |ui| {
+            egui::Grid::new("okra-preview-grid").num_columns(2).max_col_width((ui.available_width() - 100.0).max(120.0)).spacing(Vec2::new(14.0, 6.0)).show(ui, |ui| {
                 for (label, value) in view.rows.iter().chain(view.extra.iter()) {
                     ui.label(RichText::new(label).size(12.0).color(muted));
                     ui.add(egui::Label::new(RichText::new(value).size(13.0).color(text)).truncate(true));
@@ -345,9 +420,19 @@ mod tests {
     }
 
     #[test]
+    fn calendar_conversions_round_trip() {
+        for days in [-1_000_i64, -1, 0, 59, 60, 11_016, 19_675, 40_000] {
+            let (year, month, day) = civil_from_days(days);
+            assert_eq!(days_from_civil(year, month, day), days);
+        }
+    }
+
+    #[test]
     fn sizes_read_naturally() {
         assert_eq!(human_size(0), "0 bytes");
+        assert_eq!(human_size(1), "1 byte");
         assert_eq!(human_size(1023), "1023 bytes");
+        assert_eq!(human_size(1024 * 1024 - 1), "1.0 MB");
         assert_eq!(human_size(1536), "1.5 KB");
         assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
         assert_eq!(human_size(300 * 1024 * 1024), "300 MB");
@@ -368,11 +453,25 @@ mod tests {
 
         let folder = load(&dir, true);
         assert_eq!(folder.kind_label, "Folder");
-        assert!(folder.rows.iter().any(|(label, value)| label == "Contains" && value == "1 items"));
+        assert!(folder.rows.iter().any(|(label, value)| label == "Contains" && value == "1 item"));
 
         let missing = load(&dir.join("gone.bin"), false);
         assert_eq!(missing.rows[0].0, "Status");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_snippets_skip_bom_and_mark_cuts() {
+        let path = std::env::temp_dir().join(format!("okra-preview-bom-{}.txt", std::process::id()));
+        let mut content = vec![0xEF, 0xBB, 0xBF];
+        for n in 0..20 {
+            content.extend_from_slice(format!("line {n}\n").as_bytes());
+        }
+        std::fs::write(&path, &content).unwrap();
+        let snippet = read_snippet(&path).unwrap();
+        assert!(snippet.starts_with("line 0\n"));
+        assert!(snippet.ends_with("line 13\n\u{2026}"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
