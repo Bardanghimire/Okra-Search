@@ -106,6 +106,7 @@ def main():
     render(1024).save(ASSETS / "okra-logo.png")
     render(256).save(ASSETS / "okra-brown-search.png")       # window icon
     render(128).save(ASSETS / "okra-mark.png")               # in-app header mark
+    render(64).save(ASSETS / "okra-search.png")              # logo in the search bar
     render(32).save(ASSETS / "okra-tray.png")                # notification-area icon
     sizes = [16, 24, 32, 48, 64, 128, 256]
     frames = [render(s) for s in sizes]
