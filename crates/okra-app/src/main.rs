@@ -6,6 +6,8 @@ use okra_core::{Config, Engine, FileBackendKind, Item, Kind, Outcome, ThemeKind}
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
+mod icons;
+
 /// macOS system blue. Change this one constant to re-tint the selection and section accents.
 const ACCENT: Color32 = Color32::from_rgb(10, 132, 255);
 const WINDOW_WIDTH: f32 = 680.0;
@@ -13,6 +15,18 @@ const BAR_HEIGHT: f32 = 66.0;
 const ROW_HEIGHT: f32 = 48.0;
 const MAX_LIST_HEIGHT: f32 = 400.0;
 const SETTINGS_HEIGHT: f32 = 540.0;
+
+/// A result plus everything drawing it needs that depends only on the result and the query that
+/// produced it. Built once on the search thread, instead of on every frame for every row.
+struct Row {
+    item: Item,
+    /// Shortened path, or the kind label when there is none.
+    subtitle: String,
+    /// `(start, end, emphasised)` byte ranges of the title; emphasised = matched by the query.
+    title_runs: Vec<(usize, usize, bool)>,
+    /// What to ask Windows for this row's real icon (None: keep the coloured letter tile).
+    icon: Option<icons::IconRequest>,
+}
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -31,17 +45,22 @@ struct App {
     initial_max_results: usize,
     initial_start_with_windows: bool,
     query: String,
-    results: Vec<Item>,
+    rows: Vec<Row>,
+    icons: icons::Icons,
     selected: usize,
     status: String,
     gen: u64,
     shown: u64,
     q_tx: Sender<(u64, String)>,
-    r_rx: Receiver<(u64, Vec<Item>)>,
+    r_rx: Receiver<(u64, Vec<Row>)>,
     settings_open: bool,
     show_requested: Arc<std::sync::atomic::AtomicBool>,
     /// Set by the background app scanner when a fresh application list is available.
     index_refreshed: Arc<std::sync::atomic::AtomicBool>,
+    /// Windows wakes us when another window takes the foreground (see `foreground`); if the hook
+    /// could not be installed we fall back to a slow poll while the launcher is open.
+    #[cfg(windows)]
+    foreground_hook: bool,
     start_hidden: bool,
     resident_initialized: bool,
     last_height: f32,
@@ -180,15 +199,15 @@ impl App {
 
         // Search runs on a worker thread; rapid typing replaces stale queued queries.
         let (q_tx, q_rx) = channel::<(u64, String)>();
-        let (r_tx, r_rx) = channel::<(u64, Vec<Item>)>();
+        let (r_tx, r_rx) = channel::<(u64, Vec<Row>)>();
         let (eng, ctx) = (engine.clone(), cc.egui_ctx.clone());
         std::thread::spawn(move || {
             while let Ok(mut latest) = q_rx.recv() {
                 while let Ok(newer) = q_rx.try_recv() {
                     latest = newer;
                 }
-                let items = eng.search(&latest.1);
-                if r_tx.send((latest.0, items)).is_err() {
+                let rows = build_rows(eng.search(&latest.1), &latest.1);
+                if r_tx.send((latest.0, rows)).is_err() {
                     break;
                 }
                 ctx.request_repaint();
@@ -215,7 +234,8 @@ impl App {
             initial_start_with_windows: config.start_with_windows,
             config,
             query: String::new(),
-            results: Vec::new(),
+            rows: Vec::new(),
+            icons: icons::Icons::new(&cc.egui_ctx),
             selected: 0,
             status: "Starting resident search controls…".into(),
             gen: 0,
@@ -225,6 +245,8 @@ impl App {
             settings_open: false,
             show_requested,
             index_refreshed,
+            #[cfg(windows)]
+            foreground_hook: false,
             start_hidden,
             resident_initialized: false,
             last_height: 0.0,
@@ -233,9 +255,25 @@ impl App {
             #[cfg(windows)]
             _resident: None,
         };
-        app.results = app.engine.search("");
-        app.search_again();
+        app.show_suggestions();
         app
+    }
+
+    /// Fill in the idle suggestions right away (so there is never a frame of stale results) and
+    /// disown any older query still in flight on the search thread. This replaces a synchronous
+    /// search plus an identical queued one, which did the same work twice on every show.
+    fn show_suggestions(&mut self) {
+        let rows = build_rows(self.engine.search(""), "");
+        self.set_rows(rows);
+        self.selected = 0;
+        self.gen += 1;
+        self.shown = self.gen;
+    }
+
+    /// Show a new result list and start fetching the icons it needs (rows on screen first).
+    fn set_rows(&mut self, rows: Vec<Row>) {
+        self.icons.request(rows.iter().filter_map(|row| row.icon.as_ref()));
+        self.rows = rows;
     }
 
     fn search_again(&mut self) {
@@ -248,26 +286,30 @@ impl App {
         self.query.clear();
         self.status.clear();
         self.had_focus = false;
-        // Suggestions are cheap, so fill them in before the first frame instead of flashing stale results.
-        self.results = self.engine.search("");
-        self.selected = 0;
-        self.search_again();
+        self.show_suggestions();
+        debug_log("show");
         #[cfg(windows)]
-        bring_to_front();
+        {
+            foreground::watch(true);
+            bring_to_front();
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        self.focus_retry_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(700));
+        self.focus_retry_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(1000));
         ctx.request_repaint();
     }
 
     fn hide(&mut self, ctx: &egui::Context) {
+        debug_log("hide");
+        #[cfg(windows)]
+        foreground::watch(false);
         self.had_focus = false;
         self.focus_retry_until = None;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
     fn activate(&mut self, ctx: &egui::Context, idx: usize) {
-        let Some(item) = self.results.get(idx).cloned() else { return };
+        let Some(item) = self.rows.get(idx).map(|row| row.item.clone()) else { return };
         match self.engine.activate_for(&item, &self.query) {
             Ok(Outcome::CopyText(text)) => {
                 ctx.output_mut(|output| output.copied_text = text);
@@ -371,17 +413,17 @@ impl App {
             return SETTINGS_HEIGHT;
         }
         let status = if self.status.is_empty() { 0.0 } else { 22.0 };
-        if self.results.is_empty() {
+        if self.rows.is_empty() {
             return if self.query.trim().is_empty() { BAR_HEIGHT + status } else { BAR_HEIGHT + 64.0 + status };
         }
         let mut total = 0.0;
         let mut prev: Option<Kind> = None;
-        for (index, item) in self.results.iter().enumerate() {
+        for (index, row) in self.rows.iter().enumerate() {
             total += ROW_HEIGHT + 4.0;
-            if index == 0 || prev != Some(item.kind) {
+            if index == 0 || prev != Some(row.item.kind) {
                 total += 28.0;
             }
-            prev = Some(item.kind);
+            prev = Some(row.item.kind);
         }
         BAR_HEIGHT + 24.0 + status + total.min(MAX_LIST_HEIGHT)
     }
@@ -404,8 +446,12 @@ impl eframe::App for App {
                     && status.contains("System tray unavailable");
                 self._resident = Some(resident);
                 self.status = status;
+                self.foreground_hook = foreground::install(ctx);
+                debug_log(&format!("foreground hook installed: {}", self.foreground_hook));
                 if self.start_hidden && !controls_failed {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                } else {
+                    foreground::watch(true);
                 }
             }
             #[cfg(not(windows))]
@@ -415,10 +461,11 @@ impl eframe::App for App {
             self.resident_initialized = true;
         }
 
-        while let Ok((generation, items)) = self.r_rx.try_recv() {
+        self.icons.poll();
+        while let Ok((generation, rows)) = self.r_rx.try_recv() {
             if generation >= self.shown {
                 self.shown = generation;
-                self.results = items;
+                self.set_rows(rows);
                 self.selected = 0;
             }
         }
@@ -431,21 +478,40 @@ impl eframe::App for App {
         }
 
         // Click anywhere outside (or switch away) and the launcher goes away, like Spotlight.
+        // On Windows ask the OS which window is in the foreground: egui's own focus flag is fed
+        // by window messages and can disagree with reality, which kept this from ever closing.
+        #[cfg(windows)]
+        let focused = foreground::is_ours();
+        #[cfg(not(windows))]
         let focused = ctx.input(|input| input.viewport().focused).unwrap_or(false);
         if focused {
+            if !self.had_focus {
+                debug_log("focus gained");
+            }
             self.had_focus = true;
         } else if self.had_focus {
+            debug_log("focus lost -> hiding");
             self.hide(ctx);
         }
         if let Some(deadline) = self.focus_retry_until {
-            if focused || std::time::Instant::now() > deadline {
+            if focused {
                 self.focus_retry_until = None;
+            } else if std::time::Instant::now() > deadline {
+                // Windows refused to hand us the foreground. A launcher that cannot take typing,
+                // and that clicking away could never dismiss, is worse than none: step aside.
+                debug_log("focus never granted -> hiding");
+                self.hide(ctx);
             } else {
                 #[cfg(windows)]
                 bring_to_front();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 ctx.request_repaint_after(std::time::Duration::from_millis(60));
             }
+        }
+        // Without the foreground hook, check on a slow timer (only while the launcher is open).
+        #[cfg(windows)]
+        if !self.foreground_hook && self.had_focus {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
 
         let (down, up, enter, escape) = ctx.input_mut(|input| {
@@ -459,15 +525,15 @@ impl eframe::App for App {
         let mut activate = None;
         let mut moved = false;
         if !self.settings_open {
-            if down && !self.results.is_empty() {
-                self.selected = (self.selected + 1).min(self.results.len() - 1);
+            if down && !self.rows.is_empty() {
+                self.selected = (self.selected + 1).min(self.rows.len() - 1);
                 moved = true;
             }
             if up {
                 self.selected = self.selected.saturating_sub(1);
                 moved = true;
             }
-            if enter && !self.results.is_empty() {
+            if enter && !self.rows.is_empty() {
                 activate = Some(self.selected);
             }
         }
@@ -537,9 +603,8 @@ impl eframe::App for App {
                     ui.label(RichText::new(&self.status).size(12.0).color(pal.muted));
                 }
                 let searching = !self.query.trim().is_empty();
-                let highlight = Query::new(strip_route_prefix(&self.query));
                 let suggestions = !searching;
-                if self.results.is_empty() {
+                if self.rows.is_empty() {
                     if searching {
                         ui.separator();
                         ui.add_space(10.0);
@@ -553,7 +618,8 @@ impl eframe::App for App {
                     let mut clicked = None;
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         let mut prev: Option<Kind> = None;
-                        for (index, item) in self.results.iter().enumerate() {
+                        for (index, row) in self.rows.iter().enumerate() {
+                            let item = &row.item;
                             let heading = if index == 0 {
                                 Some(if suggestions { "Suggestions" } else { "Top Hit" })
                             } else if prev != Some(item.kind) {
@@ -586,37 +652,44 @@ impl eframe::App for App {
                                 Pos2::new(rect.left() + 8.0, rect.center().y - 17.0),
                                 Vec2::splat(34.0),
                             );
-                            ui.painter().rect_filled(tile, 8.0_f32, tile_color(item));
-                            let letter = item.title.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
-                            ui.painter().text(
-                                tile.center(),
-                                Align2::CENTER_CENTER,
-                                letter,
-                                FontId::proportional(17.0),
-                                Color32::WHITE,
-                            );
+                            match row.icon.as_ref().and_then(|(key, _)| self.icons.texture(key)) {
+                                Some(texture) => {
+                                    ui.painter().image(
+                                        texture.id(),
+                                        tile,
+                                        egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+                                }
+                                None => {
+                                    // Until the real icon arrives (or for items that have none).
+                                    ui.painter().rect_filled(tile, 8.0_f32, tile_color(item));
+                                    let letter = item.title.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+                                    ui.painter().text(
+                                        tile.center(),
+                                        Align2::CENTER_CENTER,
+                                        letter,
+                                        FontId::proportional(17.0),
+                                        Color32::WHITE,
+                                    );
+                                }
+                            }
 
                             let text_x = tile.right() + 12.0;
                             let text_painter = ui.painter().with_clip_rect(rect.shrink2(Vec2::new(4.0, 0.0)));
-                            let subtitle = if item.subtitle.is_empty() { item.kind.label().to_string() } else { shorten(&item.subtitle, 74) };
-                            let matched: Vec<usize> = if highlight.is_empty() || item.kind == Kind::Calculation {
-                                Vec::new()
-                            } else {
-                                fuzzy_with(&highlight, &item.title).map(|m| m.indices).unwrap_or_default()
-                            };
                             let title_rect = egui::Rect::from_min_max(
                                 Pos2::new(text_x, rect.center().y - 18.0),
                                 Pos2::new(rect.right() - 12.0, rect.center().y + 2.0),
                             );
                             let mut title_ui = ui.child_ui(title_rect, egui::Layout::left_to_right(egui::Align::Center));
                             title_ui.add(
-                                egui::Label::new(title_job(&item.title, &matched, title_color, is_selected, item.kind == Kind::Calculation))
+                                egui::Label::new(title_job(row, title_color, is_selected, item.kind == Kind::Calculation))
                                     .truncate(true),
                             );
                             text_painter.text(
                                 Pos2::new(text_x, rect.center().y + 10.0),
                                 Align2::LEFT_CENTER,
-                                subtitle,
+                                &row.subtitle,
                                 FontId::proportional(12.0),
                                 sub_color,
                             );
@@ -732,8 +805,9 @@ fn strip_route_prefix(query: &str) -> &str {
     query.trim()
 }
 
-/// Title text with the matched letters emphasised.
-fn title_job(title: &str, matched: &[usize], color: Color32, selected: bool, large: bool) -> egui::text::LayoutJob {
+/// Title text with the matched letters emphasised: a handful of text runs per title, built
+/// from the ranges computed once in [`build_rows`].
+fn title_job(row: &Row, color: Color32, selected: bool, large: bool) -> egui::text::LayoutJob {
     let size = if large { 20.0 } else { 15.5 };
     let plain = egui::TextFormat { font_id: FontId::proportional(size), color, ..Default::default() };
     let mut emphasised = plain.clone();
@@ -743,11 +817,53 @@ fn title_job(title: &str, matched: &[usize], color: Color32, selected: bool, lar
         emphasised.color = ACCENT;
     }
     let mut job = egui::text::LayoutJob::default();
-    for (index, ch) in title.chars().enumerate() {
-        let format = if matched.contains(&index) { emphasised.clone() } else { plain.clone() };
-        job.append(&ch.to_string(), 0.0, format);
+    for &(start, end, matched) in &row.title_runs {
+        job.append(&row.item.title[start..end], 0.0, if matched { emphasised.clone() } else { plain.clone() });
     }
     job
+}
+
+/// Merges per-character matches (`matched` = ascending char indices) into byte-range runs.
+fn highlight_runs(title: &str, matched: &[usize]) -> Vec<(usize, usize, bool)> {
+    let mut runs = Vec::new();
+    let mut current: Option<(usize, bool)> = None;
+    let mut next = 0;
+    for (char_index, (byte_index, _)) in title.char_indices().enumerate() {
+        let hit = next < matched.len() && matched[next] == char_index;
+        if hit {
+            next += 1;
+        }
+        current = match current {
+            Some((start, flag)) if flag != hit => {
+                runs.push((start, byte_index, flag));
+                Some((byte_index, hit))
+            }
+            Some(run) => Some(run),
+            None => Some((byte_index, hit)),
+        };
+    }
+    if let Some((start, flag)) = current {
+        runs.push((start, title.len(), flag));
+    }
+    runs
+}
+
+fn build_rows(items: Vec<Item>, query: &str) -> Vec<Row> {
+    let highlight = Query::new(strip_route_prefix(query));
+    items
+        .into_iter()
+        .map(|item| {
+            let matched = if highlight.is_empty() || item.kind == Kind::Calculation {
+                Vec::new()
+            } else {
+                fuzzy_with(&highlight, &item.title).map(|m| m.indices).unwrap_or_default()
+            };
+            let subtitle = if item.subtitle.is_empty() { item.kind.label().to_string() } else { shorten(&item.subtitle, 74) };
+            let title_runs = highlight_runs(&item.title, &matched);
+            let icon = icons::icon_request(&item);
+            Row { item, subtitle, title_runs, icon }
+        })
+        .collect()
 }
 
 /// Keeps the tail of long paths, which is the informative part.
@@ -767,6 +883,99 @@ fn paint_magnifier(ui: &egui::Ui, center: Pos2, color: Color32) {
         [center + Vec2::new(3.5, 3.5), center + Vec2::new(9.5, 9.5)],
         Stroke::new(2.4_f32, color),
     );
+}
+
+/// Set `OKRA_DEBUG=1` to append show/hide/focus transitions to `%TEMP%\okra-debug.log`
+/// (the release build has no console). Does nothing otherwise.
+fn debug_log(message: &str) {
+    use std::io::Write;
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let started = *START.get_or_init(std::time::Instant::now);
+    if std::env::var_os("OKRA_DEBUG").is_none() {
+        return;
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(std::env::temp_dir().join("okra-debug.log")) {
+        let _ = writeln!(file, "{:>9.3}s {message}", started.elapsed().as_secs_f64());
+    }
+}
+
+/// Windows' own idea of "which window is in the foreground", independent of egui/winit bookkeeping.
+#[cfg(windows)]
+mod foreground {
+    use eframe::egui;
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+
+    type WinEventProc = unsafe extern "system" fn(*mut c_void, u32, *mut c_void, i32, i32, u32, u32);
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetForegroundWindow() -> *mut c_void;
+        fn GetWindowThreadProcessId(hwnd: *mut c_void, process_id: *mut u32) -> u32;
+        fn SetWinEventHook(
+            event_min: u32,
+            event_max: u32,
+            module: *mut c_void,
+            callback: Option<WinEventProc>,
+            process_id: u32,
+            thread_id: u32,
+            flags: u32,
+        ) -> *mut c_void;
+    }
+    const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
+    const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
+    const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
+
+    static CONTEXT: OnceLock<egui::Context> = OnceLock::new();
+    static WATCHING: AtomicBool = AtomicBool::new(false);
+
+    /// Only wake the UI while the launcher is open; the decision itself is made in `update`.
+    pub fn watch(on: bool) {
+        WATCHING.store(on, Ordering::Relaxed);
+    }
+
+    unsafe extern "system" fn on_foreground_changed(_: *mut c_void, _: u32, _: *mut c_void, _: i32, _: i32, _: u32, _: u32) {
+        if WATCHING.load(Ordering::Relaxed) {
+            if let Some(ctx) = CONTEXT.get() {
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    /// Asks Windows to tell this (UI) thread whenever a window of another process becomes the
+    /// foreground, so clicking away closes the launcher instantly with no polling. The callback
+    /// is delivered through the thread's message loop, which winit is already running.
+    pub fn install(ctx: &egui::Context) -> bool {
+        let _ = CONTEXT.set(ctx.clone());
+        let hook = unsafe {
+            SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_FOREGROUND,
+                std::ptr::null_mut(),
+                Some(on_foreground_changed),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+        };
+        !hook.is_null()
+    }
+
+    /// Is the current foreground window ours? A momentarily null foreground (mid-switch) counts as
+    /// "yes" so a transient state never closes the launcher.
+    pub fn is_ours() -> bool {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.is_null() {
+                return true;
+            }
+            let mut process_id = 0u32;
+            GetWindowThreadProcessId(hwnd, &mut process_id);
+            process_id == std::process::id()
+        }
+    }
 }
 
 /// Segoe UI is what Windows itself uses; it looks far less "toolkit" than egui's bundled font.
@@ -929,4 +1138,39 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| Box::new(App::new(cc, engine, config, start_hidden))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use okra_core::{Action, Kind};
+
+    fn item(title: &str, kind: Kind) -> Item {
+        Item { id: title.into(), title: title.into(), subtitle: String::new(), kind, action: Action::Copy(String::new()), score: 0 }
+    }
+
+    #[test]
+    fn runs_cover_the_title_exactly_and_flag_matches() {
+        let title = "Workbench 2023 R1";
+        let runs = highlight_runs(title, &[0, 1, 2, 3]);
+        assert_eq!(runs, vec![(0, 4, true), (4, title.len(), false)]);
+        // No gaps or overlaps, whatever the match pattern (incl. multi-byte characters).
+        for (title, matched) in [("Éclair café", vec![0usize, 3, 4, 10]), ("abc", vec![]), ("abc", vec![0, 1, 2]), ("", vec![])] {
+            let runs = highlight_runs(title, &matched);
+            let rebuilt: String = runs.iter().map(|&(a, b, _)| &title[a..b]).collect();
+            assert_eq!(rebuilt, title);
+            let flagged: usize = runs.iter().filter(|r| r.2).map(|&(a, b, _)| title[a..b].chars().count()).sum();
+            assert_eq!(flagged, matched.len());
+        }
+    }
+
+    #[test]
+    fn rows_highlight_the_query_that_produced_them() {
+        let rows = build_rows(vec![item("Workbench 2023 R1", Kind::App), item("2+2", Kind::Calculation)], "a work");
+        assert_eq!(rows[0].title_runs.iter().filter(|r| r.2).count(), 1, "prefix `a ` is not highlighted");
+        assert!(rows[0].title_runs[0].2 && rows[0].title_runs[0].1 == 4, "\"work\" highlighted");
+        assert!(rows[1].title_runs.iter().all(|r| !r.2), "calculations are never highlighted");
+        assert_eq!(rows[0].subtitle, Kind::App.label(), "empty subtitle falls back to the kind label");
+        assert!(build_rows(vec![item("Notepad", Kind::App)], "")[0].title_runs.iter().all(|r| !r.2));
+    }
 }

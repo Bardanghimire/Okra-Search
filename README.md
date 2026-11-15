@@ -38,9 +38,13 @@ The file query is passed to Everything unchanged, so Everything operators are av
 - **Nothing slow on the keystroke path.** Typing is coalesced on a worker thread; only the newest query is ever searched.
 - **Allocation-free fuzzy matcher.** The query is prepared once per search, non-matches are rejected without allocating, and scoring is linear in name length. A randomized test checks it against the original reference implementation (identical scores and matched positions).
 - **Fast built-in index.** Each indexed file carries a 64-bit character signature in a contiguous array, so most files are rejected with one AND before any text is read; only the best results are selected rather than sorting every hit.
+- **Cheap ranking.** Usage history is resolved once per search (not once per result), so scoring hundreds of results allocates nothing. History is saved by a background thread with an atomic write-then-rename, so opening a result never waits on the disk.
+- **Draw once, not every frame.** Highlight ranges and shortened paths are computed on the search thread when results arrive; the UI only draws them.
+- **Real program icons, off the UI thread.** Results show each program's own icon (Start-menu shortcuts, Store apps, and per-type icons for files and folders), fetched from the shell by a worker thread, rows on screen first and cached for the session. Rows appear instantly with a coloured letter tile that is swapped for the icon as it arrives, so typing never waits on icons. Settings, open windows and calculator results keep the tile.
+- **Closes when you click away.** On Windows the launcher asks the OS which window is in the foreground and is woken by a foreground-change hook, so there is no polling while it is open. If something misbehaves, set `OKRA_DEBUG=1` to log show/hide/focus events to `%TEMP%\okra-debug.log`.
 - **Everything is still the fast path.** When Everything is running, file queries are answered by its own index; the built-in index is only a fallback.
 
-Micro-benchmarks: `cargo run --release -p okra-core --example bench`, and for the real built-in index path `cargo test --release -p okra-core -- --ignored --nocapture bench_builtin`.
+Micro-benchmarks: `cargo run --release -p okra-core --example bench`, and for the real built-in index path `cargo test --release -p okra-core -- --ignored --nocapture bench_builtin`; for per-keystroke ranking overhead `... bench_engine_overhead`.
 
 ## Requirements
 

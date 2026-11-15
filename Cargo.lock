@@ -2175,6 +2175,7 @@ dependencies = [
  "image",
  "okra-core",
  "tray-icon",
+ "windows",
  "winres",
 ]
 
