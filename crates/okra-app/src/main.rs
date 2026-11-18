@@ -5,9 +5,7 @@ use eframe::egui::{
 };
 use okra_core::matcher::{fuzzy_with, Query};
 use okra_core::providers::files::{ntfs_helper_status, HelperStatus};
-use okra_core::{
-    Action, Config, Engine, FileBackendKind, FontKind, Item, Kind, Outcome, ThemeKind,
-};
+use okra_core::{Action, Config, Engine, FontKind, Item, Kind, Outcome, ThemeKind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -66,7 +64,6 @@ struct Palette {
 struct App {
     engine: Arc<Engine>,
     config: Config,
-    initial_backend: FileBackendKind,
     initial_max_results: usize,
     initial_start_with_windows: bool,
     query: String,
@@ -104,7 +101,7 @@ struct App {
     #[cfg(windows)]
     foreground_hook: bool,
     start_hidden: bool,
-    /// Startup heads-ups (no Everything, hotkey taken...), shown in the bar for the first few opens.
+    /// Startup heads-ups (indexing diagnostics, hotkey taken...), shown in the bar for the first few opens.
     notice: String,
     notice_shows_left: u8,
     resident_initialized: bool,
@@ -341,7 +338,6 @@ impl App {
 
         Self {
             engine,
-            initial_backend: config.file_backend,
             initial_max_results: config.max_results,
             initial_start_with_windows: config.start_with_windows,
             config,
@@ -483,7 +479,22 @@ impl App {
             };
 
             ui.add_space(2.0);
-            ui.label(RichText::new("Settings").size(22.0).strong().color(pal.text));
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let title_response = ui.add(
+                    egui::Label::new(
+                        RichText::new("Settings").size(22.0).strong().color(pal.text),
+                    )
+                    .sense(Sense::drag()),
+                );
+                let (_, blank_response) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), title_response.rect.height()),
+                    Sense::drag(),
+                );
+                if title_response.drag_started() || blank_response.drag_started() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+            });
 
             section(ui, "Appearance");
             let mut theme_changed = false;
@@ -510,16 +521,14 @@ impl App {
             }
 
             section(ui, "File search");
-            egui::ComboBox::from_id_source("okra-file-backend")
-                .selected_text(self.config.file_backend.label())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.config.file_backend, FileBackendKind::Auto, "Automatic (recommended)");
-                    ui.selectable_value(&mut self.config.file_backend, FileBackendKind::Everything, "Everything only");
-                    ui.selectable_value(&mut self.config.file_backend, FileBackendKind::Builtin, "Built-in index only");
-                });
-            ui.label(RichText::new("Automatic uses Everything, es.exe, the optional elevated Okra NTFS helper, then the local index.").size(12.0).color(pal.muted));
+            ui.label(RichText::new("Okra Native Search").size(13.0).strong().color(pal.text));
+            ui.label(
+                RichText::new("Okra searches its own NTFS index, with a built-in filesystem index as a fallback. No external search application is used.")
+                    .size(12.0)
+                    .color(pal.muted),
+            );
 
-            section(ui, "NTFS helper health");
+            section(ui, "Okra index health");
             let helper_description = self
                 .helper_status
                 .map(|status| status.describe())
@@ -540,7 +549,7 @@ impl App {
                 }
             });
             ui.label(
-                RichText::new("This optional index is used in Automatic mode when Everything is unavailable. Status checks never request elevation or start the helper.")
+                RichText::new("The Okra NTFS index updates in the background. Status checks never request elevation or start the helper.")
                     .size(12.0)
                     .color(pal.muted),
             );
@@ -556,7 +565,7 @@ impl App {
             ui.label(RichText::new("The app stays in the notification area until you choose Exit.").size(12.0).color(pal.muted));
 
             ui.add_space(16.0);
-            let restart_needed = self.config.file_backend != self.initial_backend || self.config.max_results != self.initial_max_results;
+            let restart_needed = self.config.max_results != self.initial_max_results;
             ui.horizontal(|ui| {
                 if ui.add(egui::Button::new(RichText::new("Save").strong().color(Color32::WHITE)).fill(ACCENT).rounding(6.0_f32)).clicked() {
                     self.save_settings();
@@ -569,7 +578,7 @@ impl App {
             });
             if restart_needed {
                 ui.add_space(4.0);
-                ui.label(RichText::new("File backend and result-count changes apply the next time the app starts.").size(12.0).color(pal.muted));
+                ui.label(RichText::new("Result-count changes apply the next time the app starts.").size(12.0).color(pal.muted));
             }
         });
     }

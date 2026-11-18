@@ -35,6 +35,45 @@ Run once to initialize or synchronize:
   --root "$env:USERPROFILE"
 ```
 
+### Full-volume indexing
+
+The helper can export every path on one selected NTFS volume, from its root through all directory
+levels. Use `--full-volume` instead of `--max-depth` and `--root`; the option expands to the volume
+root and removes the depth filter. This is a per-volume setting: the first implementation indexes
+one drive letter per installed helper task (for example, `C:`). The current named-pipe/task setup
+serves one configured volume at a time; changing it to another drive replaces that configuration.
+Automatic multi-volume discovery and merged search across drives are a later milestone.
+
+A full-volume scope changes only the export filter. The persistent state already retains the whole
+MFT graph for the selected volume, so when its volume and USN cursor are still valid the helper
+reuses that graph, applies the current journal delta, and rewrites the searchable snapshot without
+re-enumerating the MFT. If the journal has expired or changed, the normal full MFT rebuild still
+applies. First-baseline time and the launcher's in-memory search cache grow with the number of files
+and folders. The persistent state currently has a 2 GiB safety limit. NTFS path-resolution gaps,
+unsupported USN record versions, and incomplete hard-link modelling remain limitations.
+
+For a one-time manual test on `C:`:
+
+```powershell
+$indexDir = "$env:LOCALAPPDATA\okra-brown-search"
+& ".\target\release\okra-index-helper.exe" `
+  --volume C: `
+  --output "$indexDir\mft-snapshot.tsv" `
+  --state "$indexDir\mft-snapshot.state" `
+  --full-volume `
+  --serve `
+  --poll-seconds 1
+```
+
+To install the full-volume configuration as the existing logon task, rebuild the helper first and
+rerun `--install-task --start-now` with the same `--volume`, `--output`, and `--state` paths, replacing
+`--max-depth`/`--root` with `--full-volume`. Reinstallation updates the protected Program Files copy
+and task arguments. If the saved state belongs to the same volume and its USN journal cursor is
+still valid, the helper reuses the saved whole-volume MFT graph, applies the journal delta, and
+rewrites the full-volume snapshot. If the journal identity changed, the cursor expired, or the state
+cannot be read, it performs a new MFT baseline. Keep the previous task configuration backed up
+until the new helper reaches `ready` and whole-volume searches are verified.
+
 Use `--watch` to keep the elevated helper running and poll the journal. The default polling interval
 is two seconds; `--poll-seconds 5` changes it to five seconds. Press Ctrl+C to stop. The watch mode
 is a development process, not an installed Windows service. Run only one helper instance for a given
@@ -68,10 +107,9 @@ so the standard-integrity desktop app can write requests without granting write 
 integrity clients. The helper enables `SeSecurityPrivilege` only during pipe creation and restores
 its previous state immediately afterward. The protocol is versioned and length-prefixed,
 validates query and result bounds, and only returns paths from the configured-root snapshot. A
-missing or unavailable helper is treated as a normal backend miss, so the app falls through to the
-existing built-in walker index. The app keeps its priority order: Everything SDK, `es.exe`, the Okra
-NTFS helper, then the local walker fallback. The explicit “Everything only” and “Built-in index only”
-settings remain unchanged.
+missing or unavailable helper is treated as a normal backend miss, so the app falls through to
+Okra's built-in walker index. The native backend order is the Okra NTFS helper followed by the local
+walker fallback. No external search application or SDK is loaded.
 
 Start the elevated helper in an Administrator PowerShell window and keep it open:
 
@@ -87,10 +125,9 @@ $indexDir = "$env:LOCALAPPDATA\okra-brown-search"
   --poll-seconds 1
 ```
 
-Then start Okra normally (without elevation). In Automatic file-backend mode, file queries use
-Everything first when it is available, then the named-pipe helper, then the existing unprivileged
-walker index. Stage 4 below installs it as a logon task so you do not have to start it by hand; for
-manual testing, close it with Ctrl+C.
+Then start Okra normally (without elevation). File queries use the Okra named-pipe helper first,
+then the existing unprivileged walker index. Stage 4 below installs it as a logon task so you do not
+have to start it by hand; for manual testing, close it with Ctrl+C.
 
 ## Stage 4: automatic startup, health status, and graceful shutdown
 
@@ -180,7 +217,7 @@ need step 1 to 4 above before being treated as verified.
 
 ## Stage 5: launcher health display
 
-The Settings page now displays the optional helper's current health using the existing `OKS1` / `OKT1` status protocol. It shows the state, indexed path count, last successful synchronization age, process ID, and consecutive synchronization failures when the helper is ready. A manual Refresh action is available; while Settings remains open, the UI also refreshes every five seconds.
+The Settings page now displays the Okra NTFS helper's current health using the existing `OKS1` / `OKT1` status protocol. It shows the state, indexed path count, last successful synchronization age, process ID, and consecutive synchronization failures when the helper is ready. A manual Refresh action is available; while Settings remains open, the UI also refreshes every five seconds.
 
 Status requests run on one dedicated background worker, not on the egui update or search path. Requests use a one-slot queue so repeated refreshes coalesce. This is important because the current named-pipe server does not yet enforce I/O timeouts: a stalled health request can block its worker, but it cannot freeze typing, rendering, or the launcher itself. Checking health never starts the helper and never prompts for elevation.
 
@@ -193,11 +230,11 @@ On non-Windows builds the existing status API reports `NotRunning`, as expected 
   versions fail closed: the helper reports the unsupported version and does not save a later
   cursor, rather than silently skipping a change.
 - Hard links are not a complete multi-name model. The current graph stores one entry per file
-  reference; hard-link changes need dedicated handling before claiming full Everything parity.
+  reference; hard-link changes need dedicated handling before claiming complete native-index parity.
 - The persistent state retains the full MFT graph, not just configured-root entries. Memory and
   disk use will need measurement and optimization on very large volumes.
 - The helper is a per-user logon task (Stage 4), not a Windows service. The launcher never starts it
-  or requests elevation; when it is not running, the app uses its normal fallback chain.
+  or requests elevation; when it is not running, the app uses Okra's built-in walker fallback.
 - The pipe server has no I/O timeouts and serves one client at a time, so a same-session process that
   connects and then stalls can block searches (they fall back) until it disconnects. Overlapped I/O
   with timeouts is a separate hardening item.
@@ -213,10 +250,25 @@ On non-Windows builds the existing status API reports `NotRunning`, as expected 
 - Non-NTFS volumes, unsupported record versions, inaccessible records, and helper failures still
   require the normal file-search fallback.
 
-## Next stages
+## Native-search roadmap
 
-1. Add hard-link and unsupported-record handling, exclusions, and robust recovery tests.
-2. Harden named-pipe IPC with bounded I/O timeouts and move elevated-helper state away from the
-   user-writable `%LOCALAPPDATA%` location before treating the helper as production-hardened.
-3. Benchmark cold start, incremental update latency, query latency, CPU, disk activity, and memory
-   at 100k / 1M / 5M entries before changing defaults.
+Okra is the sole owner of its file-search engine. The launcher uses the Okra NTFS helper first
+and its own walker fallback second; it does not load a third-party SDK, probe for a separate CLI,
+or send queries to another search process. This removes the external runtime dependency, but it
+does not yet claim feature or performance parity with dedicated file-search products.
+
+1. **Coverage:** discover all configured fixed NTFS volumes, expand root/depth controls, and add
+   correct multi-name hard-link modelling. Keep a walker fallback for non-NTFS and inaccessible
+   locations. The current default remains the user's home folder at depth 8.
+2. **Index integrity:** handle USN record versions and volume changes explicitly, add exclusions,
+   repair/recovery tests, and prove create/delete/rename/move/hard-link cases.
+3. **IPC and security:** add bounded named-pipe I/O timeouts, cancellation, concurrent-client
+   handling, and move elevated-helper state away from user-writable `%LOCALAPPDATA%`.
+4. **Query language:** implement native `ext:`, `path:`, size/date/type filters and a safe regex
+   mode. Document-content search requires its own extractor/index and is not implemented yet.
+5. **Scale and speed:** benchmark cold indexing, incremental update latency, query latency, CPU,
+   disk activity, memory, and result quality at 100k / 1M / 5M entries. Optimize index layout and
+   candidate retrieval based on those measurements, not microbenchmarks alone.
+
+The supplied benchmark CSVs contain Okra-helper and walker measurements, but no same-scope
+Everything measurements; they are not evidence of head-to-head parity.

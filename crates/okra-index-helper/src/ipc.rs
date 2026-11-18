@@ -21,10 +21,30 @@ const MAX_PATH_BYTES: usize = 128 * 1024;
 #[derive(Clone, Debug)]
 struct SnapshotEntry {
     path: String,
-    name: String,
+    name_start: usize,
     lower_name: String,
-    mask: u64,
     is_dir: bool,
+}
+
+impl SnapshotEntry {
+    fn from_path(path: String, is_dir: bool) -> Self {
+        let name_start = path
+            .rfind(['\\', '/'])
+            .map(|separator| separator + 1)
+            .filter(|start| *start < path.len())
+            .unwrap_or(0);
+        let lower_name: String = path[name_start..].chars().map(lc).collect();
+        Self {
+            path,
+            name_start,
+            lower_name,
+            is_dir,
+        }
+    }
+
+    fn name(&self) -> &str {
+        self.path.get(self.name_start..).unwrap_or(&self.path)
+    }
 }
 
 #[derive(Default)]
@@ -32,8 +52,8 @@ struct SnapshotCache {
     path: Option<PathBuf>,
     stamp: Option<(u64, Option<SystemTime>)>,
     entries: Vec<SnapshotEntry>,
-    /// `masks[i]` is `entries[i].mask`, kept in its own contiguous array so the first filtering
-    /// pass streams 8 bytes per entry instead of touching every entry's strings.
+    /// `masks[i]` is `char_mask(entries[i].lower_name)`, kept in its own contiguous array so the
+    /// first filtering pass streams 8 bytes per entry instead of touching every entry's strings.
     masks: Vec<u64>,
 }
 
@@ -56,19 +76,41 @@ impl SnapshotCache {
         if self.stamp == Some(stamp) {
             return Ok(());
         }
+        use std::io::BufRead;
+
         let reload_started = std::time::Instant::now();
-        let text = std::fs::read_to_string(path)
-            .map_err(|error| format!("Could not read NTFS snapshot: {error}"))?;
-        let mut lines = text.lines();
-        let header = lines
-            .next()
-            .ok_or_else(|| "NTFS snapshot is empty".to_string())?;
+        // A full-volume cache can be large. Drop the previous snapshot before loading its
+        // replacement so refresh does not temporarily keep two complete indexes in memory.
+        self.entries.clear();
+        self.masks.clear();
+        self.stamp = None;
+        let file = std::fs::File::open(path)
+            .map_err(|error| format!("Could not open NTFS snapshot: {error}"))?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut line = String::new();
+        if reader
+            .read_line(&mut line)
+            .map_err(|error| format!("Could not read NTFS snapshot header: {error}"))?
+            == 0
+        {
+            return Err("NTFS snapshot is empty".into());
+        }
+        let header = line.trim_end_matches(['\r', '\n']);
         if !header.starts_with("okra-index-v1\t") {
             return Err("NTFS snapshot has an unsupported header".into());
         }
         let mut entries = Vec::new();
-        for line in lines {
-            let Some((kind, raw_path)) = line.split_once('\t') else {
+        loop {
+            line.clear();
+            if reader
+                .read_line(&mut line)
+                .map_err(|error| format!("Could not read NTFS snapshot: {error}"))?
+                == 0
+            {
+                break;
+            }
+            let row = line.trim_end_matches(['\r', '\n']);
+            let Some((kind, raw_path)) = row.split_once('\t') else {
                 continue;
             };
             if raw_path.is_empty()
@@ -82,24 +124,17 @@ impl SnapshotCache {
                 "F" => false,
                 _ => continue,
             };
-            let name = raw_path
-                .rsplit(['\\', '/'])
-                .next()
-                .filter(|name| !name.is_empty())
-                .unwrap_or(raw_path)
-                .to_string();
-            let lower_name: String = name.chars().map(lc).collect();
-            let mask = char_mask(lower_name.chars());
-            entries.push(SnapshotEntry {
-                path: raw_path.to_string(),
-                name,
-                lower_name,
-                mask,
-                is_dir,
-            });
+            entries.push(SnapshotEntry::from_path(raw_path.to_string(), is_dir));
+            if entries.len() % 250_000 == 0 {
+                eprintln!("NTFS IPC snapshot load: {} paths parsed ...", entries.len());
+            }
         }
         self.entries = entries;
-        self.masks = self.entries.iter().map(|entry| entry.mask).collect();
+        self.masks = self
+            .entries
+            .iter()
+            .map(|entry| char_mask(entry.lower_name.chars()))
+            .collect();
         self.stamp = Some(stamp);
         eprintln!(
             "NTFS IPC snapshot cache loaded: {} paths in {:.1} ms",
@@ -118,7 +153,11 @@ impl SnapshotCache {
         }
         if self.masks.len() != self.entries.len() {
             // Unit tests fill `entries` directly, so rebuild the mask array when it is out of step.
-            self.masks = self.entries.iter().map(|entry| entry.mask).collect();
+            self.masks = self
+                .entries
+                .iter()
+                .map(|entry| char_mask(entry.lower_name.chars()))
+                .collect();
         }
         let query_mask = query.mask();
         let mut hits: Vec<(i64, usize)> = Vec::new();
@@ -127,7 +166,7 @@ impl SnapshotCache {
                 continue;
             }
             let entry = &self.entries[position];
-            if let Some(score) = score_with_lower(&query, &entry.name, &entry.lower_name) {
+            if let Some(score) = score_with_lower(&query, entry.name(), &entry.lower_name) {
                 let rank = score - 10 + if entry.is_dir { 5 } else { 0 };
                 hits.push((rank, position));
             }
@@ -810,27 +849,9 @@ mod tests {
     fn snapshot_search_matches_file_names_and_respects_the_limit() {
         let mut cache = SnapshotCache {
             entries: vec![
-                SnapshotEntry {
-                    path: r"C:\Users\me\notes.txt".into(),
-                    name: "notes.txt".into(),
-                    lower_name: "notes.txt".into(),
-                    mask: char_mask("notes.txt".chars()),
-                    is_dir: false,
-                },
-                SnapshotEntry {
-                    path: r"C:\Users\me\note-folder".into(),
-                    name: "note-folder".into(),
-                    lower_name: "note-folder".into(),
-                    mask: char_mask("note-folder".chars()),
-                    is_dir: true,
-                },
-                SnapshotEntry {
-                    path: r"C:\Users\me\photo.jpg".into(),
-                    name: "photo.jpg".into(),
-                    lower_name: "photo.jpg".into(),
-                    mask: char_mask("photo.jpg".chars()),
-                    is_dir: false,
-                },
+                SnapshotEntry::from_path(r"C:\Users\me\notes.txt".into(), false),
+                SnapshotEntry::from_path(r"C:\Users\me\note-folder".into(), true),
+                SnapshotEntry::from_path(r"C:\Users\me\photo.jpg".into(), false),
             ],
             ..Default::default()
         };

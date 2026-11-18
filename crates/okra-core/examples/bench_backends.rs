@@ -3,19 +3,13 @@
 //!
 //!     cargo run --release -p okra-core --example bench_backends
 //!
-//! Backends: the elevated NTFS helper (raw pipe round trip), the Everything SDK (when its DLL
-//! can be loaded) and the built-in walker index (through the file provider, so it includes the
-//! provider's scoring). Environment variables:
+//! Backends: the elevated Okra NTFS helper (raw pipe round trip) and the built-in walker index
+//! (through the file provider, so it includes the provider's scoring). Environment variables:
 //!     FS_RUNS=100               timed runs per query (after 5 warm-up runs)
 //!     FS_PACE_MS=0              pause before every call, not timed (try 2 to mimic typing)
-//!     FS_EVERYTHING_DLL=path    Everything64.dll to use
-//!     FS_EVERYTHING_SCOPE=path  folder prefix added to Everything queries, to roughly match the
-//!                               helper's scoped dataset, e.g. C:\Users\barda\
 //!     FS_BENCH_CSV=path         also write the results as CSV
-use okra_core::providers::everything::EverythingSdk;
 use okra_core::providers::files::{ntfs_helper_search, FilesProvider};
-use okra_core::{Config, FileBackendKind, Provider};
-use std::path::PathBuf;
+use okra_core::{Config, Provider};
 use std::time::Instant;
 
 const QUERIES: &[&str] = &[
@@ -127,32 +121,11 @@ fn main() {
         println!("Skipping the NTFS helper: it is not serving searches.");
     }
 
-    // 2. Everything SDK, when available.
-    let dll: Option<PathBuf> = std::env::var_os("FS_EVERYTHING_DLL").map(PathBuf::from);
-    match EverythingSdk::load(dll.as_deref()) {
-        Some(sdk) => {
-            let scope = std::env::var("FS_EVERYTHING_SCOPE").ok();
-            bench("Everything (SDK)", runs, pace_ms, &mut csv, &mut |q| {
-                let full = match &scope {
-                    Some(prefix) => format!("{prefix} {q}"),
-                    None => q.to_string(),
-                };
-                sdk.search(&full, RESULT_LIMIT as u32).map(|r| r.len())
-            });
-        }
-        None => println!(
-            "\nSkipping Everything: Everything64.dll was not found (set FS_EVERYTHING_DLL)."
-        ),
-    }
-
-    // 3. Built-in walker index, through the provider (includes scoring).
-    let cfg = Config {
-        file_backend: FileBackendKind::Builtin,
-        ..Config::default()
-    };
+    // 2. Built-in walker index, through the provider (includes scoring).
+    let cfg = Config::default();
     println!("\nBuilding the walker index over {:?} ...", cfg.file_roots);
     let start = Instant::now();
-    let walker = FilesProvider::new(&cfg);
+    let walker = FilesProvider::walker_only(&cfg);
     // The walker fills its index in the background, so wait until it answers a known query.
     let mut walker_ready = false;
     while start.elapsed().as_secs() < 60 {
@@ -171,7 +144,7 @@ fn main() {
         println!("walker index returned nothing for \"cargo\" after 60 s; its numbers below are not meaningful");
     }
     bench(
-        "Built-in walker (provider)",
+        "Okra built-in walker (provider)",
         runs,
         pace_ms,
         &mut csv,

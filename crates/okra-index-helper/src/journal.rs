@@ -52,6 +52,7 @@ struct SyncStats {
     cursor_before: i64,
     cursor_after: i64,
     rebuilt: bool,
+    scope_changed: bool,
 }
 
 fn read_u16(bytes: &[u8], at: usize) -> Result<u16, String> {
@@ -165,6 +166,16 @@ fn config_matches(state: &IndexState, volume: &str, roots: &[String], max_depth:
     state.volume.eq_ignore_ascii_case(volume)
         && normalized_roots(&state.roots) == normalized_roots(roots)
         && state.max_depth == max_depth
+}
+
+fn resume_problem(state: &IndexState, volume: &str, journal: JournalInfo) -> Option<String> {
+    if !state.volume.eq_ignore_ascii_case(volume) {
+        return Some(format!(
+            "saved index belongs to volume {}, not {volume}",
+            state.volume
+        ));
+    }
+    journal_resume_problem(state, journal)
 }
 
 fn journal_resume_problem(state: &IndexState, journal: JournalInfo) -> Option<String> {
@@ -467,14 +478,19 @@ fn persist_outputs(
     snapshot_path: &Path,
     state_path: &Path,
 ) -> Result<usize, String> {
-    let snapshot =
-        mft::make_cache_text(&state.entries, &state.roots, state.max_depth, &state.volume);
-    let count = snapshot.lines().skip(1).count();
+    // Serialize and validate the state before replacing the snapshot. The cache itself is streamed
+    // to a temporary file so a whole-volume export does not require a second volume-sized String.
     let state_bytes = encode_state(state)?;
+    let count = mft::write_cache_atomically(
+        snapshot_path,
+        &state.entries,
+        &state.roots,
+        state.max_depth,
+        &state.volume,
+    )?;
     // Write the derived cache first. If saving the cursor subsequently fails, replaying the same
     // journal records on the next run is safe and idempotent; saving the cursor first could leave
     // a stale cache if the process stopped between the two writes.
-    mft::write_atomically(snapshot_path, &snapshot)?;
     write_bytes_atomically(state_path, &state_bytes)?;
     Ok(count)
 }
@@ -490,8 +506,11 @@ fn rebuild_state(
             "Building an MFT baseline (attempt {attempt}/3); journal ID {}, cursor {} ...",
             before.journal_id, before.next_usn
         );
+        // Keep the complete MFT graph for this volume in persistent state. Configured roots and
+        // depth restrict only the exported/searchable snapshot, so changing scope can be served
+        // from this graph without repeating the expensive MFT enumeration.
         let entries = mft::enumerate(volume)?;
-        mft::log_path_diagnostics(&entries, roots, max_depth, volume);
+        mft::log_path_diagnostics(&entries);
         let after = native::query_journal(volume)?;
 
         if before.journal_id != after.journal_id
@@ -565,11 +584,11 @@ fn sync_once(
     };
 
     if let Some(state) = loaded {
-        let reason = if !config_matches(&state, volume, roots, max_depth) {
-            Some("volume, configured roots, or maximum depth changed".to_string())
-        } else {
-            journal_resume_problem(&state, journal)
-        };
+        let scope_changed = !config_matches(&state, volume, roots, max_depth);
+        // The saved FRN graph contains the whole volume; roots/depth are export filters only.
+        // Reuse that graph for a scope change as long as this is the same volume and the USN
+        // cursor is still valid. A volume or journal identity change still requires a rebuild.
+        let reason = resume_problem(&state, volume, journal);
         if let Some(reason) = reason {
             eprintln!("Cannot resume the saved index: {reason}. Rebuilding from the MFT.");
         } else {
@@ -607,8 +626,8 @@ fn sync_once(
             {
                 let updated = IndexState {
                     volume: state.volume,
-                    roots: state.roots,
-                    max_depth: state.max_depth,
+                    roots: roots.to_vec(),
+                    max_depth,
                     journal_id: latest.journal_id,
                     cursor: cursor_after,
                     entries: index.finish(),
@@ -620,6 +639,7 @@ fn sync_once(
                         cursor_before,
                         cursor_after,
                         rebuilt: false,
+                        scope_changed,
                     },
                 ));
             }
@@ -645,6 +665,7 @@ fn rebuild_with_stats(
             cursor_before: old_cursor,
             cursor_after,
             rebuilt: true,
+            scope_changed: false,
         },
     ))
 }
@@ -674,6 +695,7 @@ pub(super) fn run(
                 let changed = stats.rebuilt
                     || stats.changes_read > 0
                     || stats.cursor_before != stats.cursor_after
+                    || stats.scope_changed
                     || !has_outputs;
                 let mut outputs_current = true;
                 if changed {
@@ -684,6 +706,11 @@ pub(super) fn run(
                                 println!(
                                     "Built NTFS index: {} MFT entries, {} journal changes replayed, {} paths exported.",
                                     state.entries.len(), stats.changes_read, indexed
+                                );
+                            } else if stats.scope_changed {
+                                println!(
+                                    "Updated NTFS index scope using the saved MFT graph; applied {} USN journal records (cursor {} -> {}); {} paths exported.",
+                                    stats.changes_read, stats.cursor_before, stats.cursor_after, indexed
                                 );
                             } else {
                                 println!(
@@ -1084,6 +1111,38 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn full_volume_scope_change_reuses_valid_same_volume_mft_state() {
+        let state = sample_state();
+        let journal = JournalInfo {
+            journal_id: 77,
+            first_usn: 0,
+            next_usn: 150,
+            lowest_valid_usn: 0,
+        };
+        let full_volume_roots = vec![r"C:\".to_string()];
+
+        assert!(resume_problem(&state, "C:", journal).is_none());
+        assert!(!config_matches(
+            &state,
+            "C:",
+            &full_volume_roots,
+            usize::MAX
+        ));
+    }
+
+    #[test]
+    fn saved_mft_state_is_not_reused_for_a_different_volume() {
+        let state = sample_state();
+        let journal = JournalInfo {
+            journal_id: 77,
+            first_usn: 0,
+            next_usn: 150,
+            lowest_valid_usn: 0,
+        };
+        assert!(resume_problem(&state, "D:", journal).is_some());
     }
 
     #[test]

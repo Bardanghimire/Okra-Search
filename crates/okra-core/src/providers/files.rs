@@ -1,6 +1,5 @@
-use super::everything::{EsCli, EverythingSdk};
 use super::{Action, Item, Kind, Provider};
-use crate::config::{Config, FileBackendKind};
+use crate::config::Config;
 use crate::matcher::{char_mask, is_subsequence, lc, score, score_with_lower, Query};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -10,24 +9,6 @@ use walkdir::WalkDir;
 trait FileBackend: Send + Sync {
     fn name(&self) -> &'static str;
     fn search(&self, q: &str, max: usize) -> Option<Vec<(PathBuf, bool)>>;
-}
-
-impl FileBackend for EverythingSdk {
-    fn name(&self) -> &'static str {
-        "Everything (SDK)"
-    }
-    fn search(&self, q: &str, max: usize) -> Option<Vec<(PathBuf, bool)>> {
-        EverythingSdk::search(self, q, max as u32)
-    }
-}
-
-impl FileBackend for EsCli {
-    fn name(&self) -> &'static str {
-        "Everything (es.exe)"
-    }
-    fn search(&self, q: &str, max: usize) -> Option<Vec<(PathBuf, bool)>> {
-        EsCli::search(self, q, max as u32)
-    }
 }
 
 /// Health of the optional elevated NTFS helper, as reported over its named pipe.
@@ -334,7 +315,7 @@ fn build_index(roots: Vec<PathBuf>, max_depth: usize) -> Index {
     index
 }
 
-/// Own walker-based index. Started lazily, so with Everything available it costs nothing.
+/// Okra-owned walker index. It warms in the background as a fallback to the NTFS index.
 struct Builtin {
     roots: Vec<PathBuf>,
     depth: usize,
@@ -393,67 +374,46 @@ pub struct FilesProvider {
 
 impl FilesProvider {
     pub fn new(cfg: &Config) -> Self {
-        let builtin = || Builtin {
+        Self::with_ntfs_helper(cfg, true)
+    }
+
+    /// Construct the unprivileged walker-only backend for isolated benchmarks.
+    #[doc(hidden)]
+    pub fn walker_only(cfg: &Config) -> Self {
+        Self::with_ntfs_helper(cfg, false)
+    }
+
+    fn with_ntfs_helper(cfg: &Config, use_ntfs_helper: bool) -> Self {
+        let builtin = Builtin {
             roots: cfg.file_roots.clone(),
             depth: cfg.file_max_depth,
             index: OnceLock::new(),
         };
-        let mut backends: Vec<Box<dyn FileBackend>> = Vec::new();
-        let mut notice: Option<String> = None;
-        let use_everything = !matches!(cfg.file_backend, FileBackendKind::Builtin);
-        if use_everything {
-            // es.exe talks to the same running Everything instance as the SDK DLL, so it can only
-            // help when the DLL is missing. Probing it spawns processes, so skip that when the
-            // DLL loaded: it keeps startup fast and avoids a ~50x slower per-query path.
-            if let Some(sdk) = EverythingSdk::load(cfg.everything_dll.as_deref()) {
-                backends.push(Box::new(sdk));
-            } else if let Some(es) = EsCli::find(cfg.es_exe.as_deref()) {
-                backends.push(Box::new(es));
-                notice = Some(
-                    "Everything64.dll not found: using the slower es.exe for files".to_string(),
-                );
-            } else {
-                notice = Some(
-                    match cfg.file_backend {
-                        FileBackendKind::Everything => "Everything not found: file search is unavailable",
-                        _ => "Everything not found: using the NTFS helper when available, then the built-in index",
-                    }
-                    .to_string(),
-                );
-            }
-        }
-        match cfg.file_backend {
-            FileBackendKind::Auto => {
-                let b = builtin();
-                if backends.is_empty() {
-                    // Preserve the existing behavior: warm the walker fallback at startup when
-                    // neither Everything transport is available, even if the optional helper may
-                    // answer queries before it.
-                    b.index
-                        .get_or_init(|| build_index(b.roots.clone(), b.depth));
-                }
 
-                // Keep Everything first, then the optional elevated NTFS helper, then the walker.
-                #[cfg(windows)]
-                backends.push(Box::new(NtfsPipe));
-                backends.push(Box::new(b));
-            }
-            FileBackendKind::Builtin => {
-                let b = builtin();
-                b.index
-                    .get_or_init(|| build_index(b.roots.clone(), b.depth)); // eager
-                backends.push(Box::new(b));
-            }
-            FileBackendKind::Everything => {}
+        // Warm Okra's own fallback index in the background even when the NTFS helper is healthy.
+        // That way a helper outage or unsupported volume does not make the first fallback query
+        // pay the cost of starting the filesystem walk.
+        builtin
+            .index
+            .get_or_init(|| build_index(builtin.roots.clone(), builtin.depth));
+
+        let mut backends: Vec<Box<dyn FileBackend>> = Vec::new();
+        // The elevated Okra helper is the primary fast path on Windows. Other platforms and
+        // helper outages use the built-in walker index; no external search service is consulted.
+        if use_ntfs_helper {
+            #[cfg(windows)]
+            backends.push(Box::new(NtfsPipe));
         }
+        backends.push(Box::new(builtin));
+
         Self {
             backends,
             active: Mutex::new("none"),
-            notice,
+            notice: None,
         }
     }
 
-    /// Set when the fast Everything path is not available, so the app can tell the user once.
+    /// Startup notice, reserved for actionable indexing diagnostics.
     pub fn startup_notice(&self) -> Option<String> {
         self.notice.clone()
     }
@@ -496,7 +456,8 @@ impl Provider for FilesProvider {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| path.display().to_string());
-                    // Everything also matches on path / by operators, so fall back to weaker scores.
+                    // Helper results are ranked by basename; use the full path as a secondary
+                    // match so folder names can still help a result surface.
                     let rank = score(&query, &name)
                         .or_else(|| score(&query, &path.display().to_string()).map(|s| s - 40))
                         .unwrap_or(-60)

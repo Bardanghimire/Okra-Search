@@ -7,7 +7,7 @@ A minimal desktop search launcher written in Rust, focused on Windows. It search
 ## Search features
 
 - **Programs:** Start Menu shortcuts and registered Windows applications, including packaged/UWP apps discovered through `Get-StartApps`.
-- **Files and folders:** voidtools Everything is the primary backend. The app tries the Everything SDK DLL, then `es.exe`, then its built-in filename index.
+- **Files and folders:** Okra's own NTFS MFT/USN index is the primary fast backend. A built-in unprivileged filesystem index provides fallback search when the helper is unavailable or a path is outside its indexed scope. No external search application is required or used.
 - **Windows Settings:** direct shortcuts to common `ms-settings:` pages plus useful administrative tools such as Task Manager, Device Manager, Disk Management, Services, and Event Viewer.
 - **Open windows:** enumerate visible top-level windows and bring the selected window to the foreground.
 - **Ranking:** fuzzy matching, prefix/word-boundary weighting, and a small local usage-history boost.
@@ -17,7 +17,7 @@ A minimal desktop search launcher written in Rust, focused on Windows. It search
 - **Starts empty:** the launcher opens as just the search bar, centred on the screen where the mouse is, with no results until you type. The window itself keeps a fixed size so the bar never jumps while you type.
 - **Appearance:** warm-light and dark themes, a choice of the bundled Inter font or the system Segoe UI, plus a compact settings screen.
 - **NTFS helper diagnostics:** Settings shows whether the optional elevated helper is ready, starting, stale, stopped, or incompatible, together with index size and last-sync age when available. Health checks run on a background worker and never start the helper or request elevation.
-- **Heads-up messages:** if the Ctrl + Alt + Space shortcut is already taken by another program, or Everything is missing so file search is slower, a short note shows in the bar for the first few opens.
+- **Heads-up messages:** if the Ctrl + Alt + Space shortcut is already taken by another program, a short note shows in the bar for the first few opens.
 
 ## Search syntax
 
@@ -30,12 +30,7 @@ Unprefixed text searches across programs, file names, Windows Settings, and open
 | `s ` | Windows Settings and system tools | `s bluetooth` |
 | `win ` | Currently open windows | `win browser` |
 
-The file query is passed to Everything unchanged, so Everything operators are available, for example:
-
-- `f ext:pdf report`
-- `f size:>10mb`
-- `f dm:today`
-- `f content:invoice` (requires content indexing to be enabled in Everything)
+File queries use Okra's native fuzzy filename matcher. Search by part of a filename or folder name, for example `f report`, `f Cargo.toml`, or `f notes`. Filter operators and document-content indexing are not implemented yet; they are planned as native Okra features rather than delegated to another search product.
 
 ## Performance design
 
@@ -48,7 +43,7 @@ The file query is passed to Everything unchanged, so Everything operators are av
 - **Real program icons, off the UI thread.** Results show each program's own icon (Start-menu shortcuts, Store apps, and per-type icons for files and folders), fetched from the shell by a worker thread, rows on screen first and cached for the session. Rows appear instantly with a coloured letter tile that is swapped for the icon as it arrives, so typing never waits on icons. Settings, open windows and calculator results keep the tile.
 - **Open windows are listed once per moment, not once per key.** The list of open windows is reused for under a second while you type.
 - **Closes when you click away.** On Windows the launcher asks the OS which window is in the foreground and is woken by a foreground-change hook, so there is no polling while it is open. If something misbehaves, set `OKRA_DEBUG=1` to log show/hide/focus events to `%TEMP%\okra-debug.log`.
-- **Everything is still the fast path.** When Everything is running, file queries are answered by its own index; the built-in index is only a fallback.
+- **Native index first.** On Windows, file queries go to Okra's elevated NTFS helper first and then to Okra's built-in walker index. The fallback is warmed in the background so helper outages do not trigger a cold scan on the first query.
 
 Micro-benchmarks: `cargo run --release -p okra-core --example bench`, and for the real built-in index path `cargo test --release -p okra-core -- --ignored --nocapture bench_builtin`; for per-keystroke ranking overhead `... bench_engine_overhead`.
 
@@ -56,7 +51,7 @@ Micro-benchmarks: `cargo run --release -p okra-core --example bench`, and for th
 
 - Windows 10 or Windows 11 (the global hotkey, tray, Start app discovery, Settings shortcuts, and window switching are Windows features).
 - Rust 1.80 or newer.
-- [voidtools Everything](https://www.voidtools.com/) installed and running for fast indexed file search. Install the Everything SDK DLL or `es.exe` if you want the app to use those transports; the built-in filename index remains a fallback.
+- No external file-search application is required. For the fastest indexed search on NTFS, install Okra's own elevated NTFS helper using the instructions in `docs/ntfs-fast-mode.md`; filename search still has a built-in fallback when the helper is unavailable.
 
 ## Build and run
 
@@ -74,23 +69,14 @@ cargo build --release -p okra-brown-search
 
 The executable is under `target\release\okra-brown-search.exe`. The included GitHub Actions workflow builds and tests the project on a Windows runner when the repository is pushed to GitHub.
 
-## Everything configuration
+## Native index configuration
 
-The default `auto` mode tries:
-
-1. `Everything64.dll` / `Everything32.dll` from the executable folder, normal DLL search locations, or the configured `everything_dll` path.
-2. `es.exe` on `PATH`, under the Everything installation folder, or the configured `es_exe` path. This is only probed when the DLL is not found, because both talk to the same running Everything instance.
-3. The built-in filename index over the configured `file_roots`.
-
-Configuration is stored in `%APPDATA%\okra-brown-search\config.json` (or the platform config directory for non-Windows builds). The Settings page also lets you select the backend, theme, font, maximum result count, and optional Windows sign-in startup. Enabling sign-in startup adds an `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` entry; disabling it removes that entry. Backend and result-count changes are applied on the next launch.
+Configuration is stored in `%APPDATA%\okra-brown-search\config.json` (or the platform config directory for non-Windows builds). The Settings page lets you choose the theme, font, maximum result count, and optional Windows sign-in startup. Index roots and maximum depth are currently configured in `config.json`; the default root is the current user's home folder and the default maximum depth is 8.
 
 Example configuration:
 
 ```json
 {
-  "file_backend": "auto",
-  "everything_dll": null,
-  "es_exe": null,
   "file_roots": ["C:\\Users\\YourName"],
   "file_max_depth": 8,
   "max_results": 40,
@@ -100,13 +86,15 @@ Example configuration:
 }
 ```
 
+Legacy `file_backend`, `everything_dll`, and `es_exe` fields from older config files are ignored. Okra no longer loads the Everything SDK, probes for `es.exe`, or sends queries to an external search process.
+
 ## Current boundaries
 
-This build includes the resident launcher and Windows top-level window switching. It does **not** yet index browser tabs, keep a clipboard-history database, or extract/search text inside documents itself. `content:` queries are delegated to Everything and therefore depend on Everything's own content-index settings. The built-in filename index is a fallback snapshot; Everything is the live-updating file index. No plugin loader is included by design.
+This build includes the resident launcher and Windows top-level window switching. It does **not** yet index browser tabs, keep a clipboard-history database, or extract/search text inside documents. Native filename search is implemented; native `ext:`, size/date filters, regex, and document-content indexing are future work. The NTFS helper incrementally follows the USN journal for its configured roots; the built-in filename index walks the configured roots as a fallback. No plugin loader is included by design. The current default index scope is the user's home folder at depth 8, not every path on every volume.
 
 ## Project layout
 
-- `crates/okra-core` — providers, Everything integration, fuzzy matching, settings catalog, activation, and usage history.
+- `crates/okra-core` — native file-index integration, providers, fuzzy matching, settings catalog, activation, and usage history.
 - `crates/okra-app` — egui interface (`preview.rs` is the preview pane), resident global hotkey (toggle), tray menu, single-instance guard, startup integration, and settings UI. The window is found by process and title and cached, not looked up by title alone.
 - `assets` — logo and icons (window/app icon, `.ico`, in-app mark, tray icon).
 - `tools/make_icons.py` — regenerates every file in `assets` from one definition (`pip install pillow numpy`, then `python tools/make_icons.py`).

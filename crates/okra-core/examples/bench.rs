@@ -73,7 +73,7 @@ fn main() {
     let per = t.elapsed().as_secs_f64() * 1e6 / (reps * queries.len()) as f64;
     println!("apps  (400 names)         : {per:8.1} us / query   (hits {hits})");
 
-    // 2. files-style rescoring of Everything's 200 hits by path (worst case: name misses)
+    // 2. files-style rescoring of 200 native-index hits by path (worst case: basename misses)
     let t = Instant::now();
     let reps = 50;
     let mut hits = 0usize;

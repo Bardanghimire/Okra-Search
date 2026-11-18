@@ -1,5 +1,5 @@
 //! Show which file backend answers each query, from an ordinary (unelevated) process, using the
-//! same backend chain as the launcher (Everything, then the NTFS helper, then the walker).
+//! same backend chain as the launcher (Okra NTFS helper, then Okra's walker fallback).
 //!
 //!     cargo run -p okra-core --example backend_probe -- cargo okra
 use okra_core::providers::files::FilesProvider;

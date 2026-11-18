@@ -24,14 +24,14 @@ pub struct Engine {
     history: Mutex<History>,
     max_results: usize,
     on_index_refresh: Arc<OnceLock<RefreshCallback>>,
-    /// Something the user should know about from the start (for example: no Everything found).
+    /// Something the user should know about from the start (for example: indexing diagnostics).
     notice: Option<String>,
 }
 
 impl Engine {
     pub fn new(cfg: &Config) -> Self {
         // Okra Brown Search is intentionally a focused, built-in Windows search tool:
-        // apps, Everything-backed files, Windows Settings, and open windows.
+        // apps, Okra-indexed files, Windows Settings, and open windows.
         //
         // Construction never blocks on slow discovery: the app list comes from an on-disk cache
         // and is refreshed on a background thread (see `set_on_index_refresh`).

@@ -31,7 +31,7 @@ enum Command {
 }
 
 fn usage() -> &'static str {
-    "Usage: okra-index-helper --volume C: --output <snapshot.tsv> --max-depth 8 --root C:\\Users\\you [--root C:\\Projects] [--state <index.state>] [--watch] [--serve] [--poll-seconds 2] [--background]\n       okra-index-helper --install-task [same options as above] [--start-now]\n       okra-index-helper --uninstall-task"
+    "Usage: okra-index-helper --volume C: --output <snapshot.tsv> (--max-depth N --root C:\\Users\\you [--root C:\\Projects] | --full-volume) [--state <index.state>] [--watch] [--serve] [--poll-seconds 2] [--background]\n       okra-index-helper --install-task [same options as above] [--start-now]\n       okra-index-helper --uninstall-task"
 }
 
 fn take_value(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String, String> {
@@ -62,12 +62,34 @@ fn parse_command() -> Result<Command, String> {
     Ok(Command::Run(args))
 }
 
+fn resolve_index_scope(
+    volume: &str,
+    roots: Vec<String>,
+    max_depth: Option<usize>,
+    full_volume: bool,
+) -> Result<(Vec<String>, usize), String> {
+    if full_volume {
+        if !roots.is_empty() || max_depth.is_some() {
+            return Err("--full-volume cannot be combined with --root or --max-depth".into());
+        }
+        let root = format!("{}\\", volume.trim_end_matches(['\\', '/']));
+        return Ok((vec![root], usize::MAX));
+    }
+
+    if roots.is_empty() {
+        return Err(format!("At least one --root is required\n{}", usage()));
+    }
+    let max_depth = max_depth.ok_or_else(|| usage().to_string())?;
+    Ok((roots, max_depth))
+}
+
 fn parse_args() -> Result<Args, String> {
     let mut volume = None;
     let mut output = None;
     let mut state = None;
     let mut max_depth = None;
     let mut roots = Vec::new();
+    let mut full_volume = false;
     let mut watch = false;
     let mut serve = false;
     let mut poll_seconds = 2u64;
@@ -95,6 +117,7 @@ fn parse_args() -> Result<Args, String> {
                 );
             }
             "--root" => roots.push(take_value(&mut args, "--root")?),
+            "--full-volume" => full_volume = true,
             "--poll-seconds" => {
                 let value = take_value(&mut args, "--poll-seconds")?;
                 poll_seconds = value
@@ -111,11 +134,12 @@ fn parse_args() -> Result<Args, String> {
     let volume = volume.ok_or_else(|| usage().to_string())?;
     let output = output.ok_or_else(|| usage().to_string())?;
     let state = state.unwrap_or_else(|| output.with_extension("state"));
+    let (roots, max_depth) = resolve_index_scope(&volume, roots, max_depth, full_volume)?;
     let args = Args {
         volume,
         output,
         state,
-        max_depth: max_depth.ok_or_else(|| usage().to_string())?,
+        max_depth,
         roots,
         watch: watch || serve,
         serve,
@@ -124,9 +148,6 @@ fn parse_args() -> Result<Args, String> {
         install_task,
         start_now,
     };
-    if args.roots.is_empty() {
-        return Err(format!("At least one --root is required\n{}", usage()));
-    }
     if args.output == args.state {
         return Err("--output and --state must be different files".into());
     }
@@ -289,5 +310,33 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod full_volume_tests {
+    use super::resolve_index_scope;
+
+    #[test]
+    fn full_volume_uses_the_volume_root_and_unlimited_depth() {
+        let (roots, depth) = resolve_index_scope("C:", Vec::new(), None, true).unwrap();
+        assert_eq!(roots, vec![r"C:\"]);
+        assert_eq!(depth, usize::MAX);
+    }
+
+    #[test]
+    fn full_volume_rejects_mixed_root_and_depth_options() {
+        assert!(resolve_index_scope("C:", vec![r"C:\Users".into()], None, true).is_err());
+        assert!(resolve_index_scope("C:", Vec::new(), Some(8), true).is_err());
+    }
+
+    #[test]
+    fn scoped_mode_still_requires_a_root_and_depth() {
+        assert!(resolve_index_scope("C:", Vec::new(), Some(8), false).is_err());
+        assert!(resolve_index_scope("C:", vec![r"C:\Users".into()], None, false).is_err());
+        assert_eq!(
+            resolve_index_scope("C:", vec![r"C:\Users".into()], Some(8), false).unwrap(),
+            (vec![r"C:\Users".to_string()], 8)
+        );
     }
 }

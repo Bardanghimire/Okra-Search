@@ -200,6 +200,7 @@ fn is_within_roots(path: &str, roots: &[String], max_depth: usize) -> bool {
         .any(|root| relative_depth(path, root).is_some_and(|depth| depth > 0 && depth <= max_depth))
 }
 
+#[cfg(test)]
 pub(super) fn make_cache_text(
     entries: &[MftEntry],
     roots: &[String],
@@ -229,7 +230,15 @@ pub(super) fn make_cache_text(
     text
 }
 
-pub(super) fn write_atomically(path: &Path, contents: &str) -> Result<(), String> {
+pub(super) fn write_cache_atomically(
+    path: &Path,
+    entries: &[MftEntry],
+    roots: &[String],
+    max_depth: usize,
+    volume: &str,
+) -> Result<usize, String> {
+    use std::io::{BufWriter, Write};
+
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -238,10 +247,41 @@ pub(super) fn write_atomically(path: &Path, contents: &str) -> Result<(), String
             .map_err(|e| format!("Could not create output folder: {e}"))?;
     }
     let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, contents)
-        .map_err(|e| format!("Could not write temporary snapshot: {e}"))?;
+    let file = std::fs::File::create(&temporary)
+        .map_err(|e| format!("Could not create temporary snapshot: {e}"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(writer, "{CACHE_MAGIC}\t{max_depth}\t{}", roots.join("|"))
+        .map_err(|e| format!("Could not write snapshot header: {e}"))?;
+
+    let by_reference: HashMap<u64, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.file_reference, index))
+        .collect();
+    let root = volume_root(volume);
+    let mut count = 0usize;
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(path) = resolve_path(index, entries, &by_reference, &root) else {
+            continue;
+        };
+        if !is_within_roots(&path, roots, max_depth) || path.contains(['\t', '\n', '\r']) {
+            continue;
+        }
+        let kind = if entry.is_dir { 'D' } else { 'F' };
+        writeln!(writer, "{kind}\t{path}")
+            .map_err(|e| format!("Could not write snapshot entry: {e}"))?;
+        count += 1;
+        if count % 250_000 == 0 {
+            eprintln!("NTFS snapshot export: {count} paths written ...");
+        }
+    }
+    writer
+        .flush()
+        .map_err(|e| format!("Could not flush temporary snapshot: {e}"))?;
+    drop(writer);
     crate::atomic::replace(&temporary, path)
-        .map_err(|e| format!("Could not replace snapshot file: {e}"))
+        .map_err(|e| format!("Could not replace snapshot file: {e}"))?;
+    Ok(count)
 }
 
 #[cfg(windows)]
@@ -396,12 +436,7 @@ pub(super) fn enumerate(volume: &str) -> Result<Vec<MftEntry>, String> {
     native::enumerate(volume)
 }
 
-pub(super) fn log_path_diagnostics(
-    entries: &[MftEntry],
-    roots: &[String],
-    max_depth: usize,
-    volume: &str,
-) -> usize {
+pub(super) fn log_path_diagnostics(entries: &[MftEntry]) {
     let root_records = entries
         .iter()
         .filter(|entry| entry.file_reference & FILE_ID_MASK == NTFS_ROOT_FILE_ID)
@@ -434,13 +469,12 @@ pub(super) fn log_path_diagnostics(
             missing_parent_links += 1;
         }
     }
-    let text = make_cache_text(entries, roots, max_depth, volume);
-    let count = text.lines().skip(1).count();
+    // Do not resolve every full path here: the snapshot writer must do that once anyway, and
+    // repeating the traversal on multi-million-entry volumes adds substantial startup latency.
     eprintln!(
-        "MFT path diagnostics: {} records; {root_records} volume-root record(s); {direct_root_children} direct child record(s); {exact_parent_links} exact parent links; {sequence_only_parent_links} parent links matching only by 48-bit file ID; {missing_parent_links} parent links with no matching record; exported {count} path(s) under configured roots",
+        "MFT path diagnostics: {} records; {root_records} volume-root record(s); {direct_root_children} direct child record(s); {exact_parent_links} exact parent links; {sequence_only_parent_links} parent links matching only by 48-bit file ID; {missing_parent_links} parent links with no matching record",
         entries.len()
     );
-    count
 }
 
 #[cfg(test)]
@@ -618,6 +652,112 @@ mod tests {
     }
 
     #[test]
+    fn full_volume_scope_exports_deep_paths_across_the_selected_drive() {
+        let entries = vec![
+            MftEntry {
+                file_reference: 20,
+                parent_reference: 5,
+                name: "Users".into(),
+                is_dir: true,
+            },
+            MftEntry {
+                file_reference: 21,
+                parent_reference: 20,
+                name: "alice".into(),
+                is_dir: true,
+            },
+            MftEntry {
+                file_reference: 22,
+                parent_reference: 21,
+                name: "notes.txt".into(),
+                is_dir: false,
+            },
+            MftEntry {
+                file_reference: 30,
+                parent_reference: 5,
+                name: "Program Files".into(),
+                is_dir: true,
+            },
+            MftEntry {
+                file_reference: 31,
+                parent_reference: 30,
+                name: "Okra".into(),
+                is_dir: true,
+            },
+            MftEntry {
+                file_reference: 32,
+                parent_reference: 31,
+                name: "deep".into(),
+                is_dir: true,
+            },
+            MftEntry {
+                file_reference: 33,
+                parent_reference: 32,
+                name: "nested".into(),
+                is_dir: true,
+            },
+            MftEntry {
+                file_reference: 34,
+                parent_reference: 33,
+                name: "app.exe".into(),
+                is_dir: false,
+            },
+        ];
+        let roots = vec![r"C:\".to_string()];
+        let text = make_cache_text(&entries, &roots, usize::MAX, "C:");
+        assert!(text
+            .lines()
+            .any(|line| line == "F\tC:\\Users\\alice\\notes.txt"));
+        assert!(text
+            .lines()
+            .any(|line| line == "F\tC:\\Program Files\\Okra\\deep\\nested\\app.exe"));
+        assert_eq!(
+            text.lines().next().unwrap(),
+            format!("okra-index-v1\t{}\tC:\\", usize::MAX)
+        );
+    }
+
+    #[test]
+    fn streamed_snapshot_matches_the_existing_cache_format() {
+        let entries = vec![
+            MftEntry {
+                file_reference: 20,
+                parent_reference: 5,
+                name: "Users".into(),
+                is_dir: true,
+            },
+            MftEntry {
+                file_reference: 21,
+                parent_reference: 20,
+                name: "alice".into(),
+                is_dir: true,
+            },
+            MftEntry {
+                file_reference: 22,
+                parent_reference: 21,
+                name: "notes.txt".into(),
+                is_dir: false,
+            },
+        ];
+        let roots = vec![r"C:\".to_string()];
+        let expected = make_cache_text(&entries, &roots, usize::MAX, "C:");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "okra-streamed-cache-{}-{unique}.tsv",
+            std::process::id()
+        ));
+
+        let count = write_cache_atomically(&path, &entries, &roots, usize::MAX, "C:").unwrap();
+        let actual = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(actual, expected);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn filters_roots_and_depth_like_the_walker_index() {
         let roots = vec!["C:\\Users\\alice".to_string()];
         assert!(is_within_roots("C:\\Users\\alice\\notes.txt", &roots, 1));
@@ -630,6 +770,7 @@ mod tests {
     #[test]
     fn validates_volume_and_root_drive() {
         assert!(validate_volume_and_roots("C:", &["C:\\Users\\alice".into()]).is_ok());
+        assert!(validate_volume_and_roots("C:", &[r"C:\".into()]).is_ok());
         assert!(validate_volume_and_roots("C:", &["D:\\Users\\alice".into()]).is_err());
         assert!(validate_volume_and_roots("CC:", &["C:\\Users".into()]).is_err());
     }

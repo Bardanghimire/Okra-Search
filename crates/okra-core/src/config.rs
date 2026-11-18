@@ -2,28 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum FileBackendKind {
-    /// Everything SDK -> es.exe -> built-in index.
-    #[default]
-    Auto,
-    /// Only Everything (no fallback index).
-    Everything,
-    /// Never use Everything.
-    Builtin,
-}
-
-impl FileBackendKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "Automatic (recommended)",
-            Self::Everything => "Everything only",
-            Self::Builtin => "Built-in index only",
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeKind {
     #[default]
@@ -62,11 +40,6 @@ impl FontKind {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct Config {
-    pub file_backend: FileBackendKind,
-    /// Optional explicit path to Everything64.dll / Everything32.dll (from the Everything SDK).
-    pub everything_dll: Option<PathBuf>,
-    /// Optional explicit path to es.exe.
-    pub es_exe: Option<PathBuf>,
     pub file_roots: Vec<PathBuf>,
     pub file_max_depth: usize,
     pub max_results: usize,
@@ -78,9 +51,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            file_backend: FileBackendKind::Auto,
-            everything_dll: None,
-            es_exe: None,
             file_roots: dirs::home_dir().into_iter().collect(),
             file_max_depth: 8,
             max_results: 40,
@@ -134,6 +104,23 @@ mod tests {
         let cfg: Config = serde_json::from_str(r#"{ "max_results": 25 }"#).unwrap();
         assert_eq!(cfg.font, FontKind::Inter);
         assert_eq!(cfg.max_results, 25);
+    }
+
+    #[test]
+    fn legacy_external_backend_fields_are_ignored() {
+        // Existing installations may still have these fields in config.json. Serde ignores the
+        // removed fields and fills current defaults, so the native-only migration is seamless.
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "file_backend": "auto",
+                "everything_dll": "C:\\Program Files\\Everything\\Everything64.dll",
+                "es_exe": "C:\\Program Files\\Everything\\es.exe",
+                "max_results": 25
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.max_results, 25);
+        assert_eq!(cfg.theme, ThemeKind::default());
     }
 
     #[test]
