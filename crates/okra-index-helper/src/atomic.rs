@@ -20,8 +20,8 @@ pub(crate) fn replace(from: &Path, to: &Path) -> io::Result<()> {
     use std::ffi::c_void;
     use std::mem::{align_of, offset_of};
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::AsRawHandle;
     use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
     use std::ptr;
 
     const ERROR_ACCESS_DENIED: i32 = 5;
@@ -72,15 +72,24 @@ pub(crate) fn replace(from: &Path, to: &Path) -> io::Result<()> {
         .len()
         .checked_mul(std::mem::size_of::<u16>())
         .and_then(|length| u32::try_from(length).ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "replacement path is too long"))?;
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "replacement path is too long")
+        })?;
     let name_offset = offset_of!(FileRenameInfoEx, file_name);
     let struct_size = name_offset
         .checked_add(name_bytes as usize)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "replacement path is too long"))?;
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "replacement path is too long")
+        })?;
     let buffer_size = u32::try_from(struct_size)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "replacement path is too long"))?;
-    let layout = Layout::from_size_align(struct_size, align_of::<FileRenameInfoEx>())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid replacement path layout"))?;
+    let layout =
+        Layout::from_size_align(struct_size, align_of::<FileRenameInfoEx>()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid replacement path layout",
+            )
+        })?;
 
     let mut options = std::fs::OpenOptions::new();
     options
@@ -94,13 +103,15 @@ pub(crate) fn replace(from: &Path, to: &Path) -> io::Result<()> {
     // before calling SetFileInformationByHandle, and the buffer remains alive for the call.
     let buffer = unsafe { alloc(layout) };
     if buffer.is_null() {
-        return Err(io::Error::new(io::ErrorKind::OutOfMemory, "could not allocate rename information"));
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "could not allocate rename information",
+        ));
     }
     unsafe {
         let info = buffer.cast::<FileRenameInfoEx>();
-        ptr::addr_of_mut!((*info).flags).write(
-            FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS,
-        );
+        ptr::addr_of_mut!((*info).flags)
+            .write(FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS);
         ptr::addr_of_mut!((*info).root_directory).write(ptr::null_mut());
         ptr::addr_of_mut!((*info).file_name_length).write(name_bytes);
         ptr::copy_nonoverlapping(

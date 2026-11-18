@@ -103,7 +103,9 @@ fn parse_usn_buffer(buffer: &[u8]) -> Result<(i64, Vec<UsnChange>), String> {
         let major = read_u16(buffer, offset + 4)?;
         if major == 2 {
             if record_length < 60 {
-                return Err(format!("USN_RECORD_V2 is too short ({record_length} bytes)"));
+                return Err(format!(
+                    "USN_RECORD_V2 is too short ({record_length} bytes)"
+                ));
             }
             let file_reference = read_u64(buffer, offset + 8)?;
             let parent_reference = read_u64(buffer, offset + 16)?;
@@ -289,7 +291,8 @@ fn encode_state(state: &IndexState) -> Result<Vec<u8>, String> {
     if bytes.len() as u64 > STATE_MAX_BYTES {
         return Err(format!(
             "Persistent index would be {} bytes, larger than the {}-byte safety limit",
-            bytes.len(), STATE_MAX_BYTES
+            bytes.len(),
+            STATE_MAX_BYTES
         ));
     }
     Ok(bytes)
@@ -309,7 +312,8 @@ fn put_string(bytes: &mut Vec<u8>, value: &str) -> Result<(), String> {
     }
     put_u32(
         bytes,
-        u32::try_from(value.len()).map_err(|_| "Persistent index string is too long".to_string())?,
+        u32::try_from(value.len())
+            .map_err(|_| "Persistent index string is too long".to_string())?,
     );
     bytes.extend_from_slice(value.as_bytes());
     Ok(())
@@ -434,15 +438,20 @@ fn load_state(path: &Path) -> Result<Option<IndexState>, String> {
     if metadata.len() > STATE_MAX_BYTES {
         return Err(format!(
             "Persistent index is {} bytes, larger than the {}-byte safety limit",
-            metadata.len(), STATE_MAX_BYTES
+            metadata.len(),
+            STATE_MAX_BYTES
         ));
     }
-    let bytes = fs::read(path).map_err(|error| format!("Could not read persistent index: {error}"))?;
+    let bytes =
+        fs::read(path).map_err(|error| format!("Could not read persistent index: {error}"))?;
     decode_state(&bytes).map(Some)
 }
 
 fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Could not create state folder: {error}"))?;
     }
@@ -453,13 +462,13 @@ fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("Could not replace persistent state file: {error}"))
 }
 
-fn persist_outputs(state: &IndexState, snapshot_path: &Path, state_path: &Path) -> Result<usize, String> {
-    let snapshot = mft::make_cache_text(
-        &state.entries,
-        &state.roots,
-        state.max_depth,
-        &state.volume,
-    );
+fn persist_outputs(
+    state: &IndexState,
+    snapshot_path: &Path,
+    state_path: &Path,
+) -> Result<usize, String> {
+    let snapshot =
+        mft::make_cache_text(&state.entries, &state.roots, state.max_depth, &state.volume);
     let count = snapshot.lines().skip(1).count();
     let state_bytes = encode_state(state)?;
     // Write the derived cache first. If saving the cursor subsequently fails, replaying the same
@@ -738,7 +747,13 @@ pub(super) fn run(
 /// Number of exported paths in an existing snapshot (every line after the header).
 fn count_snapshot_paths(path: &Path) -> usize {
     fs::read(path)
-        .map(|bytes| bytes.iter().filter(|b| **b == b'\n').count().saturating_sub(1))
+        .map(|bytes| {
+            bytes
+                .iter()
+                .filter(|b| **b == b'\n')
+                .count()
+                .saturating_sub(1)
+        })
         .unwrap_or(0)
 }
 
@@ -1088,7 +1103,14 @@ mod tests {
     #[test]
     fn parses_delete_events_instead_of_filtering_them_out() {
         let mut buffer = 240u64.to_le_bytes().to_vec();
-        buffer.extend(make_v2_record("notes.txt", 22, 21, 220, USN_REASON_FILE_DELETE, 0));
+        buffer.extend(make_v2_record(
+            "notes.txt",
+            22,
+            21,
+            220,
+            USN_REASON_FILE_DELETE,
+            0,
+        ));
         let (_, changes) = parse_usn_buffer(&buffer).unwrap();
         assert_eq!(changes.len(), 1);
         assert_ne!(changes[0].reason & USN_REASON_FILE_DELETE, 0);
@@ -1143,12 +1165,7 @@ mod tests {
             is_dir: true,
         });
         let entries = index.finish();
-        let snapshot = mft::make_cache_text(
-            &entries,
-            &state.roots,
-            state.max_depth,
-            &state.volume,
-        );
+        let snapshot = mft::make_cache_text(&entries, &state.roots, state.max_depth, &state.volume);
         assert!(snapshot
             .lines()
             .any(|line| line == "F\tC:\\Users\\barda\\profile\\notes.txt"));
@@ -1176,12 +1193,7 @@ mod tests {
             is_dir: false,
         });
         let entries = index.finish();
-        let snapshot = mft::make_cache_text(
-            &entries,
-            &state.roots,
-            state.max_depth,
-            &state.volume,
-        );
+        let snapshot = mft::make_cache_text(&entries, &state.roots, state.max_depth, &state.volume);
         assert!(snapshot.contains("F\tC:\\Users\\barda\\new.txt"));
         assert!(!snapshot.contains("notes.txt"));
     }
@@ -1210,8 +1222,7 @@ mod tests {
             .sum::<usize>();
         let count_offset = encoded.len() - encoded_entries_size - 8;
         let mut impossible_count = encoded;
-        impossible_count[count_offset..count_offset + 8]
-            .copy_from_slice(&u64::MAX.to_le_bytes());
+        impossible_count[count_offset..count_offset + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(decode_state(&impossible_count).is_err());
     }
 

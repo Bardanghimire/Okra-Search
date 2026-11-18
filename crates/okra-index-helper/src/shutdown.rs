@@ -17,7 +17,10 @@ pub struct ShutdownFlag {
 
 impl ShutdownFlag {
     pub const fn new() -> Self {
-        Self { requested: AtomicBool::new(false), stopped: AtomicBool::new(false) }
+        Self {
+            requested: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+        }
     }
 
     pub fn request(&self) {

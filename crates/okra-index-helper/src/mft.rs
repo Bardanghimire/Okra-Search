@@ -86,17 +86,23 @@ fn parse_enum_buffer(buffer: &[u8]) -> Result<(u64, Vec<MftEntry>), String> {
 }
 
 fn read_u16(bytes: &[u8], at: usize) -> Result<u16, String> {
-    let value = bytes.get(at..at + 2).ok_or_else(|| "Truncated USN field".to_string())?;
+    let value = bytes
+        .get(at..at + 2)
+        .ok_or_else(|| "Truncated USN field".to_string())?;
     Ok(u16::from_le_bytes([value[0], value[1]]))
 }
 
 fn read_u32(bytes: &[u8], at: usize) -> Result<u32, String> {
-    let value = bytes.get(at..at + 4).ok_or_else(|| "Truncated USN field".to_string())?;
+    let value = bytes
+        .get(at..at + 4)
+        .ok_or_else(|| "Truncated USN field".to_string())?;
     Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
 fn read_u64(bytes: &[u8], at: usize) -> Result<u64, String> {
-    let value = bytes.get(at..at + 8).ok_or_else(|| "Truncated USN field".to_string())?;
+    let value = bytes
+        .get(at..at + 8)
+        .ok_or_else(|| "Truncated USN field".to_string())?;
     Ok(u64::from_le_bytes([
         value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
     ]))
@@ -113,10 +119,14 @@ pub(super) fn validate_volume_and_roots(volume: &str, roots: &[String]) -> Resul
     }
     let prefix = volume_root(volume);
     for raw_root in roots {
-        if !raw_root.get(..2).is_some_and(|drive| drive.eq_ignore_ascii_case(volume))
+        if !raw_root
+            .get(..2)
+            .is_some_and(|drive| drive.eq_ignore_ascii_case(volume))
             || raw_root.get(2..3) != Some("\\")
         {
-            return Err(format!("Root {raw_root:?} is not an absolute path on {volume}"));
+            return Err(format!(
+                "Root {raw_root:?} is not an absolute path on {volume}"
+            ));
         }
         let root = raw_root.trim_end_matches(['\\', '/']);
         if root.len() < prefix.len() - 1 {
@@ -176,14 +186,18 @@ fn relative_depth(path: &str, root: &str) -> Option<usize> {
     if path.len() <= prefix.len() || !path.get(..prefix.len())?.eq_ignore_ascii_case(&prefix) {
         return None;
     }
-    Some(path[prefix.len()..].split('\\').filter(|part| !part.is_empty()).count())
+    Some(
+        path[prefix.len()..]
+            .split('\\')
+            .filter(|part| !part.is_empty())
+            .count(),
+    )
 }
 
 fn is_within_roots(path: &str, roots: &[String], max_depth: usize) -> bool {
-    roots.iter().any(|root| {
-        relative_depth(path, root)
-            .is_some_and(|depth| depth > 0 && depth <= max_depth)
-    })
+    roots
+        .iter()
+        .any(|root| relative_depth(path, root).is_some_and(|depth| depth > 0 && depth <= max_depth))
 }
 
 pub(super) fn make_cache_text(
@@ -204,9 +218,7 @@ pub(super) fn make_cache_text(
         let Some(path) = resolve_path(index, entries, &by_reference, &root) else {
             continue;
         };
-        if !is_within_roots(&path, roots, max_depth)
-            || path.contains(['\t', '\n', '\r'])
-        {
+        if !is_within_roots(&path, roots, max_depth) || path.contains(['\t', '\n', '\r']) {
             continue;
         }
         text.push(if entry.is_dir { 'D' } else { 'F' });
@@ -218,7 +230,10 @@ pub(super) fn make_cache_text(
 }
 
 pub(super) fn write_atomically(path: &Path, contents: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Could not create output folder: {e}"))?;
     }
@@ -483,13 +498,40 @@ mod tests {
     #[test]
     fn resolves_paths_through_parent_file_references() {
         let entries = vec![
-            MftEntry { file_reference: 5, parent_reference: 5, name: String::new(), is_dir: true },
-            MftEntry { file_reference: 20, parent_reference: 5, name: "Users".into(), is_dir: true },
-            MftEntry { file_reference: 21, parent_reference: 20, name: "alice".into(), is_dir: true },
-            MftEntry { file_reference: 22, parent_reference: 21, name: "notes.txt".into(), is_dir: false },
+            MftEntry {
+                file_reference: 5,
+                parent_reference: 5,
+                name: String::new(),
+                is_dir: true,
+            },
+            MftEntry {
+                file_reference: 20,
+                parent_reference: 5,
+                name: "Users".into(),
+                is_dir: true,
+            },
+            MftEntry {
+                file_reference: 21,
+                parent_reference: 20,
+                name: "alice".into(),
+                is_dir: true,
+            },
+            MftEntry {
+                file_reference: 22,
+                parent_reference: 21,
+                name: "notes.txt".into(),
+                is_dir: false,
+            },
         ];
-        let by_reference: HashMap<u64, usize> = entries.iter().enumerate().map(|(i, e)| (e.file_reference, i)).collect();
-        assert_eq!(resolve_path(3, &entries, &by_reference, "C:\\"), Some("C:\\Users\\alice\\notes.txt".into()));
+        let by_reference: HashMap<u64, usize> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.file_reference, i))
+            .collect();
+        assert_eq!(
+            resolve_path(3, &entries, &by_reference, "C:\\"),
+            Some("C:\\Users\\alice\\notes.txt".into())
+        );
     }
 
     #[test]
@@ -531,17 +573,47 @@ mod tests {
     #[test]
     fn exports_existing_builtin_cache_format_for_configured_roots() {
         let entries = vec![
-            MftEntry { file_reference: 5, parent_reference: 5, name: String::new(), is_dir: true },
-            MftEntry { file_reference: 20, parent_reference: 5, name: "Users".into(), is_dir: true },
-            MftEntry { file_reference: 21, parent_reference: 20, name: "alice".into(), is_dir: true },
-            MftEntry { file_reference: 22, parent_reference: 21, name: "notes.txt".into(), is_dir: false },
-            MftEntry { file_reference: 23, parent_reference: 20, name: "other.txt".into(), is_dir: false },
+            MftEntry {
+                file_reference: 5,
+                parent_reference: 5,
+                name: String::new(),
+                is_dir: true,
+            },
+            MftEntry {
+                file_reference: 20,
+                parent_reference: 5,
+                name: "Users".into(),
+                is_dir: true,
+            },
+            MftEntry {
+                file_reference: 21,
+                parent_reference: 20,
+                name: "alice".into(),
+                is_dir: true,
+            },
+            MftEntry {
+                file_reference: 22,
+                parent_reference: 21,
+                name: "notes.txt".into(),
+                is_dir: false,
+            },
+            MftEntry {
+                file_reference: 23,
+                parent_reference: 20,
+                name: "other.txt".into(),
+                is_dir: false,
+            },
         ];
         let roots = vec!["C:\\Users\\alice".to_string()];
         let text = make_cache_text(&entries, &roots, 8, "C:");
-        assert_eq!(text.lines().next().unwrap(), "okra-index-v1\t8\tC:\\Users\\alice");
+        assert_eq!(
+            text.lines().next().unwrap(),
+            "okra-index-v1\t8\tC:\\Users\\alice"
+        );
         assert!(!text.lines().any(|line| line == "D\tC:\\Users\\alice"));
-        assert!(text.lines().any(|line| line == "F\tC:\\Users\\alice\\notes.txt"));
+        assert!(text
+            .lines()
+            .any(|line| line == "F\tC:\\Users\\alice\\notes.txt"));
         assert!(!text.contains("other.txt"));
     }
 

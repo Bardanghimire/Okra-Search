@@ -3,17 +3,22 @@ use okra_core::matcher::{fuzzy, is_subsequence, normalize};
 use std::time::Instant;
 
 fn lcg(seed: &mut u64) -> u64 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     *seed >> 33
 }
 
 fn synth_name(seed: &mut u64) -> String {
     const WORDS: &[&str] = &[
-        "report", "invoice", "final", "draft", "thesis", "turbine", "heat", "transfer", "chapter", "notes",
-        "Visual", "Studio", "Code", "Chrome", "Firefox", "setup", "backup", "photo", "IMG", "scan", "lecture",
-        "design", "gear", "shaft", "fluent", "ansys", "model", "v2", "copy", "new",
+        "report", "invoice", "final", "draft", "thesis", "turbine", "heat", "transfer", "chapter",
+        "notes", "Visual", "Studio", "Code", "Chrome", "Firefox", "setup", "backup", "photo",
+        "IMG", "scan", "lecture", "design", "gear", "shaft", "fluent", "ansys", "model", "v2",
+        "copy", "new",
     ];
-    const EXT: &[&str] = &["pdf", "docx", "xlsx", "txt", "png", "py", "rs", "dll", "exe", "zip"];
+    const EXT: &[&str] = &[
+        "pdf", "docx", "xlsx", "txt", "png", "py", "rs", "dll", "exe", "zip",
+    ];
     let n = 1 + (lcg(seed) % 4) as usize;
     let mut s = String::new();
     for i in 0..n {
@@ -33,9 +38,24 @@ fn main() {
     let files: Vec<String> = (0..300_000).map(|_| synth_name(&mut seed)).collect();
     let files_lower: Vec<String> = files.iter().map(|s| s.to_lowercase()).collect();
     let paths: Vec<String> = (0..200)
-        .map(|_| format!("C:\\Users\\student\\Documents\\University\\Semester7\\{}\\{}", synth_name(&mut seed), synth_name(&mut seed)))
+        .map(|_| {
+            format!(
+                "C:\\Users\\student\\Documents\\University\\Semester7\\{}\\{}",
+                synth_name(&mut seed),
+                synth_name(&mut seed)
+            )
+        })
         .collect();
-    let queries = ["ch", "chr", "chrome", "vsc", "turb", "heat tr", "report fin", "invoice pdf"];
+    let queries = [
+        "ch",
+        "chr",
+        "chrome",
+        "vsc",
+        "turb",
+        "heat tr",
+        "report fin",
+        "invoice pdf",
+    ];
 
     // 1. apps-style: fuzzy over 400 names (what AppsProvider does per keystroke)
     let t = Instant::now();

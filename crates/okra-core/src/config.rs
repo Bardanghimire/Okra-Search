@@ -98,7 +98,9 @@ impl Config {
 
     /// Load the user's config, writing the defaults on first run so they can be edited.
     pub fn load_or_default() -> Self {
-        let Some(path) = Self::path() else { return Self::default() };
+        let Some(path) = Self::path() else {
+            return Self::default();
+        };
         if let Ok(text) = std::fs::read_to_string(&path) {
             if let Ok(cfg) = serde_json::from_str(&text) {
                 return cfg;
@@ -114,9 +116,11 @@ impl Config {
             return Err("Could not resolve the application config directory".into());
         };
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("Could not create settings folder: {e}"))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Could not create settings folder: {e}"))?;
         }
-        let json = serde_json::to_string_pretty(self).map_err(|e| format!("Could not serialize settings: {e}"))?;
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("Could not serialize settings: {e}"))?;
         std::fs::write(path, json).map_err(|e| format!("Could not save settings: {e}"))
     }
 }
@@ -134,8 +138,10 @@ mod tests {
 
     #[test]
     fn font_choice_round_trips() {
-        let mut cfg = Config::default();
-        cfg.font = FontKind::SegoeUi;
+        let cfg = Config {
+            font: FontKind::SegoeUi,
+            ..Config::default()
+        };
         let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back.font, FontKind::SegoeUi);
     }

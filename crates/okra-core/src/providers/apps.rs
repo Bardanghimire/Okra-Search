@@ -39,26 +39,35 @@ impl AppsProvider {
         Self::start_with_cache(cache_path(), on_refresh)
     }
 
-    fn start_with_cache(cache: Option<PathBuf>, on_refresh: Arc<OnceLock<RefreshCallback>>) -> Self {
+    fn start_with_cache(
+        cache: Option<PathBuf>,
+        on_refresh: Arc<OnceLock<RefreshCallback>>,
+    ) -> Self {
         let initial = cache.as_deref().and_then(load_cache).unwrap_or_default();
         let shared: Arc<RwLock<Arc<Vec<AppEntry>>>> = Arc::new(RwLock::new(Arc::new(initial)));
         let background = shared.clone();
-        let _ = std::thread::Builder::new().name("okra-app-scan".into()).spawn(move || loop {
-            let fresh = scan_all();
-            if let Some(path) = &cache {
-                save_cache(path, &fresh);
-            }
-            *background.write().unwrap() = Arc::new(fresh);
-            if let Some(callback) = on_refresh.get() {
-                callback();
-            }
-            std::thread::sleep(RESCAN_INTERVAL);
-        });
+        let _ = std::thread::Builder::new()
+            .name("okra-app-scan".into())
+            .spawn(move || loop {
+                let fresh = scan_all();
+                if let Some(path) = &cache {
+                    save_cache(path, &fresh);
+                }
+                *background.write().unwrap() = Arc::new(fresh);
+                if let Some(callback) = on_refresh.get() {
+                    callback();
+                }
+                std::thread::sleep(RESCAN_INTERVAL);
+            });
         Self { apps: shared }
     }
 
     pub fn len(&self) -> usize {
         self.apps.read().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -71,7 +80,7 @@ fn scan_all() -> Vec<AppEntry> {
     } else {
         scan_linux(&mut apps);
     }
-    apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    apps.sort_by_cached_key(|a| a.name.to_lowercase());
     apps.dedup_by(|a, b| a.name.eq_ignore_ascii_case(&b.name));
     apps
 }
@@ -109,10 +118,20 @@ fn save_cache(path: &Path, apps: &[AppEntry]) {
                 exec: exec.clone(),
                 app_id: None,
             }),
-            AppTarget::AppId(id) => Some(CachedApp { name: app.name.clone(), path: None, exec: None, app_id: Some(id.clone()) }),
+            AppTarget::AppId(id) => Some(CachedApp {
+                name: app.name.clone(),
+                path: None,
+                exec: None,
+                app_id: Some(id.clone()),
+            }),
         })
         .collect();
-    let Ok(json) = serde_json::to_vec(&CacheFile { version: CACHE_VERSION, apps: cached }) else { return };
+    let Ok(json) = serde_json::to_vec(&CacheFile {
+        version: CACHE_VERSION,
+        apps: cached,
+    }) else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -133,11 +152,17 @@ fn load_cache(path: &Path) -> Option<Vec<AppEntry>> {
             .into_iter()
             .filter_map(|app| {
                 let target = match (app.path, app.app_id) {
-                    (Some(path), _) => AppTarget::Shortcut { path: PathBuf::from(path), exec: app.exec },
+                    (Some(path), _) => AppTarget::Shortcut {
+                        path: PathBuf::from(path),
+                        exec: app.exec,
+                    },
                     (None, Some(id)) => AppTarget::AppId(id),
                     (None, None) => return None,
                 };
-                Some(AppEntry { name: app.name, target })
+                Some(AppEntry {
+                    name: app.name,
+                    target,
+                })
             })
             .collect(),
     )
@@ -197,7 +222,13 @@ fn parse_desktop(p: &Path) -> Option<AppEntry> {
         return None;
     }
     // Linux .desktop launch support remains deliberately small in this Windows-focused build.
-    Some(AppEntry { name: name?, target: AppTarget::Shortcut { path: p.to_path_buf(), exec: Some(exec?) } })
+    Some(AppEntry {
+        name: name?,
+        target: AppTarget::Shortcut {
+            path: p.to_path_buf(),
+            exec: Some(exec?),
+        },
+    })
 }
 
 /// Strip freedesktop field codes (%f %U ...) from an Exec line.
@@ -213,21 +244,50 @@ fn clean_exec(s: &str) -> String {
 /// someone searching for an application wants.
 fn is_start_menu_noise(name: &str) -> bool {
     let lower = name.to_lowercase();
-    ["uninstall", "readme", "read me", "release notes", "license", "licence", "changelog"]
-        .iter()
-        .any(|word| lower.contains(word))
+    [
+        "uninstall",
+        "readme",
+        "read me",
+        "release notes",
+        "license",
+        "licence",
+        "changelog",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
 }
 
 fn scan_windows(out: &mut Vec<AppEntry>) {
-    let rel = Path::new("Microsoft").join("Windows").join("Start Menu").join("Programs");
+    let rel = Path::new("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs");
     for var in ["ProgramData", "APPDATA"] {
-        let Some(base) = std::env::var_os(var) else { continue };
-        for e in WalkDir::new(PathBuf::from(base).join(&rel)).max_depth(5).into_iter().flatten() {
+        let Some(base) = std::env::var_os(var) else {
+            continue;
+        };
+        for e in WalkDir::new(PathBuf::from(base).join(&rel))
+            .max_depth(5)
+            .into_iter()
+            .flatten()
+        {
             let p = e.path();
-            let is_lnk = p.extension().and_then(|x| x.to_str()).map_or(false, |x| x.eq_ignore_ascii_case("lnk"));
-            let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let is_lnk = p
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| x.eq_ignore_ascii_case("lnk"));
+            let stem = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
             if is_lnk && !is_start_menu_noise(&stem) {
-                out.push(AppEntry { name: stem, target: AppTarget::Shortcut { path: p.to_path_buf(), exec: None } });
+                out.push(AppEntry {
+                    name: stem,
+                    target: AppTarget::Shortcut {
+                        path: p.to_path_buf(),
+                        exec: None,
+                    },
+                });
             }
         }
     }
@@ -248,10 +308,21 @@ fn scan_windows(out: &mut Vec<AppEntry>) {
             if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
                 let entries = value.as_array().cloned().unwrap_or_else(|| vec![value]);
                 for row in entries {
-                    let name = row.get("Name").and_then(|v| v.as_str()).unwrap_or_default().trim();
-                    let app_id = row.get("AppID").and_then(|v| v.as_str()).unwrap_or_default().trim();
+                    let name = row
+                        .get("Name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .trim();
+                    let app_id = row
+                        .get("AppID")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .trim();
                     if !name.is_empty() && !app_id.is_empty() {
-                        out.push(AppEntry { name: name.to_string(), target: AppTarget::AppId(app_id.to_string()) });
+                        out.push(AppEntry {
+                            name: name.to_string(),
+                            target: AppTarget::AppId(app_id.to_string()),
+                        });
                     }
                 }
             }
@@ -260,20 +331,36 @@ fn scan_windows(out: &mut Vec<AppEntry>) {
 }
 
 fn scan_macos(out: &mut Vec<AppEntry>) {
-    let mut roots: Vec<PathBuf> = ["/Applications", "/Applications/Utilities", "/System/Applications", "/System/Applications/Utilities"]
-        .iter()
-        .map(PathBuf::from)
-        .collect();
+    let mut roots: Vec<PathBuf> = [
+        "/Applications",
+        "/Applications/Utilities",
+        "/System/Applications",
+        "/System/Applications/Utilities",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
     if let Some(h) = dirs::home_dir() {
         roots.push(h.join("Applications"));
     }
     for r in roots {
-        let Ok(rd) = std::fs::read_dir(r) else { continue };
+        let Ok(rd) = std::fs::read_dir(r) else {
+            continue;
+        };
         for e in rd.flatten() {
             let p = e.path();
-            if p.extension().map_or(false, |x| x == "app") {
-                let name = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                out.push(AppEntry { name, target: AppTarget::Shortcut { path: p, exec: None } });
+            if p.extension().is_some_and(|x| x == "app") {
+                let name = p
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                out.push(AppEntry {
+                    name,
+                    target: AppTarget::Shortcut {
+                        path: p,
+                        exec: None,
+                    },
+                });
             }
         }
     }
@@ -293,12 +380,19 @@ impl Provider for AppsProvider {
         let mut items: Vec<Item> = apps
             .iter()
             .filter_map(|app| {
-                let rank = if query.is_empty() { 0 } else { score(&query, &app.name)? + 30 };
+                let rank = if query.is_empty() {
+                    0
+                } else {
+                    score(&query, &app.name)? + 30
+                };
                 let (id, subtitle, action) = match &app.target {
                     AppTarget::Shortcut { path, exec } => (
                         format!("app:{}", path.display()),
                         path.display().to_string(),
-                        Action::Launch { path: path.clone(), exec: exec.clone() },
+                        Action::Launch {
+                            path: path.clone(),
+                            exec: exec.clone(),
+                        },
                     ),
                     AppTarget::AppId(app_id) => (
                         format!("app-id:{app_id}"),
@@ -306,7 +400,14 @@ impl Provider for AppsProvider {
                         Action::LaunchAppId(app_id.clone()),
                     ),
                 };
-                Some(Item { id, title: app.name.clone(), subtitle, kind: Kind::App, action, score: rank })
+                Some(Item {
+                    id,
+                    title: app.name.clone(),
+                    subtitle,
+                    kind: Kind::App,
+                    action,
+                    score: rank,
+                })
             })
             .collect();
         items.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
@@ -320,7 +421,10 @@ mod tests {
     use super::*;
 
     fn entry(name: &str, target: AppTarget) -> AppEntry {
-        AppEntry { name: name.into(), target }
+        AppEntry {
+            name: name.into(),
+            target,
+        }
     }
 
     #[test]
@@ -331,16 +435,38 @@ mod tests {
         save_cache(
             &path,
             &[
-                entry("Firefox", AppTarget::Shortcut { path: "/x/firefox.lnk".into(), exec: None }),
-                entry("Terminal", AppTarget::Shortcut { path: "/x/t.desktop".into(), exec: Some("xterm".into()) }),
-                entry("Calculator", AppTarget::AppId("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into())),
+                entry(
+                    "Firefox",
+                    AppTarget::Shortcut {
+                        path: "/x/firefox.lnk".into(),
+                        exec: None,
+                    },
+                ),
+                entry(
+                    "Terminal",
+                    AppTarget::Shortcut {
+                        path: "/x/t.desktop".into(),
+                        exec: Some("xterm".into()),
+                    },
+                ),
+                entry(
+                    "Calculator",
+                    AppTarget::AppId("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into()),
+                ),
             ],
         );
         let loaded = load_cache(&path).expect("cache loads");
         assert_eq!(loaded.len(), 3);
-        assert!(matches!(&loaded[2].target, AppTarget::AppId(id) if id.starts_with("Microsoft.WindowsCalculator")));
-        assert!(matches!(&loaded[1].target, AppTarget::Shortcut { exec: Some(e), .. } if e == "xterm"));
-        assert!(!path.with_extension("json.tmp").exists(), "temp file must not linger");
+        assert!(
+            matches!(&loaded[2].target, AppTarget::AppId(id) if id.starts_with("Microsoft.WindowsCalculator"))
+        );
+        assert!(
+            matches!(&loaded[1].target, AppTarget::Shortcut { exec: Some(e), .. } if e == "xterm")
+        );
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "temp file must not linger"
+        );
 
         // Corrupt or wrong-version caches are ignored rather than crashing startup.
         std::fs::write(&path, b"{ not json").unwrap();
@@ -356,7 +482,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("okra-apps-start-{}", std::process::id()));
         let path = dir.join("apps.json");
         let _ = std::fs::remove_dir_all(&dir);
-        save_cache(&path, &[entry("Cached Only App", AppTarget::Shortcut { path: "/x/c.lnk".into(), exec: None })]);
+        save_cache(
+            &path,
+            &[entry(
+                "Cached Only App",
+                AppTarget::Shortcut {
+                    path: "/x/c.lnk".into(),
+                    exec: None,
+                },
+            )],
+        );
 
         let refreshes = Arc::new(AtomicUsize::new(0));
         let notify: Arc<OnceLock<RefreshCallback>> = Arc::new(OnceLock::new());
@@ -369,7 +504,10 @@ mod tests {
         let provider = AppsProvider::start_with_cache(Some(path.clone()), notify);
         let startup = began.elapsed();
         // The cached entry is searchable right away, before/regardless of the background scan.
-        assert!(startup < Duration::from_millis(250), "start() blocked for {startup:?}");
+        assert!(
+            startup < Duration::from_millis(250),
+            "start() blocked for {startup:?}"
+        );
         let initial = provider.query("cached only", 5);
         let scanned_already = refreshes.load(Ordering::SeqCst) > 0;
         assert!(scanned_already || initial.iter().any(|i| i.title == "Cached Only App"));
@@ -379,7 +517,10 @@ mod tests {
         while refreshes.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(refreshes.load(Ordering::SeqCst) >= 1, "refresh callback never fired");
+        assert!(
+            refreshes.load(Ordering::SeqCst) >= 1,
+            "refresh callback never fired"
+        );
         // ... and rewrote the cache from the fresh scan (which does not contain our fake app).
         let rewritten = load_cache(&path).expect("cache rewritten");
         assert!(rewritten.iter().all(|a| a.name != "Cached Only App"));

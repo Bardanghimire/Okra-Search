@@ -72,7 +72,8 @@ impl HealthState {
     }
 
     pub fn set_entries(&self, entries: usize) {
-        self.entries.store(entries.min(u32::MAX as usize) as u32, Ordering::Release);
+        self.entries
+            .store(entries.min(u32::MAX as usize) as u32, Ordering::Release);
     }
 
     pub fn mark_stopping(&self) {
@@ -96,7 +97,10 @@ pub fn global() -> &'static HealthState {
 }
 
 pub fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// `Ok(())` when the snapshot may be served; otherwise the refusal code to send back.
@@ -140,8 +144,14 @@ mod tests {
     fn stops_serving_when_the_sync_loop_goes_quiet() {
         let state = HealthState::new();
         state.mark_sync_ok(1000);
-        assert_eq!(searchable(&state.snapshot(), 1000 + STALE_AFTER_SECS), Ok(()));
-        assert_eq!(searchable(&state.snapshot(), 1001 + STALE_AFTER_SECS), Err(REFUSED_STALE));
+        assert_eq!(
+            searchable(&state.snapshot(), 1000 + STALE_AFTER_SECS),
+            Ok(())
+        );
+        assert_eq!(
+            searchable(&state.snapshot(), 1001 + STALE_AFTER_SECS),
+            Err(REFUSED_STALE)
+        );
         state.mark_sync_ok(2000);
         assert_eq!(searchable(&state.snapshot(), 2001), Ok(()));
     }
@@ -176,15 +186,28 @@ mod tests {
         let reply = encode_status(&state.snapshot(), 4242);
         assert_eq!(
             decode_helper_status(&reply, 5007),
-            HelperStatus::Ready { entries: 70_799, last_sync_age_secs: 7, pid: 4242, failed_syncs: 1 }
+            HelperStatus::Ready {
+                entries: 70_799,
+                last_sync_age_secs: 7,
+                pid: 4242,
+                failed_syncs: 1
+            }
         );
         // Same reply, much later: the launcher classifies it as stale on its own clock too.
         assert_eq!(
             decode_helper_status(&reply, 5000 + STALE_AFTER_SECS + 5),
-            HelperStatus::Stale { last_sync_age_secs: STALE_AFTER_SECS + 5 }
+            HelperStatus::Stale {
+                last_sync_age_secs: STALE_AFTER_SECS + 5
+            }
         );
         state.mark_stopping();
-        assert_eq!(decode_helper_status(&encode_status(&state.snapshot(), 1), 5001), HelperStatus::Stopping);
-        assert_eq!(decode_helper_status(&encode_status(&HealthState::new().snapshot(), 1), 1), HelperStatus::Starting);
+        assert_eq!(
+            decode_helper_status(&encode_status(&state.snapshot(), 1), 5001),
+            HelperStatus::Stopping
+        );
+        assert_eq!(
+            decode_helper_status(&encode_status(&HealthState::new().snapshot(), 1), 1),
+            HelperStatus::Starting
+        );
     }
 }

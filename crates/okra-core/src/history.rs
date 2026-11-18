@@ -26,7 +26,10 @@ pub struct History {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn normalize_query(query: &str) -> String {
@@ -41,14 +44,21 @@ impl History {
             Some(text) => {
                 // Older versions stored just `{ id: count }`; keep those counts.
                 if let Ok(counts) = serde_json::from_str::<HashMap<String, u32>>(&text) {
-                    Data { counts, ..Data::default() }
+                    Data {
+                        counts,
+                        ..Data::default()
+                    }
                 } else {
                     serde_json::from_str::<Data>(&text).unwrap_or_default()
                 }
             }
             None => Data::default(),
         };
-        Self { data, path, writer: None }
+        Self {
+            data,
+            path,
+            writer: None,
+        }
     }
 
     pub fn in_memory() -> Self {
@@ -105,7 +115,11 @@ impl History {
                 }
             }
         }
-        QueryBoost { history: self, now: now_secs(), learned }
+        QueryBoost {
+            history: self,
+            now: now_secs(),
+            learned,
+        }
     }
 
     pub fn record(&mut self, id: &str, query: &str) {
@@ -113,7 +127,13 @@ impl History {
         self.data.last.insert(id.to_string(), now_secs());
         let query = normalize_query(query);
         if !query.is_empty() && query.chars().count() <= 40 {
-            *self.data.learned.entry(query).or_default().entry(id.to_string()).or_insert(0) += 1;
+            *self
+                .data
+                .learned
+                .entry(query)
+                .or_default()
+                .entry(id.to_string())
+                .or_insert(0) += 1;
         }
         self.persist();
     }
@@ -122,8 +142,12 @@ impl History {
     /// activating a result never waits on the disk (or an antivirus scan of it).
     fn persist(&mut self) {
         let Some(path) = &self.path else { return };
-        let Ok(json) = serde_json::to_string(&self.data) else { return };
-        let writer = self.writer.get_or_insert_with(|| spawn_writer(path.clone()));
+        let Ok(json) = serde_json::to_string(&self.data) else {
+            return;
+        };
+        let writer = self
+            .writer
+            .get_or_insert_with(|| spawn_writer(path.clone()));
         let _ = writer.send(json);
     }
 }
@@ -138,7 +162,13 @@ pub struct QueryBoost<'a> {
 
 impl QueryBoost<'_> {
     pub fn boost(&self, id: &str) -> i64 {
-        let best = self.learned.iter().filter_map(|picks| picks.get(id)).copied().max().unwrap_or(0);
+        let best = self
+            .learned
+            .iter()
+            .filter_map(|picks| picks.get(id))
+            .copied()
+            .max()
+            .unwrap_or(0);
         self.history.boost_at(id, self.now) + best.min(10) as i64 * 35
     }
 }
@@ -146,14 +176,16 @@ impl QueryBoost<'_> {
 /// One writer thread; if several saves queue up only the newest is written.
 fn spawn_writer(path: PathBuf) -> Sender<String> {
     let (tx, rx) = channel::<String>();
-    let _ = std::thread::Builder::new().name("okra-history-writer".into()).spawn(move || {
-        while let Ok(mut json) = rx.recv() {
-            while let Ok(newer) = rx.try_recv() {
-                json = newer;
+    let _ = std::thread::Builder::new()
+        .name("okra-history-writer".into())
+        .spawn(move || {
+            while let Ok(mut json) = rx.recv() {
+                while let Ok(newer) = rx.try_recv() {
+                    json = newer;
+                }
+                write_atomic(&path, json.as_bytes());
             }
-            write_atomic(&path, json.as_bytes());
-        }
-    });
+        });
     tx
 }
 
@@ -191,7 +223,9 @@ mod tests {
     #[test]
     fn prepared_scoring_matches_the_original_algorithm() {
         let mut history = History::in_memory();
-        let words = ["chrome", "chr", "Éclair", "ch", "c", "notepad", "ñandú", " code ", "x"];
+        let words = [
+            "chrome", "chr", "Éclair", "ch", "c", "notepad", "ñandú", " code ", "x",
+        ];
         for round in 0..400usize {
             let id = format!("item:{}", round % 23);
             history.record(&id, words[round % words.len()]);
@@ -199,10 +233,17 @@ mod tests {
                 history.record(&id, &format!("{}{}", words[round % words.len()], round % 5));
             }
         }
-        for query in ["", "c", "ch", "chr", "chro", "chrome", "Chrome ", "éc", "Éclair", "ñan", "ñandú!", "zzz", " code", "x"] {
+        for query in [
+            "", "c", "ch", "chr", "chro", "chrome", "Chrome ", "éc", "Éclair", "ñan", "ñandú!",
+            "zzz", " code", "x",
+        ] {
             for n in 0..30 {
                 let id = format!("item:{n}");
-                assert_eq!(history.boost_for_query(&id, query), reference_boost_for_query(&history, &id, query), "id={id} query={query:?}");
+                assert_eq!(
+                    history.boost_for_query(&id, query),
+                    reference_boost_for_query(&history, &id, query),
+                    "id={id} query={query:?}"
+                );
             }
         }
     }
@@ -212,14 +253,20 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("okra-history-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("history.json");
-        let mut history = History { data: Data::default(), path: Some(path.clone()), writer: None };
+        let mut history = History {
+            data: Data::default(),
+            path: Some(path.clone()),
+            writer: None,
+        };
         for _ in 0..3 {
             history.record("app:chrome", "chr");
         }
         // The newest state reaches the file shortly after, written by the background thread.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let counts = loop {
-            let saved = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Data>(&t).ok());
+            let saved = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<Data>(&t).ok());
             match saved {
                 Some(d) if d.counts.get("app:chrome") == Some(&3) => break d.counts,
                 _ if std::time::Instant::now() > deadline => panic!("history was never written"),
@@ -227,7 +274,10 @@ mod tests {
             }
         };
         assert_eq!(counts["app:chrome"], 3);
-        assert!(!path.with_extension("json.tmp").exists(), "temp file must not linger");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "temp file must not linger"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -239,6 +289,9 @@ mod tests {
         let learned = history.boost_for_query("app:chrome", "chro");
         let other = history.boost_for_query("app:chrome-beta", "chro");
         assert!(learned > other);
-        assert!(history.boost("app:chrome") >= 80, "just-used items get the recency bonus");
+        assert!(
+            history.boost("app:chrome") >= 80,
+            "just-used items get the recency bonus"
+        );
     }
 }

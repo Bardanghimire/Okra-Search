@@ -15,7 +15,13 @@ fn main() {
     for q in std::env::args().skip(1) {
         println!("== {q}");
         for it in engine.search(&q).iter().take(6) {
-            println!("  [{:>5}] {:<10} {}  ({})", it.score, it.kind.label(), it.title, it.subtitle);
+            println!(
+                "  [{:>5}] {:<10} {}  ({})",
+                it.score,
+                it.kind.label(),
+                it.title,
+                it.subtitle
+            );
         }
     }
 }

@@ -54,7 +54,10 @@ fn parse_command() -> Result<Command, String> {
         return Ok(Command::InstallTask { args, start_now });
     }
     if args.start_now {
-        return Err(format!("--start-now only applies to --install-task\n{}", usage()));
+        return Err(format!(
+            "--start-now only applies to --install-task\n{}",
+            usage()
+        ));
     }
     Ok(Command::Run(args))
 }
@@ -165,7 +168,9 @@ fn run_index(args: Args) -> Result<(), String> {
     );
     status::global().mark_stopping();
     if result.is_ok() && shutdown::global().requested() {
-        eprintln!("Shutdown requested; the index was saved after the last completed synchronization.");
+        eprintln!(
+            "Shutdown requested; the index was saved after the last completed synchronization."
+        );
     }
     // Releases the console-handler thread, which keeps Windows from killing the process
     // before this point on close/logoff/shutdown events.
@@ -224,26 +229,40 @@ mod background {
     const MAX_LOG_BYTES: u64 = 1024 * 1024;
 
     pub fn detach() -> Result<(), String> {
-        let exe = std::env::current_exe().map_err(|error| format!("Could not locate this executable: {error}"))?;
+        let exe = std::env::current_exe()
+            .map_err(|error| format!("Could not locate this executable: {error}"))?;
         let log_path = exe.with_file_name("helper.log");
-        if std::fs::metadata(&log_path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
+        if std::fs::metadata(&log_path)
+            .map(|m| m.len() > MAX_LOG_BYTES)
+            .unwrap_or(false)
+        {
             let _ = std::fs::rename(&log_path, exe.with_file_name("helper.log.1"));
         }
         let log = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log_path)
-            .map_err(|error| format!("Could not open the helper log {}: {error}", log_path.display()))?;
-        let handle = log.as_raw_handle() as *mut std::ffi::c_void;
+            .map_err(|error| {
+                format!(
+                    "Could not open the helper log {}: {error}",
+                    log_path.display()
+                )
+            })?;
+        let handle = log.as_raw_handle();
         unsafe {
             FreeConsole();
-            if SetStdHandle(STD_OUTPUT_HANDLE, handle) == 0 || SetStdHandle(STD_ERROR_HANDLE, handle) == 0 {
+            if SetStdHandle(STD_OUTPUT_HANDLE, handle) == 0
+                || SetStdHandle(STD_ERROR_HANDLE, handle) == 0
+            {
                 return Err("Could not redirect helper output to its log file".into());
             }
         }
         // The process-wide standard handles now own this file for the life of the process.
         std::mem::forget(log);
-        eprintln!("---- okra-index-helper started (pid {}) ----", std::process::id());
+        eprintln!(
+            "---- okra-index-helper started (pid {}) ----",
+            std::process::id()
+        );
         Ok(())
     }
 }

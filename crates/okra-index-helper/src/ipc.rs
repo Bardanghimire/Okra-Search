@@ -60,14 +60,21 @@ impl SnapshotCache {
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("Could not read NTFS snapshot: {error}"))?;
         let mut lines = text.lines();
-        let header = lines.next().ok_or_else(|| "NTFS snapshot is empty".to_string())?;
+        let header = lines
+            .next()
+            .ok_or_else(|| "NTFS snapshot is empty".to_string())?;
         if !header.starts_with("okra-index-v1\t") {
             return Err("NTFS snapshot has an unsupported header".into());
         }
         let mut entries = Vec::new();
         for line in lines {
-            let Some((kind, raw_path)) = line.split_once('\t') else { continue };
-            if raw_path.is_empty() || raw_path.len() > MAX_PATH_BYTES || raw_path.contains(['\n', '\r', '\t']) {
+            let Some((kind, raw_path)) = line.split_once('\t') else {
+                continue;
+            };
+            if raw_path.is_empty()
+                || raw_path.len() > MAX_PATH_BYTES
+                || raw_path.contains(['\n', '\r', '\t'])
+            {
                 continue;
             }
             let is_dir = match kind {
@@ -125,9 +132,7 @@ impl SnapshotCache {
                 hits.push((rank, position));
             }
         }
-        let order = |a: &(i64, usize), b: &(i64, usize)| {
-            b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))
-        };
+        let order = |a: &(i64, usize), b: &(i64, usize)| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1));
         if hits.len() > max {
             hits.select_nth_unstable_by(max - 1, order);
             hits.truncate(max);
@@ -135,9 +140,9 @@ impl SnapshotCache {
         hits.sort_by(order);
         Ok(hits
             .into_iter()
-            .filter_map(|(_, position)| {
+            .map(|(_, position)| {
                 let entry = &self.entries[position];
-                Some((entry.path.clone(), entry.is_dir))
+                (entry.path.clone(), entry.is_dir)
             })
             .collect())
     }
@@ -147,24 +152,21 @@ fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
 }
 
-fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
-}
-
 fn parse_request(header: &[u8], body: &[u8]) -> Result<(String, usize), String> {
     if header.len() != 8 || &header[..4] != REQUEST_MAGIC {
         return Err("Invalid Okra IPC request header".into());
     }
     let max = read_u16(header, 4).ok_or_else(|| "Truncated result limit".to_string())? as usize;
-    let query_len = read_u16(header, 6).ok_or_else(|| "Truncated query length".to_string())? as usize;
+    let query_len =
+        read_u16(header, 6).ok_or_else(|| "Truncated query length".to_string())? as usize;
     if !(1..=MAX_RESULTS).contains(&max) {
         return Err("IPC result limit must be between 1 and 200".into());
     }
     if query_len == 0 || query_len > MAX_QUERY_BYTES || body.len() != query_len {
         return Err("IPC query length is invalid".into());
     }
-    let query = std::str::from_utf8(body)
-        .map_err(|_| "IPC query is not valid UTF-8".to_string())?;
+    let query =
+        std::str::from_utf8(body).map_err(|_| "IPC query is not valid UTF-8".to_string())?;
     if query.chars().any(char::is_control) {
         return Err("IPC query contains control characters".into());
     }
@@ -177,8 +179,7 @@ fn encode_response(results: &[(String, bool)], status: u16) -> Result<Vec<u8>, S
             .iter()
             .filter_map(|(path, is_dir)| {
                 let bytes = path.as_bytes();
-                (!bytes.is_empty() && bytes.len() <= MAX_PATH_BYTES)
-                    .then_some((bytes, *is_dir))
+                (!bytes.is_empty() && bytes.len() <= MAX_PATH_BYTES).then_some((bytes, *is_dir))
             })
             .take(MAX_RESULTS)
             .collect()
@@ -274,7 +275,8 @@ mod win_pipe {
     #[link(name = "advapi32")]
     extern "system" {
         fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
-        fn LookupPrivilegeValueW(system_name: *const u16, name: *const u16, luid: *mut Luid) -> i32;
+        fn LookupPrivilegeValueW(system_name: *const u16, name: *const u16, luid: *mut Luid)
+            -> i32;
         fn AdjustTokenPrivileges(
             token: Handle,
             disable_all: i32,
@@ -325,7 +327,7 @@ mod win_pipe {
             bytes_read: *mut u32,
             overlapped: *mut c_void,
         ) -> i32;
-        
+
         fn WriteFile(
             file: Handle,
             buffer: *const u8,
@@ -339,7 +341,9 @@ mod win_pipe {
     impl Drop for OwnedHandle {
         fn drop(&mut self) {
             if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
-                unsafe { CloseHandle(self.0); }
+                unsafe {
+                    CloseHandle(self.0);
+                }
             }
         }
     }
@@ -348,11 +352,12 @@ mod win_pipe {
     impl Drop for LocalMemory {
         fn drop(&mut self) {
             if !self.0.is_null() {
-                unsafe { LocalFree(self.0); }
+                unsafe {
+                    LocalFree(self.0);
+                }
             }
         }
     }
-
 
     /// Enables SeSecurityPrivilege only while CreateNamedPipe applies the mandatory integrity
     /// label in the new object's SACL. The prior privilege state is restored when this guard drops.
@@ -398,8 +403,14 @@ mod win_pipe {
             ));
         }
         let token = OwnedHandle(token);
-        let name = "SeSecurityPrivilege".encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
-        let mut luid = Luid { low_part: 0, high_part: 0 };
+        let name = "SeSecurityPrivilege"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut luid = Luid {
+            low_part: 0,
+            high_part: 0,
+        };
         if unsafe { LookupPrivilegeValueW(ptr::null(), name.as_ptr(), &mut luid) } == 0 {
             return Err(format!(
                 "Could not look up SeSecurityPrivilege (Windows error {})",
@@ -409,12 +420,18 @@ mod win_pipe {
 
         let enabled = TokenPrivileges {
             privilege_count: 1,
-            privileges: [LuidAndAttributes { luid, attributes: SE_PRIVILEGE_ENABLED }],
+            privileges: [LuidAndAttributes {
+                luid,
+                attributes: SE_PRIVILEGE_ENABLED,
+            }],
         };
         let mut previous = TokenPrivileges {
             privilege_count: 0,
             privileges: [LuidAndAttributes {
-                luid: Luid { low_part: 0, high_part: 0 },
+                luid: Luid {
+                    low_part: 0,
+                    high_part: 0,
+                },
                 attributes: 0,
             }],
         };
@@ -436,7 +453,10 @@ mod win_pipe {
             ));
         }
         if unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
-            return Err("The elevated helper token does not have SeSecurityPrivilege to label the pipe".into());
+            return Err(
+                "The elevated helper token does not have SeSecurityPrivilege to label the pipe"
+                    .into(),
+            );
         }
         Ok(SecurityPrivilegeGuard { token, previous })
     }
@@ -445,7 +465,10 @@ mod win_pipe {
         let mut token = ptr::null_mut();
         let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
         if opened == 0 {
-            return Err(format!("Could not open helper process token (Windows error {})", unsafe { GetLastError() }));
+            return Err(format!(
+                "Could not open helper process token (Windows error {})",
+                unsafe { GetLastError() }
+            ));
         }
         let token = OwnedHandle(token);
         let mut needed = 0u32;
@@ -453,7 +476,10 @@ mod win_pipe {
             GetTokenInformation(token.0, TOKEN_GROUPS_CLASS, ptr::null_mut(), 0, &mut needed);
         }
         if needed < size_of::<u32>() as u32 {
-            return Err(format!("Could not size token-group information (Windows error {})", unsafe { GetLastError() }));
+            return Err(format!(
+                "Could not size token-group information (Windows error {})",
+                unsafe { GetLastError() }
+            ));
         }
         let words = (needed as usize + size_of::<usize>() - 1) / size_of::<usize>();
         let mut storage = vec![0usize; words];
@@ -468,7 +494,10 @@ mod win_pipe {
             )
         };
         if ok == 0 {
-            return Err(format!("Could not read token-group information (Windows error {})", unsafe { GetLastError() }));
+            return Err(format!(
+                "Could not read token-group information (Windows error {})",
+                unsafe { GetLastError() }
+            ));
         }
 
         let base = storage.as_ptr() as *const u8;
@@ -498,7 +527,10 @@ mod win_pipe {
 
         let mut sid_text = ptr::null_mut();
         if unsafe { ConvertSidToStringSidW(logon_sid, &mut sid_text) } == 0 {
-            return Err(format!("Could not convert logon-session SID (Windows error {})", unsafe { GetLastError() }));
+            return Err(format!(
+                "Could not convert logon-session SID (Windows error {})",
+                unsafe { GetLastError() }
+            ));
         }
         let sid_memory = LocalMemory(sid_text as Handle);
         let mut length = 0usize;
@@ -526,7 +558,10 @@ mod win_pipe {
                 )
             };
             if ok == 0 || read == 0 {
-                return Err(format!("Could not read Okra IPC request (Windows error {})", unsafe { GetLastError() }));
+                return Err(format!(
+                    "Could not read Okra IPC request (Windows error {})",
+                    unsafe { GetLastError() }
+                ));
             }
             let (_, rest) = output.split_at_mut(read as usize);
             output = rest;
@@ -547,7 +582,10 @@ mod win_pipe {
                 )
             };
             if ok == 0 || written == 0 {
-                return Err(format!("Could not write Okra IPC response (Windows error {})", unsafe { GetLastError() }));
+                return Err(format!(
+                    "Could not write Okra IPC response (Windows error {})",
+                    unsafe { GetLastError() }
+                ));
             }
             input = &input[written as usize..];
         }
@@ -621,11 +659,17 @@ mod win_pipe {
     }
 
     fn create_pipe(logon_sid: &str) -> Result<OwnedHandle, String> {
-        let pipe_name = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+        let pipe_name = PIPE_NAME
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
         // Medium integrity lets the unelevated desktop app write requests to this pipe; the
         // protected DACL still limits access to this exact logon session and SYSTEM.
         let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;{logon_sid})S:(ML;;NW;;;ME)");
-        let sddl_wide = sddl.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+        let sddl_wide = sddl
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
         let mut descriptor = ptr::null_mut();
         if unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -634,11 +678,15 @@ mod win_pipe {
                 &mut descriptor,
                 ptr::null_mut(),
             )
-        } == 0 {
-            return Err(format!("Could not create logon-session pipe ACL (Windows error {})", unsafe { GetLastError() }));
+        } == 0
+        {
+            return Err(format!(
+                "Could not create logon-session pipe ACL (Windows error {})",
+                unsafe { GetLastError() }
+            ));
         }
         let descriptor = LocalMemory(descriptor);
-        let mut security = SecurityAttributes {
+        let security = SecurityAttributes {
             length: size_of::<SecurityAttributes>() as u32,
             descriptor: descriptor.0,
             inherit_handle: 0,
@@ -656,7 +704,7 @@ mod win_pipe {
                 64 * 1024,
                 2048,
                 0,
-                &mut security,
+                &security,
             )
         };
         let pipe_error = if pipe.is_null() || pipe == INVALID_HANDLE_VALUE {
@@ -684,7 +732,9 @@ mod win_pipe {
                 let error = unsafe { GetLastError() };
                 if error != ERROR_PIPE_CONNECTED {
                     eprintln!("Could not accept Okra named-pipe client (Windows error {error}).");
-                    unsafe { DisconnectNamedPipe(pipe.0); }
+                    unsafe {
+                        DisconnectNamedPipe(pipe.0);
+                    }
                     thread::sleep(Duration::from_millis(100));
                     continue;
                 }
@@ -694,8 +744,12 @@ mod win_pipe {
             }
             // DisconnectNamedPipe discards data the client has not read yet. Wait for the
             // client to read the whole reply first, or fast replies (such as status) are lost.
-            unsafe { FlushFileBuffers(pipe.0); }
-            unsafe { DisconnectNamedPipe(pipe.0); }
+            unsafe {
+                FlushFileBuffers(pipe.0);
+            }
+            unsafe {
+                DisconnectNamedPipe(pipe.0);
+            }
         }
     }
 }
@@ -709,7 +763,10 @@ mod tests {
         let mut header = Vec::from(&REQUEST_MAGIC[..]);
         header.extend_from_slice(&50u16.to_le_bytes());
         header.extend_from_slice(&4u16.to_le_bytes());
-        assert_eq!(parse_request(&header, b"note").unwrap(), ("note".into(), 50));
+        assert_eq!(
+            parse_request(&header, b"note").unwrap(),
+            ("note".into(), 50)
+        );
         assert!(parse_request(b"BAD!\x32\x00\x04\x00", b"note").is_err());
         assert!(parse_request(b"OKQ1\x00\x00\x04\x00", b"note").is_err());
         assert!(parse_request(&header, b"no").is_err());
@@ -726,7 +783,8 @@ mod tests {
 
     #[test]
     fn snapshot_cache_loads_the_existing_tsv_format() {
-        let path = std::env::temp_dir().join(format!("okra-ipc-snapshot-{}.tsv", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("okra-ipc-snapshot-{}.tsv", std::process::id()));
         std::fs::write(
             &path,
             "okra-index-v1\t8\tC:\\Users\\me\nF\tC:\\Users\\me\\notes.txt\nD\tC:\\Users\\me\\note-folder\n",
@@ -735,19 +793,47 @@ mod tests {
         let mut cache = SnapshotCache::new(path.clone());
         let results = cache.search("note", 10).unwrap();
         assert_eq!(results.len(), 2);
-        assert!(results.iter().any(|(path, is_dir)| path.rsplit(['\\', '/']).next() == Some("notes.txt") && !*is_dir));
-        assert!(results.iter().any(|(path, is_dir)| path.rsplit(['\\', '/']).next() == Some("note-folder") && *is_dir));
+        assert!(results
+            .iter()
+            .any(
+                |(path, is_dir)| path.rsplit(['\\', '/']).next() == Some("notes.txt") && !*is_dir
+            ));
+        assert!(results
+            .iter()
+            .any(
+                |(path, is_dir)| path.rsplit(['\\', '/']).next() == Some("note-folder") && *is_dir
+            ));
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn snapshot_search_matches_file_names_and_respects_the_limit() {
-        let mut cache = SnapshotCache::default();
-        cache.entries = vec![
-            SnapshotEntry { path: r"C:\Users\me\notes.txt".into(), name: "notes.txt".into(), lower_name: "notes.txt".into(), mask: char_mask("notes.txt".chars()), is_dir: false },
-            SnapshotEntry { path: r"C:\Users\me\note-folder".into(), name: "note-folder".into(), lower_name: "note-folder".into(), mask: char_mask("note-folder".chars()), is_dir: true },
-            SnapshotEntry { path: r"C:\Users\me\photo.jpg".into(), name: "photo.jpg".into(), lower_name: "photo.jpg".into(), mask: char_mask("photo.jpg".chars()), is_dir: false },
-        ];
+        let mut cache = SnapshotCache {
+            entries: vec![
+                SnapshotEntry {
+                    path: r"C:\Users\me\notes.txt".into(),
+                    name: "notes.txt".into(),
+                    lower_name: "notes.txt".into(),
+                    mask: char_mask("notes.txt".chars()),
+                    is_dir: false,
+                },
+                SnapshotEntry {
+                    path: r"C:\Users\me\note-folder".into(),
+                    name: "note-folder".into(),
+                    lower_name: "note-folder".into(),
+                    mask: char_mask("note-folder".chars()),
+                    is_dir: true,
+                },
+                SnapshotEntry {
+                    path: r"C:\Users\me\photo.jpg".into(),
+                    name: "photo.jpg".into(),
+                    lower_name: "photo.jpg".into(),
+                    mask: char_mask("photo.jpg".chars()),
+                    is_dir: false,
+                },
+            ],
+            ..Default::default()
+        };
         assert_eq!(cache.search("note", 10).unwrap().len(), 2);
         assert_eq!(cache.search("photo", 1).unwrap().len(), 1);
         assert!(cache.search("zzzz", 10).unwrap().is_empty());

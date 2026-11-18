@@ -32,13 +32,20 @@ pub struct EverythingSdk {
 impl EverythingSdk {
     /// `explicit` (from config) is always tried; automatic discovery only runs on Windows.
     pub fn load(explicit: Option<&Path>) -> Option<Self> {
-        let name = if cfg!(target_pointer_width = "64") { "Everything64.dll" } else { "Everything32.dll" };
+        let name = if cfg!(target_pointer_width = "64") {
+            "Everything64.dll"
+        } else {
+            "Everything32.dll"
+        };
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(p) = explicit {
             candidates.push(p.to_path_buf());
         }
         if cfg!(windows) {
-            if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
+            if let Some(dir) = std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+            {
                 candidates.push(dir.join(name));
             }
             candidates.push(PathBuf::from(name)); // normal DLL search order (cwd, PATH, ...)
@@ -53,7 +60,9 @@ impl EverythingSdk {
         candidates
             .into_iter()
             .find_map(|c| unsafe { Library::new(&c) }.ok())
-            .map(|lib| Self { lib: Mutex::new(lib) })
+            .map(|lib| Self {
+                lib: Mutex::new(lib),
+            })
     }
 
     /// Returns `None` when the query could not run (typically: Everything is not running).
@@ -65,7 +74,8 @@ impl EverythingSdk {
             let set_max: Symbol<SetU32> = lib.get(b"Everything_SetMax\0").ok()?;
             let query: Symbol<QueryW> = lib.get(b"Everything_QueryW\0").ok()?;
             let count: Symbol<GetU32> = lib.get(b"Everything_GetNumResults\0").ok()?;
-            let full_path: Symbol<GetFullPathW> = lib.get(b"Everything_GetResultFullPathNameW\0").ok()?;
+            let full_path: Symbol<GetFullPathW> =
+                lib.get(b"Everything_GetResultFullPathNameW\0").ok()?;
             let is_folder: Symbol<IsFolder> = lib.get(b"Everything_IsFolderResult\0").ok()?;
 
             let wide: Vec<u16> = q.encode_utf16().chain(once(0)).collect();
@@ -134,7 +144,12 @@ impl EsCli {
     pub fn search(&self, q: &str, max: u32) -> Option<Vec<(PathBuf, bool)>> {
         let mut command = Command::new(&self.exe);
         suppress_console(&mut command);
-        let out = command.arg("-n").arg(max.to_string()).arg(q).output().ok()?;
+        let out = command
+            .arg("-n")
+            .arg(max.to_string())
+            .arg(q)
+            .output()
+            .ok()?;
         if !out.status.success() {
             return None; // e.g. Everything is not running (IPC error)
         }
@@ -163,7 +178,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fs-es-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("fake-es");
-        std::fs::write(&script, "#!/bin/sh\n[ \"$1\" = \"-version\" ] && exit 0\necho /tmp/a.txt\necho\necho /tmp\n").unwrap();
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n[ \"$1\" = \"-version\" ] && exit 0\necho /tmp/a.txt\necho\necho /tmp\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let es = EsCli::find(Some(&script)).expect("fake es found");
         let r = es.search("a b", 10).unwrap();

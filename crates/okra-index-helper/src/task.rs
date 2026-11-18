@@ -59,7 +59,9 @@ pub fn xml_escape(text: &str) -> String {
 /// no legitimate path needs them, and refusing is safer than clever escaping.
 pub fn quote_arg(arg: &str) -> Result<String, String> {
     if arg.chars().any(|c| c == '"' || c.is_control()) {
-        return Err(format!("Argument contains a quote or control character: {arg:?}"));
+        return Err(format!(
+            "Argument contains a quote or control character: {arg:?}"
+        ));
     }
     if !arg.is_empty() && !arg.contains([' ', '\t']) {
         return Ok(arg.to_string());
@@ -203,7 +205,8 @@ mod win {
     /// parent process could have altered before this elevated process was started.
     fn windows_dir() -> Result<PathBuf, String> {
         let mut buffer = [0u16; 260];
-        let len = unsafe { GetSystemWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+        let len = unsafe { GetSystemWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) }
+            as usize;
         if len == 0 || len >= buffer.len() {
             return Err("Could not determine the Windows directory".into());
         }
@@ -255,11 +258,15 @@ mod win {
                 }
             }
         }
-        Err(format!("Could not copy the helper to {} ({last}). Run this from an elevated prompt.", to.display()))
+        Err(format!(
+            "Could not copy the helper to {} ({last}). Run this from an elevated prompt.",
+            to.display()
+        ))
     }
 
     pub fn install(request: &InstallRequest, start_now: bool) -> Result<(), String> {
-        let domain = std::env::var("USERDOMAIN").map_err(|_| "USERDOMAIN is not set".to_string())?;
+        let domain =
+            std::env::var("USERDOMAIN").map_err(|_| "USERDOMAIN is not set".to_string())?;
         let user_name = std::env::var("USERNAME").map_err(|_| "USERNAME is not set".to_string())?;
         let user = format!("{domain}\\{user_name}");
 
@@ -267,10 +274,15 @@ mod win {
         let _ = run_schtasks(&["/End", "/TN", TASK_NAME]);
 
         let dir = install_dir()?;
-        fs::create_dir_all(&dir)
-            .map_err(|error| format!("Could not create {} ({error}). Run this from an elevated prompt.", dir.display()))?;
+        fs::create_dir_all(&dir).map_err(|error| {
+            format!(
+                "Could not create {} ({error}). Run this from an elevated prompt.",
+                dir.display()
+            )
+        })?;
         let installed = dir.join(INSTALLED_EXE_NAME);
-        let current = std::env::current_exe().map_err(|error| format!("Could not locate this executable: {error}"))?;
+        let current = std::env::current_exe()
+            .map_err(|error| format!("Could not locate this executable: {error}"))?;
         if current != installed {
             copy_with_retries(&current, &installed)?;
         }
@@ -282,7 +294,10 @@ mod win {
         };
         let xml = to_utf16le_with_bom(&build_task_xml(&spec)?);
 
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         let xml_path = windows_dir()?
             .join("Temp")
             .join(format!("okra-task-{}-{stamp}.xml", std::process::id()));
@@ -292,7 +307,8 @@ mod win {
                 .create_new(true)
                 .open(&xml_path)
                 .map_err(|error| format!("Could not stage the task definition: {error}"))?;
-            file.write_all(&xml).map_err(|error| format!("Could not write the task definition: {error}"))?;
+            file.write_all(&xml)
+                .map_err(|error| format!("Could not write the task definition: {error}"))?;
         }
         let xml_arg = xml_path.to_string_lossy().into_owned();
         let created = run_schtasks(&["/Create", "/TN", TASK_NAME, "/XML", &xml_arg, "/F"]);
@@ -303,14 +319,20 @@ mod win {
         }
 
         println!("Installed scheduled task \"{TASK_NAME}\" for {user}.");
-        println!("It runs {} at logon with highest privileges (no UAC prompt).", installed.display());
+        println!(
+            "It runs {} at logon with highest privileges (no UAC prompt).",
+            installed.display()
+        );
         println!("Log file: {}", dir.join("helper.log").display());
         if start_now {
             let started = run_schtasks(&["/Run", "/TN", TASK_NAME])?;
             if started.status.success() {
                 println!("Started the task now.");
             } else {
-                return Err(format!("Installed, but starting failed: {}", describe(&started)));
+                return Err(format!(
+                    "Installed, but starting failed: {}",
+                    describe(&started)
+                ));
             }
         } else {
             println!("It starts at your next sign-in; to start it now run: schtasks /Run /TN \"{TASK_NAME}\"");
@@ -343,7 +365,11 @@ mod tests {
     fn spec() -> TaskSpec {
         TaskSpec {
             exe: r"C:\Program Files\Okra Brown Search\okra-index-helper.exe".into(),
-            arguments: vec!["--root".into(), r"C:\Users\Jane & Co\Docs".into(), "--serve".into()],
+            arguments: vec![
+                "--root".into(),
+                r"C:\Users\Jane & Co\Docs".into(),
+                "--serve".into(),
+            ],
             user: r"SILK\barda".into(),
         }
     }
@@ -352,7 +378,10 @@ mod tests {
     fn quoting_follows_windows_command_line_rules() {
         assert_eq!(quote_arg("C:").unwrap(), "C:");
         assert_eq!(quote_arg(r"C:\Users\me").unwrap(), r"C:\Users\me");
-        assert_eq!(quote_arg(r"C:\Program Files\x").unwrap(), r#""C:\Program Files\x""#);
+        assert_eq!(
+            quote_arg(r"C:\Program Files\x").unwrap(),
+            r#""C:\Program Files\x""#
+        );
         assert_eq!(quote_arg(r"C:\My Dir\").unwrap(), r#""C:\My Dir\\""#);
         assert_eq!(quote_arg("").unwrap(), r#""""#);
         assert!(quote_arg("bad\"quote").is_err());
@@ -361,7 +390,10 @@ mod tests {
 
     #[test]
     fn xml_escaping_covers_markup_characters() {
-        assert_eq!(xml_escape(r#"a&b<c>"d"'e'"#), "a&amp;b&lt;c&gt;&quot;d&quot;&apos;e&apos;");
+        assert_eq!(
+            xml_escape(r#"a&b<c>"d"'e'"#),
+            "a&amp;b&lt;c&gt;&quot;d&quot;&apos;e&apos;"
+        );
     }
 
     #[test]
@@ -374,7 +406,9 @@ mod tests {
         assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
         assert!(xml.contains("<RestartOnFailure>"));
-        assert!(xml.contains(r"<Command>C:\Program Files\Okra Brown Search\okra-index-helper.exe</Command>"));
+        assert!(xml.contains(
+            r"<Command>C:\Program Files\Okra Brown Search\okra-index-helper.exe</Command>"
+        ));
         // Markup characters are escaped in the XML text...
         assert!(xml.contains("Jane &amp; Co"));
         assert!(!xml.contains("Jane & Co"));
@@ -407,7 +441,10 @@ mod tests {
     fn xml_file_is_utf16_le_with_bom() {
         let bytes = to_utf16le_with_bom("<a>é</a>");
         assert_eq!(&bytes[..2], &[0xFF, 0xFE]);
-        let units: Vec<u16> = bytes[2..].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let units: Vec<u16> = bytes[2..]
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
         assert_eq!(String::from_utf16(&units).unwrap(), "<a>é</a>");
     }
 
@@ -426,6 +463,8 @@ mod tests {
         for expected in ["--serve", "--background", "--poll-seconds", "--state"] {
             assert!(args.iter().any(|a| a == expected), "missing {expected}");
         }
-        assert!(join_arguments(&args).unwrap().starts_with("--volume C: --output "));
+        assert!(join_arguments(&args)
+            .unwrap()
+            .starts_with("--volume C: --output "));
     }
 }

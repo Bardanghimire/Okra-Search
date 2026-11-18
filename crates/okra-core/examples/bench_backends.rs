@@ -19,7 +19,16 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 const QUERIES: &[&str] = &[
-    "ca", "car", "carg", "cargo", "Cargo.toml", "ipc.rs", ".rs", "okra", "readme", "zzqxjkvw",
+    "ca",
+    "car",
+    "carg",
+    "cargo",
+    "Cargo.toml",
+    "ipc.rs",
+    ".rs",
+    "okra",
+    "readme",
+    "zzqxjkvw",
 ];
 const WARMUP: usize = 5;
 const RESULT_LIMIT: usize = 60;
@@ -29,7 +38,13 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[index]
 }
 
-fn bench(label: &str, runs: usize, pace_ms: u64, csv: &mut Vec<String>, f: &mut dyn FnMut(&str) -> Option<usize>) {
+fn bench(
+    label: &str,
+    runs: usize,
+    pace_ms: u64,
+    csv: &mut Vec<String>,
+    f: &mut dyn FnMut(&str) -> Option<usize>,
+) {
     let pause = || {
         if pace_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(pace_ms));
@@ -69,7 +84,10 @@ fn bench(label: &str, runs: usize, pace_ms: u64, csv: &mut Vec<String>, f: &mut 
             }
         }
         let Some(count) = count.filter(|_| !times.is_empty()) else {
-            println!("{q:<12} {:>8} {:>10} {:>10} {:>10} {:>10} {failed:>4}/{runs}", "n/a", "-", "-", "-", "-");
+            println!(
+                "{q:<12} {:>8} {:>10} {:>10} {:>10} {:>10} {failed:>4}/{runs}",
+                "n/a", "-", "-", "-", "-"
+            );
             continue;
         };
         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -77,14 +95,24 @@ fn bench(label: &str, runs: usize, pace_ms: u64, csv: &mut Vec<String>, f: &mut 
         let p95 = percentile(&times, 0.95);
         let max = *times.last().unwrap();
         println!("{q:<12} {count:>8} {first_ms:>10.3} {median:>10.3} {p95:>10.3} {max:>10.3} {failed:>4}/{runs}");
-        csv.push(format!("{label},{q},{count},{first_ms:.3},{median:.3},{p95:.3},{max:.3},{failed},{runs}"));
+        csv.push(format!(
+            "{label},{q},{count},{first_ms:.3},{median:.3},{p95:.3},{max:.3},{failed},{runs}"
+        ));
     }
 }
 
 fn main() {
-    let runs: usize = std::env::var("FS_RUNS").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or(100);
-    let pace_ms: u64 = std::env::var("FS_PACE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let mut csv = vec!["backend,query,results,first_ms,median_ms,p95_ms,max_ms,failed,runs".to_string()];
+    let runs: usize = std::env::var("FS_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(100);
+    let pace_ms: u64 = std::env::var("FS_PACE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let mut csv =
+        vec!["backend,query,results,first_ms,median_ms,p95_ms,max_ms,failed,runs".to_string()];
     println!("Okra file-backend benchmark: {runs} timed runs per query, {WARMUP} warm-up runs, {pace_ms} ms pause between calls, up to {RESULT_LIMIT} results");
     println!("Use a --release build; debug builds are much slower and are not comparable.");
 
@@ -112,12 +140,16 @@ fn main() {
                 sdk.search(&full, RESULT_LIMIT as u32).map(|r| r.len())
             });
         }
-        None => println!("\nSkipping Everything: Everything64.dll was not found (set FS_EVERYTHING_DLL)."),
+        None => println!(
+            "\nSkipping Everything: Everything64.dll was not found (set FS_EVERYTHING_DLL)."
+        ),
     }
 
     // 3. Built-in walker index, through the provider (includes scoring).
-    let mut cfg = Config::default();
-    cfg.file_backend = FileBackendKind::Builtin;
+    let cfg = Config {
+        file_backend: FileBackendKind::Builtin,
+        ..Config::default()
+    };
     println!("\nBuilding the walker index over {:?} ...", cfg.file_roots);
     let start = Instant::now();
     let walker = FilesProvider::new(&cfg);
@@ -131,11 +163,20 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     if walker_ready {
-        println!("walker index answered its first query after {:.0} ms", start.elapsed().as_secs_f64() * 1000.0);
+        println!(
+            "walker index answered its first query after {:.0} ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
     } else {
         println!("walker index returned nothing for \"cargo\" after 60 s; its numbers below are not meaningful");
     }
-    bench("Built-in walker (provider)", runs, pace_ms, &mut csv, &mut |q| Some(walker.query(q, 20).len()));
+    bench(
+        "Built-in walker (provider)",
+        runs,
+        pace_ms,
+        &mut csv,
+        &mut |q| Some(walker.query(q, 20).len()),
+    );
 
     if let Ok(path) = std::env::var("FS_BENCH_CSV") {
         match std::fs::write(&path, csv.join("\n") + "\n") {

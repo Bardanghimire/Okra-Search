@@ -40,7 +40,12 @@ pub enum HelperStatus {
     /// Running, but still building or resuming its index; searches fall through to the next backend.
     Starting,
     /// Serving searches from an up-to-date index.
-    Ready { entries: u32, last_sync_age_secs: u64, pid: u32, failed_syncs: u32 },
+    Ready {
+        entries: u32,
+        last_sync_age_secs: u64,
+        pid: u32,
+        failed_syncs: u32,
+    },
     /// Running, but its sync loop has not completed a pass recently; it refuses searches.
     Stale { last_sync_age_secs: u64 },
     /// Shutting down.
@@ -94,7 +99,8 @@ pub fn decode_helper_status(reply: &[u8; HELPER_STATUS_LEN], now_unix: u64) -> H
         return HelperStatus::Incompatible;
     }
     let u16_at = |at: usize| u16::from_le_bytes([reply[at], reply[at + 1]]);
-    let u32_at = |at: usize| u32::from_le_bytes([reply[at], reply[at + 1], reply[at + 2], reply[at + 3]]);
+    let u32_at =
+        |at: usize| u32::from_le_bytes([reply[at], reply[at + 1], reply[at + 2], reply[at + 3]]);
     let last_ok = u64::from_le_bytes(reply[16..24].try_into().unwrap());
     match u16_at(4) {
         0 => HelperStatus::Starting,
@@ -102,7 +108,9 @@ pub fn decode_helper_status(reply: &[u8; HELPER_STATUS_LEN], now_unix: u64) -> H
         1 => {
             let age = now_unix.saturating_sub(last_ok);
             if age > HELPER_STALE_AFTER_SECS {
-                HelperStatus::Stale { last_sync_age_secs: age }
+                HelperStatus::Stale {
+                    last_sync_age_secs: age,
+                }
             } else {
                 HelperStatus::Ready {
                     entries: u32_at(8),
@@ -252,7 +260,11 @@ fn search_ntfs_pipe(q: &str, max: usize) -> Option<Vec<(PathBuf, bool)>> {
     // An empty scoped NTFS snapshot is not proof that the complete configured search space has
     // no match (for example, another configured root may live on a different volume). Let the
     // existing walker backend try before reporting no results.
-    if results.is_empty() { None } else { Some(results) }
+    if results.is_empty() {
+        None
+    } else {
+        Some(results)
+    }
 }
 
 // ---------------------------------------------------------------- built-in fallback index
@@ -285,7 +297,10 @@ type Index = Arc<RwLock<IndexData>>;
 
 fn skip(name: &str) -> bool {
     name.starts_with('.')
-        || matches!(name, "node_modules" | "target" | "__pycache__" | "$RECYCLE.BIN" | "AppData" | "Library")
+        || matches!(
+            name,
+            "node_modules" | "target" | "__pycache__" | "$RECYCLE.BIN" | "AppData" | "Library"
+        )
 }
 
 fn build_index(roots: Vec<PathBuf>, max_depth: usize) -> Index {
@@ -332,7 +347,11 @@ impl FileBackend for Builtin {
     }
     fn search(&self, q: &str, max: usize) -> Option<Vec<(PathBuf, bool)>> {
         let query = Query::new(q);
-        let idx = self.index.get_or_init(|| build_index(self.roots.clone(), self.depth)).read().unwrap();
+        let idx = self
+            .index
+            .get_or_init(|| build_index(self.roots.clone(), self.depth))
+            .read()
+            .unwrap();
         // (score, position in index). Higher score first; equal scores keep index order.
         let mut hits: Vec<(i64, usize)> = Vec::new();
         let qm = query.mask();
@@ -356,7 +375,11 @@ impl FileBackend for Builtin {
         }
         hits.sort_by(order);
         hits.truncate(max);
-        Some(hits.into_iter().map(|(_, pos)| (idx.entries[pos].path.clone(), idx.entries[pos].is_dir)).collect())
+        Some(
+            hits.into_iter()
+                .map(|(_, pos)| (idx.entries[pos].path.clone(), idx.entries[pos].is_dir))
+                .collect(),
+        )
     }
 }
 
@@ -370,7 +393,11 @@ pub struct FilesProvider {
 
 impl FilesProvider {
     pub fn new(cfg: &Config) -> Self {
-        let builtin = || Builtin { roots: cfg.file_roots.clone(), depth: cfg.file_max_depth, index: OnceLock::new() };
+        let builtin = || Builtin {
+            roots: cfg.file_roots.clone(),
+            depth: cfg.file_max_depth,
+            index: OnceLock::new(),
+        };
         let mut backends: Vec<Box<dyn FileBackend>> = Vec::new();
         let mut notice: Option<String> = None;
         let use_everything = !matches!(cfg.file_backend, FileBackendKind::Builtin);
@@ -402,7 +429,8 @@ impl FilesProvider {
                     // Preserve the existing behavior: warm the walker fallback at startup when
                     // neither Everything transport is available, even if the optional helper may
                     // answer queries before it.
-                    b.index.get_or_init(|| build_index(b.roots.clone(), b.depth));
+                    b.index
+                        .get_or_init(|| build_index(b.roots.clone(), b.depth));
                 }
 
                 // Keep Everything first, then the optional elevated NTFS helper, then the walker.
@@ -412,12 +440,17 @@ impl FilesProvider {
             }
             FileBackendKind::Builtin => {
                 let b = builtin();
-                b.index.get_or_init(|| build_index(b.roots.clone(), b.depth)); // eager
+                b.index
+                    .get_or_init(|| build_index(b.roots.clone(), b.depth)); // eager
                 backends.push(Box::new(b));
             }
             FileBackendKind::Everything => {}
         }
-        Self { backends, active: Mutex::new("none"), notice }
+        Self {
+            backends,
+            active: Mutex::new("none"),
+            notice,
+        }
     }
 
     /// Set when the fast Everything path is not available, so the app can tell the user once.
@@ -452,12 +485,17 @@ impl Provider for FilesProvider {
             // Ask for a few times what can be shown rather than a flat 200: every extra hit is
             // fetched, scored and sorted on each keystroke.
             let want = limit.saturating_mul(3).clamp(60, 200);
-            let Some(hits) = b.search(q, want) else { continue };
+            let Some(hits) = b.search(q, want) else {
+                continue;
+            };
             *self.active.lock().unwrap() = b.name();
             let mut items: Vec<Item> = hits
                 .into_iter()
                 .map(|(path, is_dir)| {
-                    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string());
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.display().to_string());
                     // Everything also matches on path / by operators, so fall back to weaker scores.
                     let rank = score(&query, &name)
                         .or_else(|| score(&query, &path.display().to_string()).map(|s| s - 40))
@@ -466,7 +504,10 @@ impl Provider for FilesProvider {
                         + if is_dir { 5 } else { 0 };
                     Item {
                         id: format!("file:{}", path.display()),
-                        subtitle: path.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+                        subtitle: path
+                            .parent()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
                         title: name,
                         kind: if is_dir { Kind::Folder } else { Kind::File },
                         action: Action::OpenPath(path),
@@ -474,7 +515,7 @@ impl Provider for FilesProvider {
                     }
                 })
                 .collect();
-            items.sort_by(|a, b| b.score.cmp(&a.score));
+            items.sort_by_key(|a| std::cmp::Reverse(a.score));
             items.truncate(limit);
             return items;
         }
@@ -487,17 +528,22 @@ mod tests {
     use super::*;
 
     fn lcg(seed: &mut u64) -> u64 {
-        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *seed >> 33
     }
 
     fn synth(n: usize) -> Builtin {
         const WORDS: &[&str] = &[
-            "report", "invoice", "final", "draft", "thesis", "turbine", "heat", "transfer", "chapter", "notes",
-            "Visual", "Studio", "Code", "Chrome", "Firefox", "setup", "backup", "photo", "IMG", "scan", "lecture",
-            "design", "gear", "shaft", "fluent", "ansys", "model", "v2", "copy", "new",
+            "report", "invoice", "final", "draft", "thesis", "turbine", "heat", "transfer",
+            "chapter", "notes", "Visual", "Studio", "Code", "Chrome", "Firefox", "setup", "backup",
+            "photo", "IMG", "scan", "lecture", "design", "gear", "shaft", "fluent", "ansys",
+            "model", "v2", "copy", "new",
         ];
-        const EXT: &[&str] = &["pdf", "docx", "xlsx", "txt", "png", "py", "rs", "dll", "exe", "zip"];
+        const EXT: &[&str] = &[
+            "pdf", "docx", "xlsx", "txt", "png", "py", "rs", "dll", "exe", "zip",
+        ];
         let mut seed = 42u64;
         let mut entries = Vec::with_capacity(n);
         for i in 0..n {
@@ -518,7 +564,11 @@ mod tests {
                 is_dir: false,
             });
         }
-        let b = Builtin { roots: vec![], depth: 0, index: OnceLock::new() };
+        let b = Builtin {
+            roots: vec![],
+            depth: 0,
+            index: OnceLock::new(),
+        };
         let mut data = IndexData::default();
         data.extend(entries);
         let _ = b.index.set(Arc::new(RwLock::new(data)));
@@ -530,7 +580,16 @@ mod tests {
     #[ignore]
     fn bench_builtin() {
         let b = synth(300_000);
-        let queries = ["ch", "chr", "chrome", "vsc", "turb", "heat tr", "report fin", "invoice pdf"];
+        let queries = [
+            "ch",
+            "chr",
+            "chrome",
+            "vsc",
+            "turb",
+            "heat tr",
+            "report fin",
+            "invoice pdf",
+        ];
         let _ = b.search("warm", 200);
         let t = std::time::Instant::now();
         let mut total = 0usize;
@@ -546,7 +605,13 @@ mod tests {
 mod helper_status_tests {
     use super::*;
 
-    fn reply(state: u16, entries: u32, pid: u32, last_ok: u64, failures: u32) -> [u8; HELPER_STATUS_LEN] {
+    fn reply(
+        state: u16,
+        entries: u32,
+        pid: u32,
+        last_ok: u64,
+        failures: u32,
+    ) -> [u8; HELPER_STATUS_LEN] {
         let mut out = [0u8; HELPER_STATUS_LEN];
         out[..4].copy_from_slice(HELPER_STATUS_MAGIC);
         out[4..6].copy_from_slice(&state.to_le_bytes());
@@ -559,25 +624,50 @@ mod helper_status_tests {
 
     #[test]
     fn decodes_each_state() {
-        assert_eq!(decode_helper_status(&reply(0, 0, 1, 0, 0), 100), HelperStatus::Starting);
-        assert_eq!(decode_helper_status(&reply(2, 5, 1, 90, 0), 100), HelperStatus::Stopping);
+        assert_eq!(
+            decode_helper_status(&reply(0, 0, 1, 0, 0), 100),
+            HelperStatus::Starting
+        );
+        assert_eq!(
+            decode_helper_status(&reply(2, 5, 1, 90, 0), 100),
+            HelperStatus::Stopping
+        );
         assert_eq!(
             decode_helper_status(&reply(1, 70_799, 4242, 95, 3), 100),
-            HelperStatus::Ready { entries: 70_799, last_sync_age_secs: 5, pid: 4242, failed_syncs: 3 }
+            HelperStatus::Ready {
+                entries: 70_799,
+                last_sync_age_secs: 5,
+                pid: 4242,
+                failed_syncs: 3
+            }
         );
-        assert_eq!(decode_helper_status(&reply(9, 0, 1, 0, 0), 100), HelperStatus::Incompatible);
+        assert_eq!(
+            decode_helper_status(&reply(9, 0, 1, 0, 0), 100),
+            HelperStatus::Incompatible
+        );
     }
 
     #[test]
     fn staleness_is_judged_on_the_launchers_clock() {
         let r = reply(1, 10, 1, 1_000, 0);
-        assert!(matches!(decode_helper_status(&r, 1_000 + HELPER_STALE_AFTER_SECS), HelperStatus::Ready { .. }));
+        assert!(matches!(
+            decode_helper_status(&r, 1_000 + HELPER_STALE_AFTER_SECS),
+            HelperStatus::Ready { .. }
+        ));
         assert_eq!(
             decode_helper_status(&r, 1_001 + HELPER_STALE_AFTER_SECS),
-            HelperStatus::Stale { last_sync_age_secs: HELPER_STALE_AFTER_SECS + 1 }
+            HelperStatus::Stale {
+                last_sync_age_secs: HELPER_STALE_AFTER_SECS + 1
+            }
         );
         // A helper clock ahead of ours must not underflow.
-        assert!(matches!(decode_helper_status(&r, 500), HelperStatus::Ready { last_sync_age_secs: 0, .. }));
+        assert!(matches!(
+            decode_helper_status(&r, 500),
+            HelperStatus::Ready {
+                last_sync_age_secs: 0,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -585,18 +675,41 @@ mod helper_status_tests {
         let mut r = reply(1, 1, 1, 100, 0);
         r[..4].copy_from_slice(b"OKR1");
         assert_eq!(decode_helper_status(&r, 100), HelperStatus::Incompatible);
-        assert!(HelperStatus::Ready { entries: 1, last_sync_age_secs: 0, pid: 1, failed_syncs: 0 }.is_serving());
+        assert!(HelperStatus::Ready {
+            entries: 1,
+            last_sync_age_secs: 0,
+            pid: 1,
+            failed_syncs: 0
+        }
+        .is_serving());
         assert!(HelperStatus::Busy.is_serving());
-        for s in [HelperStatus::NotRunning, HelperStatus::Starting, HelperStatus::Stopping, HelperStatus::Incompatible,
-                  HelperStatus::Stale { last_sync_age_secs: 61 }] {
+        for s in [
+            HelperStatus::NotRunning,
+            HelperStatus::Starting,
+            HelperStatus::Stopping,
+            HelperStatus::Incompatible,
+            HelperStatus::Stale {
+                last_sync_age_secs: 61,
+            },
+        ] {
             assert!(!s.is_serving());
         }
     }
 
     #[test]
     fn descriptions_mention_the_key_facts() {
-        let line = HelperStatus::Ready { entries: 70_799, last_sync_age_secs: 2, pid: 7, failed_syncs: 1 }.describe();
+        let line = HelperStatus::Ready {
+            entries: 70_799,
+            last_sync_age_secs: 2,
+            pid: 7,
+            failed_syncs: 1,
+        }
+        .describe();
         assert!(line.contains("70799") && line.contains("2s ago") && line.contains("failed"));
-        assert!(HelperStatus::Stale { last_sync_age_secs: 99 }.describe().contains("stale"));
+        assert!(HelperStatus::Stale {
+            last_sync_age_secs: 99
+        }
+        .describe()
+        .contains("stale"));
     }
 }

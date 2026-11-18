@@ -13,7 +13,11 @@ fn main() {
     }
     println!("{}", files.helper_status().describe());
     let queries: Vec<String> = std::env::args().skip(1).collect();
-    for q in if queries.is_empty() { vec!["cargo".to_string()] } else { queries } {
+    for q in if queries.is_empty() {
+        vec!["cargo".to_string()]
+    } else {
+        queries
+    } {
         let start = Instant::now();
         let items = files.query(&q, 10);
         println!(
