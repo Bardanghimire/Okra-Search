@@ -1,10 +1,13 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-use eframe::egui::{self, Align2, Color32, FontId, Key, Modifiers, Pos2, RichText, Sense, Stroke, Vec2};
+use eframe::egui::{
+    self, Align2, Color32, FontId, Key, Modifiers, Pos2, RichText, Sense, Stroke, Vec2,
+};
 use okra_core::matcher::{fuzzy_with, Query};
-use okra_core::{Action, Config, Engine, FileBackendKind, FontKind, Item, Kind, Outcome, ThemeKind};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use okra_core::providers::files::{ntfs_helper_status, HelperStatus};
+use okra_core::{Action, Config, Engine, FontKind, Item, Kind, Outcome, ThemeKind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::Arc;
 
 mod icons;
@@ -61,7 +64,6 @@ struct Palette {
 struct App {
     engine: Arc<Engine>,
     config: Config,
-    initial_backend: FileBackendKind,
     initial_max_results: usize,
     initial_start_with_windows: bool,
     query: String,
@@ -85,6 +87,11 @@ struct App {
     pending: bool,
     q_tx: Sender<(u64, String)>,
     r_rx: Receiver<(u64, Vec<Row>)>,
+    /// Helper health is fetched on one dedicated worker because named-pipe reads may stall.
+    helper_status: Option<HelperStatus>,
+    helper_status_request_tx: SyncSender<()>,
+    helper_status_rx: Receiver<HelperStatus>,
+    helper_status_last_requested: Option<std::time::Instant>,
     settings_open: bool,
     show_requested: Arc<std::sync::atomic::AtomicBool>,
     /// Set by the background app scanner when a fresh application list is available.
@@ -94,7 +101,7 @@ struct App {
     #[cfg(windows)]
     foreground_hook: bool,
     start_hidden: bool,
-    /// Startup heads-ups (no Everything, hotkey taken...), shown in the bar for the first few opens.
+    /// Startup heads-ups (indexing diagnostics, hotkey taken...), shown in the bar for the first few opens.
     notice: String,
     notice_shows_left: u8,
     resident_initialized: bool,
@@ -114,7 +121,10 @@ struct ResidentControls {
 
 #[cfg(windows)]
 impl ResidentControls {
-    fn new(ctx: &egui::Context, show_requested: Arc<std::sync::atomic::AtomicBool>) -> (Self, String) {
+    fn new(
+        ctx: &egui::Context,
+        show_requested: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (Self, String) {
         use global_hotkey::{
             hotkey::{Code, HotKey, Modifiers},
             GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
@@ -133,22 +143,26 @@ impl ResidentControls {
                     Ok(()) => {
                         let context = ctx.clone();
                         let flag = show_requested.clone();
-                        GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
-                            if event.id == hotkey_id && event.state == HotKeyState::Pressed {
-                                if LAUNCHER_OPEN.load(Ordering::SeqCst) {
-                                    // Already open: the shortcut closes it again, like a toggle.
-                                    HIDE_REQUESTED.store(true, Ordering::SeqCst);
-                                    context.request_repaint();
-                                } else {
-                                    LAUNCHER_OPEN.store(true, Ordering::SeqCst);
-                                    flag.store(true, Ordering::SeqCst);
-                                    bring_to_front(true);
-                                    context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                                    context.send_viewport_cmd(egui::ViewportCommand::Focus);
-                                    context.request_repaint();
+                        GlobalHotKeyEvent::set_event_handler(Some(
+                            move |event: GlobalHotKeyEvent| {
+                                if event.id == hotkey_id && event.state == HotKeyState::Pressed {
+                                    if LAUNCHER_OPEN.load(Ordering::SeqCst) {
+                                        // Already open: the shortcut closes it again, like a toggle.
+                                        HIDE_REQUESTED.store(true, Ordering::SeqCst);
+                                        context.request_repaint();
+                                    } else {
+                                        LAUNCHER_OPEN.store(true, Ordering::SeqCst);
+                                        flag.store(true, Ordering::SeqCst);
+                                        bring_to_front(true);
+                                        context.send_viewport_cmd(egui::ViewportCommand::Visible(
+                                            true,
+                                        ));
+                                        context.send_viewport_cmd(egui::ViewportCommand::Focus);
+                                        context.request_repaint();
+                                    }
                                 }
-                            }
-                        }));
+                            },
+                        ));
                         Some(manager)
                     }
                     Err(error) => {
@@ -172,7 +186,8 @@ impl ResidentControls {
                 .map_err(|e| e.to_string())?
                 .into_rgba8();
             let (width, height) = image.dimensions();
-            let icon = Icon::from_rgba(image.into_raw(), width, height).map_err(|e| e.to_string())?;
+            let icon =
+                Icon::from_rgba(image.into_raw(), width, height).map_err(|e| e.to_string())?;
 
             let menu = Menu::new();
             let show_item = MenuItem::new("Show Okra Brown Search", true, None);
@@ -191,7 +206,7 @@ impl ResidentControls {
                 } else if event.id == show_id {
                     flag_for_menu.store(true, std::sync::atomic::Ordering::SeqCst);
                     bring_to_front(true);
-context_for_menu.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    context_for_menu.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     context_for_menu.send_viewport_cmd(egui::ViewportCommand::Focus);
                     context_for_menu.request_repaint();
                 }
@@ -200,15 +215,18 @@ context_for_menu.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             let context_for_tray = ctx.clone();
             let flag_for_tray = show_requested.clone();
             TrayIconEvent::set_event_handler(Some(move |event| {
-                let should_show = match event {
-                    TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. }
-                    | TrayIconEvent::DoubleClick { .. } => true,
-                    _ => false,
-                };
+                let should_show = matches!(
+                    event,
+                    TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } | TrayIconEvent::DoubleClick { .. }
+                );
                 if should_show {
                     flag_for_tray.store(true, std::sync::atomic::Ordering::SeqCst);
                     bring_to_front(true);
-context_for_tray.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    context_for_tray.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     context_for_tray.send_viewport_cmd(egui::ViewportCommand::Focus);
                     context_for_tray.request_repaint();
                 }
@@ -230,12 +248,23 @@ context_for_tray.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             }
         };
         let status = messages.join(" · ");
-        (Self { _hotkey_manager: hotkey_manager, _tray_icon: tray_icon }, status)
+        (
+            Self {
+                _hotkey_manager: hotkey_manager,
+                _tray_icon: tray_icon,
+            },
+            status,
+        )
     }
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, engine: Arc<Engine>, config: Config, start_hidden: bool) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        engine: Arc<Engine>,
+        config: Config,
+        start_hidden: bool,
+    ) -> Self {
         load_fonts(&cc.egui_ctx, config.font);
         apply_theme(&cc.egui_ctx, config.theme);
 
@@ -271,7 +300,26 @@ impl App {
                     let _ = r_tx.send((generation, build_rows(items, &query)));
                     ctx.request_repaint();
                 };
-                eng.search_progressive(&query, &mut emit, &|| newest.load(Ordering::Relaxed) != generation);
+                eng.search_progressive(&query, &mut emit, &|| {
+                    newest.load(Ordering::Relaxed) != generation
+                });
+            }
+        });
+
+        // The status pipe is diagnostic only and can block if a helper client stalls. Keep all
+        // named-pipe I/O off the UI thread and use a one-slot queue so refresh requests coalesce.
+        let (helper_status_request_tx, helper_status_request_rx) =
+            std::sync::mpsc::sync_channel::<()>(1);
+        let (helper_status_tx, helper_status_rx) = channel::<HelperStatus>();
+        let helper_status_ctx = cc.egui_ctx.clone();
+        std::thread::spawn(move || {
+            while helper_status_request_rx.recv().is_ok() {
+                while helper_status_request_rx.try_recv().is_ok() {}
+                let status = ntfs_helper_status();
+                if helper_status_tx.send(status).is_err() {
+                    break;
+                }
+                helper_status_ctx.request_repaint();
             }
         });
 
@@ -290,7 +338,6 @@ impl App {
 
         Self {
             engine,
-            initial_backend: config.file_backend,
             initial_max_results: config.max_results,
             initial_start_with_windows: config.start_with_windows,
             config,
@@ -309,6 +356,10 @@ impl App {
             pending: false,
             q_tx,
             r_rx,
+            helper_status: None,
+            helper_status_request_tx,
+            helper_status_rx,
+            helper_status_last_requested: None,
             settings_open: false,
             show_requested,
             index_refreshed,
@@ -338,7 +389,8 @@ impl App {
 
     /// Show a new result list and start fetching the icons it needs (rows on screen first).
     fn set_rows(&mut self, rows: Vec<Row>) {
-        self.icons.request(rows.iter().filter_map(|row| row.icon.as_ref()));
+        self.icons
+            .request(rows.iter().filter_map(|row| row.icon.as_ref()));
         self.rows = rows;
     }
 
@@ -372,7 +424,8 @@ impl App {
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        self.focus_retry_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(1000));
+        self.focus_retry_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(1000));
         ctx.request_repaint();
     }
 
@@ -393,7 +446,9 @@ impl App {
     }
 
     fn activate(&mut self, ctx: &egui::Context, idx: usize) {
-        let Some(item) = self.rows.get(idx).map(|row| row.item.clone()) else { return };
+        let Some(item) = self.rows.get(idx).map(|row| row.item.clone()) else {
+            return;
+        };
         match self.engine.activate_for(&item, &self.query) {
             Ok(Outcome::CopyText(text)) => {
                 ctx.output_mut(|output| output.copied_text = text);
@@ -402,6 +457,16 @@ impl App {
             Ok(Outcome::Done) => self.hide(ctx),
             Err(error) => self.status = error,
         }
+    }
+
+    fn request_helper_status(&mut self) {
+        match self.helper_status_request_tx.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => {}
+            Err(TrySendError::Disconnected(())) => {
+                self.helper_status = Some(HelperStatus::NotRunning);
+            }
+        }
+        self.helper_status_last_requested = Some(std::time::Instant::now());
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
@@ -414,7 +479,22 @@ impl App {
             };
 
             ui.add_space(2.0);
-            ui.label(RichText::new("Settings").size(22.0).strong().color(pal.text));
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let title_response = ui.add(
+                    egui::Label::new(
+                        RichText::new("Settings").size(22.0).strong().color(pal.text),
+                    )
+                    .sense(Sense::drag()),
+                );
+                let (_, blank_response) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), title_response.rect.height()),
+                    Sense::drag(),
+                );
+                if title_response.drag_started() || blank_response.drag_started() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+            });
 
             section(ui, "Appearance");
             let mut theme_changed = false;
@@ -441,14 +521,38 @@ impl App {
             }
 
             section(ui, "File search");
-            egui::ComboBox::from_id_source("okra-file-backend")
-                .selected_text(self.config.file_backend.label())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.config.file_backend, FileBackendKind::Auto, "Automatic (recommended)");
-                    ui.selectable_value(&mut self.config.file_backend, FileBackendKind::Everything, "Everything only");
-                    ui.selectable_value(&mut self.config.file_backend, FileBackendKind::Builtin, "Built-in index only");
-                });
-            ui.label(RichText::new("Automatic uses the Everything SDK, then es.exe, then the local index.").size(12.0).color(pal.muted));
+            ui.label(RichText::new("Okra Native Search").size(13.0).strong().color(pal.text));
+            ui.label(
+                RichText::new("Okra searches its own NTFS index, with a built-in filesystem index as a fallback. No external search application is used.")
+                    .size(12.0)
+                    .color(pal.muted),
+            );
+
+            section(ui, "Okra index health");
+            let helper_description = self
+                .helper_status
+                .map(|status| status.describe())
+                .unwrap_or_else(|| "Checking helper status…".to_string());
+            let helper_color = match self.helper_status {
+                Some(HelperStatus::Ready { .. } | HelperStatus::Busy) => {
+                    Color32::from_rgb(48, 155, 92)
+                }
+                Some(HelperStatus::Stale { .. } | HelperStatus::Incompatible) => {
+                    Color32::from_rgb(205, 135, 35)
+                }
+                _ => pal.muted,
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(helper_description).size(12.5).color(helper_color));
+                if ui.small_button("Refresh").clicked() {
+                    self.request_helper_status();
+                }
+            });
+            ui.label(
+                RichText::new("The Okra NTFS index updates in the background. Status checks never request elevation or start the helper.")
+                    .size(12.0)
+                    .color(pal.muted),
+            );
 
             section(ui, "Results");
             ui.add(egui::Slider::new(&mut self.config.max_results, 10..=80).text("Maximum results"));
@@ -461,7 +565,7 @@ impl App {
             ui.label(RichText::new("The app stays in the notification area until you choose Exit.").size(12.0).color(pal.muted));
 
             ui.add_space(16.0);
-            let restart_needed = self.config.file_backend != self.initial_backend || self.config.max_results != self.initial_max_results;
+            let restart_needed = self.config.max_results != self.initial_max_results;
             ui.horizontal(|ui| {
                 if ui.add(egui::Button::new(RichText::new("Save").strong().color(Color32::WHITE)).fill(ACCENT).rounding(6.0_f32)).clicked() {
                     self.save_settings();
@@ -474,7 +578,7 @@ impl App {
             });
             if restart_needed {
                 ui.add_space(4.0);
-                ui.label(RichText::new("File backend and result-count changes apply the next time the app starts.").size(12.0).color(pal.muted));
+                ui.label(RichText::new("Result-count changes apply the next time the app starts.").size(12.0).color(pal.muted));
             }
         });
     }
@@ -516,26 +620,38 @@ impl App {
             self.preview_extra = build_extra(&self.engine, item);
         }
         if let (Kind::File | Kind::Folder, Action::OpenPath(path)) = (item.kind, &item.action) {
-            self.previews.request(&item.id, path, item.kind == Kind::Folder);
+            self.previews
+                .request(&item.id, path, item.kind == Kind::Folder);
         }
     }
 
     fn draw_preview(&self, ui: &mut egui::Ui, pal: Palette) {
-        let Some(row) = self.rows.get(self.selected) else { return };
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
         let item = &row.item;
         let is_file = matches!(item.kind, Kind::File | Kind::Folder);
-        let loaded = if is_file { self.previews.get(&item.id) } else { None };
+        let loaded = if is_file {
+            self.previews.get(&item.id)
+        } else {
+            None
+        };
         // Until the worker answers, a file shows the same rows with "..." for the values, so the
         // pane keeps its shape instead of jumping when the details arrive.
         let is_dir = item.kind == Kind::Folder;
         let pending_label = match &item.action {
-            Action::OpenPath(path) if is_file && loaded.is_none() => Some(preview::kind_label_for(path, is_dir)),
+            Action::OpenPath(path) if is_file && loaded.is_none() => {
+                Some(preview::kind_label_for(path, is_dir))
+            }
             _ => None,
         };
         let pending: Vec<(String, String)> = if is_file && loaded.is_none() {
             let dots = "\u{2026}".to_string();
             vec![
-                ((if is_dir { "Contains" } else { "Size" }).to_string(), dots.clone()),
+                (
+                    (if is_dir { "Contains" } else { "Size" }).to_string(),
+                    dots.clone(),
+                ),
                 ("Modified".to_string(), dots.clone()),
                 ("Created".to_string(), dots),
                 ("Where".to_string(), shorten(&item.subtitle, 52)),
@@ -549,9 +665,15 @@ impl App {
         };
         let view = preview::View {
             title: &item.title,
-            kind_label: loaded.map(|found| found.kind_label.as_str()).or(pending_label.as_deref()).unwrap_or_else(|| item.kind.label()),
+            kind_label: loaded
+                .map(|found| found.kind_label.as_str())
+                .or(pending_label.as_deref())
+                .unwrap_or_else(|| item.kind.label()),
             large: item.kind == Kind::Calculation,
-            icon: row.icon.as_ref().and_then(|(key, _)| self.icons.texture(key)),
+            icon: row
+                .icon
+                .as_ref()
+                .and_then(|(key, _)| self.icons.texture(key)),
             thumb: loaded.and_then(|found| found.thumb.as_ref()),
             tile: tile_color(item),
             rows,
@@ -568,7 +690,11 @@ impl App {
         }
         let status = if self.status.is_empty() { 0.0 } else { 22.0 };
         if self.rows.is_empty() {
-            return if self.query.trim().is_empty() || self.pending { BAR_HEIGHT + status } else { BAR_HEIGHT + 64.0 + status };
+            return if self.query.trim().is_empty() || self.pending {
+                BAR_HEIGHT + status
+            } else {
+                BAR_HEIGHT + 64.0 + status
+            };
         }
         let mut total = 0.0;
         let mut prev: Option<Kind> = None;
@@ -579,22 +705,24 @@ impl App {
             }
             prev = Some(row.item.kind);
         }
-        BAR_HEIGHT + 24.0 + status + total.min(MAX_LIST_HEIGHT).max(PREVIEW_MIN_HEIGHT)
+        BAR_HEIGHT + 24.0 + status + total.clamp(PREVIEW_MIN_HEIGHT, MAX_LIST_HEIGHT)
     }
 }
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Test switch: `OKRA_OPAQUE=1` fills the window with the panel colour instead of clearing
-        // it to transparent (some Windows setups flicker when a transparent window redraws).
-        if opaque_mode() {
-            return palette(self.config.theme).bg.to_normalized_gamma_f32();
-        }
         // Transparent window; the panel paints its own rounded background.
         egui::Rgba::TRANSPARENT.to_array()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        {
+            static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+            if frame % 20 == 0 {
+                debug_log(&format!("frame {frame}"));
+            }
+        }
         // Register native controls on the first UI frame, after eframe has entered
         // the Win32 event loop required by the global-hotkey backend.
         if !self.resident_initialized {
@@ -605,12 +733,19 @@ impl eframe::App for App {
                     && status.contains("System tray unavailable");
                 self._resident = Some(resident);
                 if !status.is_empty() {
-                    self.notice = if self.notice.is_empty() { status } else { format!("{} · {}", self.notice, status) };
+                    self.notice = if self.notice.is_empty() {
+                        status
+                    } else {
+                        format!("{} · {}", self.notice, status)
+                    };
                 }
                 self.notice_shows_left = if self.notice.is_empty() { 0 } else { 5 };
                 self.status = self.notice.clone();
                 self.foreground_hook = foreground::install(ctx);
-                debug_log(&format!("foreground hook installed: {}", self.foreground_hook));
+                debug_log(&format!(
+                    "foreground hook installed: {}",
+                    self.foreground_hook
+                ));
                 if self.start_hidden && !controls_failed {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 } else {
@@ -620,7 +755,8 @@ impl eframe::App for App {
                     LAUNCHER_OPEN.store(true, Ordering::SeqCst);
                     bring_to_front(true);
                     foreground::watch(true);
-                    self.focus_retry_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(1000));
+                    self.focus_retry_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(1000));
                     ctx.request_repaint();
                 }
             }
@@ -634,6 +770,20 @@ impl eframe::App for App {
 
         self.icons.poll();
         self.previews.poll();
+
+        while let Ok(status) = self.helper_status_rx.try_recv() {
+            self.helper_status = Some(status);
+        }
+        if self.settings_open {
+            let refresh_due = self.helper_status_last_requested.map_or(true, |last| {
+                last.elapsed() >= std::time::Duration::from_secs(5)
+            });
+            if refresh_due {
+                self.request_helper_status();
+            }
+            // Repaint only while Settings is open; the worker also wakes the UI on replies.
+            ctx.request_repaint_after(std::time::Duration::from_secs(5));
+        }
         while let Ok((generation, rows)) = self.r_rx.try_recv() {
             if generation >= self.shown {
                 // A later batch for the same query (the file results joining the instant ones)
@@ -641,7 +791,11 @@ impl eframe::App for App {
                 let new_query = generation > self.shown;
                 self.shown = generation;
                 self.set_rows(rows);
-                self.selected = if new_query { 0 } else { self.selected.min(self.rows.len().saturating_sub(1)) };
+                self.selected = if new_query {
+                    0
+                } else {
+                    self.selected.min(self.rows.len().saturating_sub(1))
+                };
                 if generation == self.gen {
                     self.pending = false;
                 }
@@ -651,10 +805,16 @@ impl eframe::App for App {
         if HIDE_REQUESTED.swap(false, Ordering::SeqCst) && LAUNCHER_OPEN.load(Ordering::SeqCst) {
             self.hide(ctx);
         }
-        if self.show_requested.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .show_requested
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
             self.show(ctx);
         }
-        if self.index_refreshed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .index_refreshed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
             self.search_again();
         }
 
@@ -755,13 +915,15 @@ impl eframe::App for App {
         self.refresh_preview();
         let pal = palette(self.config.theme);
         let height = self.desired_height();
-        // Windows ignores the window's transparency here (the unused part showed up black), so
-        // instead the window is cut to the panel's rounded shape. Same fixed window size, no
-        // resizing, and clicks in the cut-away part fall through to whatever is underneath.
+        // wgpu gives the window real transparency, so nothing needs cutting. Only the old OpenGL
+        // renderer (OKRA_GLOW=1) lacks it, so there the window is cut to the panel's rounded shape.
         #[cfg(windows)]
         if (height - self.region_height).abs() > 0.5 {
             self.region_height = height;
-            set_window_region(height);
+            debug_log(&format!("window region -> height {height}"));
+            if glow_renderer() {
+                set_window_region(height);
+            }
         }
         let mut panel_rect: Option<egui::Rect> = None;
 
@@ -772,9 +934,13 @@ impl eframe::App for App {
                 // inside it. The window itself stays one fixed size, so nothing ever resizes.
                 let full = ui.max_rect();
                 let panel = egui::Rect::from_min_size(full.min, Vec2::new(full.width(), height));
-                ui.painter().rect(panel, 14.0_f32, pal.bg, Stroke::new(1.0_f32, pal.border));
+                ui.painter()
+                    .rect(panel, 14.0_f32, pal.bg, Stroke::new(1.0_f32, pal.border));
                 panel_rect = Some(panel);
-                let mut content = ui.child_ui(panel.shrink2(Vec2::new(16.0, 10.0)), egui::Layout::top_down(egui::Align::LEFT));
+                let mut content = ui.child_ui(
+                    panel.shrink2(Vec2::new(16.0, 10.0)),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                );
                 let ui = &mut content;
                 if self.settings_open {
                     self.settings_ui(ui);
@@ -784,7 +950,8 @@ impl eframe::App for App {
                 // Search row: magnifier (also the drag handle), borderless field, settings gear.
                 ui.horizontal(|ui| {
                     ui.set_min_height(46.0);
-                    let (icon_rect, icon_response) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::drag());
+                    let (icon_rect, icon_response) =
+                        ui.allocate_exact_size(Vec2::splat(28.0), Sense::drag());
                     if icon_response.drag_started() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
@@ -806,17 +973,27 @@ impl eframe::App for App {
                     }
 
                     if ui
-                        .add(egui::Button::new(RichText::new("\u{2699}").size(18.0).color(pal.muted)).frame(false))
+                        .add(
+                            egui::Button::new(
+                                RichText::new("\u{2699}").size(18.0).color(pal.muted),
+                            )
+                            .frame(false),
+                        )
                         .on_hover_text("Settings")
                         .clicked()
                     {
                         self.settings_open = true;
+                        self.request_helper_status();
+                        ctx.request_repaint();
                     }
                 });
 
                 if !self.status.is_empty() {
                     // One line only: the panel height assumes it, so a long message is cut, not wrapped.
-                    ui.add(egui::Label::new(RichText::new(&self.status).size(12.0).color(pal.muted)).truncate(true));
+                    ui.add(
+                        egui::Label::new(RichText::new(&self.status).size(12.0).color(pal.muted))
+                            .truncate(true),
+                    );
                 }
                 // "No Results" only once the search has actually answered, never in between keystrokes.
                 let searching = !self.query.trim().is_empty() && !self.pending;
@@ -834,111 +1011,162 @@ impl eframe::App for App {
                     let mut clicked = None;
                     // Left: the result list. Right: the preview of the selected result.
                     let area = ui.available_rect_before_wrap();
-                    let list_rect = egui::Rect::from_min_size(area.min, Vec2::new(LIST_WIDTH, area.height()));
-                    let preview_rect = egui::Rect::from_min_max(Pos2::new(list_rect.right() + 16.0, area.top()), area.max);
-                    ui.painter().vline(list_rect.right() + 8.0, area.y_range(), Stroke::new(1.0_f32, pal.sep));
-                    let mut list_ui = ui.child_ui_with_id_source(list_rect, egui::Layout::top_down(egui::Align::LEFT), "okra-list");
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(&mut list_ui, |ui| {
-                        let mut prev: Option<Kind> = None;
-                        for (index, row) in self.rows.iter().enumerate() {
-                            let item = &row.item;
-                            let heading = if index == 0 {
-                                Some("Top Hit")
-                            } else if prev != Some(item.kind) {
-                                Some(kind_heading(item.kind))
-                            } else {
-                                None
-                            };
-                            prev = Some(item.kind);
-                            if let Some(heading) = heading {
-                                ui.add_space(if index == 0 { 2.0 } else { 8.0 });
-                                ui.label(RichText::new(heading).size(12.0).strong().color(pal.muted));
-                                ui.add_space(2.0);
-                            }
-
-                            let (rect, response) =
-                                ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::click());
-                            let is_selected = index == selected;
-                            if is_selected {
-                                ui.painter().rect_filled(rect, 8.0_f32, ACCENT);
-                            } else if response.hovered() || ui.rect_contains_pointer(rect.expand2(Vec2::new(0.0, 1.0))) {
-                                // Also lit in the 2 px gap between rows, so the highlight never blinks off.
-                                ui.painter().rect_filled(rect, 8.0_f32, pal.hover);
-                            }
-                            let (title_color, sub_color) = if is_selected {
-                                (Color32::WHITE, Color32::from_rgba_unmultiplied(255, 255, 255, 190))
-                            } else {
-                                (pal.text, pal.muted)
-                            };
-
-                            let tile = egui::Rect::from_min_size(
-                                Pos2::new(rect.left() + 8.0, rect.center().y - 17.0),
-                                Vec2::splat(34.0),
-                            );
-                            match row.icon.as_ref().and_then(|(key, _)| self.icons.texture(key)) {
-                                Some(texture) => {
-                                    ui.painter().image(
-                                        texture.id(),
-                                        tile,
-                                        egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                        Color32::WHITE,
+                    let list_rect =
+                        egui::Rect::from_min_size(area.min, Vec2::new(LIST_WIDTH, area.height()));
+                    let preview_rect = egui::Rect::from_min_max(
+                        Pos2::new(list_rect.right() + 16.0, area.top()),
+                        area.max,
+                    );
+                    ui.painter().vline(
+                        list_rect.right() + 8.0,
+                        area.y_range(),
+                        Stroke::new(1.0_f32, pal.sep),
+                    );
+                    let mut list_ui = ui.child_ui_with_id_source(
+                        list_rect,
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        "okra-list",
+                    );
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(&mut list_ui, |ui| {
+                            let mut prev: Option<Kind> = None;
+                            for (index, row) in self.rows.iter().enumerate() {
+                                let item = &row.item;
+                                let heading = if index == 0 {
+                                    Some("Top Hit")
+                                } else if prev != Some(item.kind) {
+                                    Some(kind_heading(item.kind))
+                                } else {
+                                    None
+                                };
+                                prev = Some(item.kind);
+                                if let Some(heading) = heading {
+                                    ui.add_space(if index == 0 { 2.0 } else { 8.0 });
+                                    ui.label(
+                                        RichText::new(heading).size(12.0).strong().color(pal.muted),
                                     );
+                                    ui.add_space(2.0);
                                 }
-                                None => {
-                                    // Until the real icon arrives (or for items that have none).
-                                    ui.painter().rect_filled(tile, 8.0_f32, tile_color(item));
-                                    let letter = item.title.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
-                                    ui.painter().text(
-                                        tile.center(),
-                                        Align2::CENTER_CENTER,
-                                        letter,
-                                        FontId::proportional(17.0),
-                                        Color32::WHITE,
-                                    );
-                                }
-                            }
 
-                            let text_x = tile.right() + 12.0;
-                            let text_painter = ui.painter().with_clip_rect(rect.shrink2(Vec2::new(4.0, 0.0)));
-                            // Leave room on the right of the first nine rows for their Ctrl+N hint.
-                            let hint_room = if index < 9 { 44.0 } else { 0.0 };
-                            let title_rect = egui::Rect::from_min_max(
-                                Pos2::new(text_x, rect.center().y - 18.0),
-                                Pos2::new(rect.right() - 12.0 - hint_room, rect.center().y + 2.0),
-                            );
-                            let mut title_ui = ui.child_ui(title_rect, egui::Layout::left_to_right(egui::Align::Center));
-                            title_ui.add(
-                                egui::Label::new(title_job(row, title_color, is_selected, item.kind == Kind::Calculation))
+                                let (rect, response) = ui.allocate_exact_size(
+                                    Vec2::new(ui.available_width(), ROW_HEIGHT),
+                                    Sense::click(),
+                                );
+                                let is_selected = index == selected;
+                                if is_selected {
+                                    ui.painter().rect_filled(rect, 8.0_f32, ACCENT);
+                                } else if response.hovered()
+                                    || ui.rect_contains_pointer(rect.expand2(Vec2::new(0.0, 1.0)))
+                                {
+                                    // Also lit in the 2 px gap between rows, so the highlight never blinks off.
+                                    ui.painter().rect_filled(rect, 8.0_f32, pal.hover);
+                                }
+                                let (title_color, sub_color) = if is_selected {
+                                    (
+                                        Color32::WHITE,
+                                        Color32::from_rgba_unmultiplied(255, 255, 255, 190),
+                                    )
+                                } else {
+                                    (pal.text, pal.muted)
+                                };
+
+                                let tile = egui::Rect::from_min_size(
+                                    Pos2::new(rect.left() + 8.0, rect.center().y - 17.0),
+                                    Vec2::splat(34.0),
+                                );
+                                match row
+                                    .icon
+                                    .as_ref()
+                                    .and_then(|(key, _)| self.icons.texture(key))
+                                {
+                                    Some(texture) => {
+                                        ui.painter().image(
+                                            texture.id(),
+                                            tile,
+                                            egui::Rect::from_min_max(
+                                                Pos2::ZERO,
+                                                Pos2::new(1.0, 1.0),
+                                            ),
+                                            Color32::WHITE,
+                                        );
+                                    }
+                                    None => {
+                                        // Until the real icon arrives (or for items that have none).
+                                        ui.painter().rect_filled(tile, 8.0_f32, tile_color(item));
+                                        let letter = item
+                                            .title
+                                            .chars()
+                                            .next()
+                                            .map(|c| c.to_uppercase().to_string())
+                                            .unwrap_or_default();
+                                        ui.painter().text(
+                                            tile.center(),
+                                            Align2::CENTER_CENTER,
+                                            letter,
+                                            FontId::proportional(17.0),
+                                            Color32::WHITE,
+                                        );
+                                    }
+                                }
+
+                                let text_x = tile.right() + 12.0;
+                                let text_painter = ui
+                                    .painter()
+                                    .with_clip_rect(rect.shrink2(Vec2::new(4.0, 0.0)));
+                                // Leave room on the right of the first nine rows for their Ctrl+N hint.
+                                let hint_room = if index < 9 { 44.0 } else { 0.0 };
+                                let title_rect = egui::Rect::from_min_max(
+                                    Pos2::new(text_x, rect.center().y - 18.0),
+                                    Pos2::new(
+                                        rect.right() - 12.0 - hint_room,
+                                        rect.center().y + 2.0,
+                                    ),
+                                );
+                                let mut title_ui = ui.child_ui(
+                                    title_rect,
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                );
+                                title_ui.add(
+                                    egui::Label::new(title_job(
+                                        row,
+                                        title_color,
+                                        is_selected,
+                                        item.kind == Kind::Calculation,
+                                    ))
                                     .truncate(true),
-                            );
-                            text_painter.text(
-                                Pos2::new(text_x, rect.center().y + 10.0),
-                                Align2::LEFT_CENTER,
-                                &row.subtitle,
-                                FontId::proportional(12.0),
-                                sub_color,
-                            );
-
-                            if index < 9 {
+                                );
                                 text_painter.text(
-                                    Pos2::new(rect.right() - 12.0, rect.center().y - 8.0),
-                                    Align2::RIGHT_CENTER,
-                                    format!("Ctrl+{}", index + 1),
-                                    FontId::proportional(11.5),
+                                    Pos2::new(text_x, rect.center().y + 10.0),
+                                    Align2::LEFT_CENTER,
+                                    &row.subtitle,
+                                    FontId::proportional(12.0),
                                     sub_color,
                                 );
+
+                                if index < 9 {
+                                    text_painter.text(
+                                        Pos2::new(rect.right() - 12.0, rect.center().y - 8.0),
+                                        Align2::RIGHT_CENTER,
+                                        format!("Ctrl+{}", index + 1),
+                                        FontId::proportional(11.5),
+                                        sub_color,
+                                    );
+                                }
+                                if response.clicked() {
+                                    clicked = Some(index);
+                                }
+                                if moved && is_selected {
+                                    ui.scroll_to_rect(rect, None);
+                                }
+                                ui.add_space(2.0);
                             }
-                            if response.clicked() {
-                                clicked = Some(index);
-                            }
-                            if moved && is_selected {
-                                ui.scroll_to_rect(rect, None);
-                            }
-                            ui.add_space(2.0);
-                        }
-                    });
-                    let mut preview_ui =
-                        ui.child_ui_with_id_source(preview_rect, egui::Layout::top_down(egui::Align::LEFT), "okra-preview");
+                        });
+                    let mut preview_ui = ui.child_ui_with_id_source(
+                        preview_rect,
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        "okra-preview",
+                    );
                     self.draw_preview(&mut preview_ui, pal);
                     if let Some(index) = clicked {
                         activate = Some(index);
@@ -949,7 +1177,11 @@ impl eframe::App for App {
         // The window is taller than the panel; a click in the transparent part is a click outside.
         if let Some(rect) = panel_rect {
             let pressed_outside = ctx.input(|input| {
-                input.pointer.any_pressed() && input.pointer.interact_pos().map_or(false, |pos| !rect.contains(pos))
+                input.pointer.any_pressed()
+                    && input
+                        .pointer
+                        .interact_pos()
+                        .is_some_and(|pos| !rect.contains(pos))
             });
             if pressed_outside {
                 self.hide(ctx);
@@ -1029,7 +1261,9 @@ fn tile_color(item: &Item) -> Color32 {
     ];
     let (r, g, b) = match item.kind {
         Kind::App => {
-            let hash = item.title.bytes().fold(5381u32, |acc, byte| acc.wrapping_mul(33).wrapping_add(byte as u32));
+            let hash = item.title.bytes().fold(5381u32, |acc, byte| {
+                acc.wrapping_mul(33).wrapping_add(byte as u32)
+            });
             APP_COLORS[hash as usize % APP_COLORS.len()]
         }
         Kind::File => (142, 142, 147),
@@ -1056,7 +1290,11 @@ fn strip_route_prefix(query: &str) -> &str {
 /// from the ranges computed once in [`build_rows`].
 fn title_job(row: &Row, color: Color32, selected: bool, large: bool) -> egui::text::LayoutJob {
     let size = if large { 20.0 } else { 15.5 };
-    let plain = egui::TextFormat { font_id: FontId::proportional(size), color, ..Default::default() };
+    let plain = egui::TextFormat {
+        font_id: FontId::proportional(size),
+        color,
+        ..Default::default()
+    };
     let mut emphasised = plain.clone();
     if selected {
         emphasised.underline = Stroke::new(1.0_f32, color);
@@ -1065,7 +1303,15 @@ fn title_job(row: &Row, color: Color32, selected: bool, large: bool) -> egui::te
     }
     let mut job = egui::text::LayoutJob::default();
     for &(start, end, matched) in &row.title_runs {
-        job.append(&row.item.title[start..end], 0.0, if matched { emphasised.clone() } else { plain.clone() });
+        job.append(
+            &row.item.title[start..end],
+            0.0,
+            if matched {
+                emphasised.clone()
+            } else {
+                plain.clone()
+            },
+        );
     }
     job
 }
@@ -1103,12 +1349,23 @@ fn build_rows(items: Vec<Item>, query: &str) -> Vec<Row> {
             let matched = if highlight.is_empty() || item.kind == Kind::Calculation {
                 Vec::new()
             } else {
-                fuzzy_with(&highlight, &item.title).map(|m| m.indices).unwrap_or_default()
+                fuzzy_with(&highlight, &item.title)
+                    .map(|m| m.indices)
+                    .unwrap_or_default()
             };
-            let subtitle = if item.subtitle.is_empty() { item.kind.label().to_string() } else { shorten(&item.subtitle, 40) };
+            let subtitle = if item.subtitle.is_empty() {
+                item.kind.label().to_string()
+            } else {
+                shorten(&item.subtitle, 40)
+            };
             let title_runs = highlight_runs(&item.title, &matched);
             let icon = icons::icon_request(&item);
-            Row { item, subtitle, title_runs, icon }
+            Row {
+                item,
+                subtitle,
+                title_runs,
+                icon,
+            }
         })
         .collect()
 }
@@ -1118,16 +1375,31 @@ fn build_rows(items: Vec<Item>, query: &str) -> Vec<Row> {
 fn build_extra(engine: &Engine, item: &Item) -> Vec<(String, String)> {
     let mut rows: Vec<(String, String)> = Vec::new();
     match (&item.kind, &item.action) {
-        (Kind::App, Action::Launch { path, .. }) => rows.push(("Where".to_string(), shorten(&path.display().to_string(), 52))),
-        (Kind::App, Action::LaunchAppId(_)) => rows.push(("Source".to_string(), "Microsoft Store app".to_string())),
+        (Kind::App, Action::Launch { path, .. }) => rows.push((
+            "Where".to_string(),
+            shorten(&path.display().to_string(), 52),
+        )),
+        (Kind::App, Action::LaunchAppId(_)) => {
+            rows.push(("Source".to_string(), "Microsoft Store app".to_string()))
+        }
         (Kind::Setting, Action::OpenUri(uri)) => rows.push(("Opens".to_string(), uri.clone())),
         (Kind::Setting, Action::Run { program, args }) => {
-            let command = if args.is_empty() { program.clone() } else { format!("{program} {}", args.join(" ")) };
+            let command = if args.is_empty() {
+                program.clone()
+            } else {
+                format!("{program} {}", args.join(" "))
+            };
             rows.push(("Runs".to_string(), shorten(&command, 52)));
         }
         (Kind::Window, _) => rows.push(("Details".to_string(), item.subtitle.clone())),
         (Kind::Calculation, _) => {
-            let expression = item.subtitle.split('\u{b7}').next().unwrap_or("").trim().to_string();
+            let expression = item
+                .subtitle
+                .split('\u{b7}')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
             rows.push(("Expression".to_string(), expression));
             rows.push(("Press Enter".to_string(), "to copy the answer".to_string()));
         }
@@ -1135,12 +1407,23 @@ fn build_extra(engine: &Engine, item: &Item) -> Vec<(String, String)> {
     }
     if item.kind != Kind::Calculation {
         if let Some((count, last)) = engine.usage(&item.id) {
-            let times = if count == 1 { "1 time".to_string() } else { format!("{count} times") };
+            let times = if count == 1 {
+                "1 time".to_string()
+            } else {
+                format!("{count} times")
+            };
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            rows.push(("Opened".to_string(), if last > 0 { format!("{times}, last {}", ago(now.saturating_sub(last))) } else { times }));
+            rows.push((
+                "Opened".to_string(),
+                if last > 0 {
+                    format!("{times}, last {}", ago(now.saturating_sub(last)))
+                } else {
+                    times
+                },
+            ));
         }
     }
     rows
@@ -1154,7 +1437,11 @@ fn ago(seconds: u64) -> String {
         3_600..=86_399 => format!("{} h ago", seconds / 3_600),
         _ => {
             let days = seconds / 86_400;
-            if days == 1 { "1 day ago".to_string() } else { format!("{days} days ago") }
+            if days == 1 {
+                "1 day ago".to_string()
+            } else {
+                format!("{days} days ago")
+            }
         }
     }
 }
@@ -1171,7 +1458,11 @@ fn shorten(text: &str, max_chars: usize) -> String {
 
 fn paint_magnifier(ui: &egui::Ui, center: Pos2, color: Color32) {
     let painter = ui.painter();
-    painter.circle_stroke(center + Vec2::new(-2.0, -2.0), 7.5, Stroke::new(2.2_f32, color));
+    painter.circle_stroke(
+        center + Vec2::new(-2.0, -2.0),
+        7.5,
+        Stroke::new(2.2_f32, color),
+    );
     painter.line_segment(
         [center + Vec2::new(3.5, 3.5), center + Vec2::new(9.5, 9.5)],
         Stroke::new(2.4_f32, color),
@@ -1188,7 +1479,11 @@ fn debug_log(message: &str) {
     if std::env::var_os("OKRA_DEBUG").is_none() {
         return;
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(std::env::temp_dir().join("okra-debug.log")) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::temp_dir().join("okra-debug.log"))
+    {
         let _ = writeln!(file, "{:>9.3}s {message}", started.elapsed().as_secs_f64());
     }
 }
@@ -1201,7 +1496,8 @@ mod foreground {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::OnceLock;
 
-    type WinEventProc = unsafe extern "system" fn(*mut c_void, u32, *mut c_void, i32, i32, u32, u32);
+    type WinEventProc =
+        unsafe extern "system" fn(*mut c_void, u32, *mut c_void, i32, i32, u32, u32);
 
     #[link(name = "user32")]
     extern "system" {
@@ -1229,7 +1525,15 @@ mod foreground {
         WATCHING.store(on, Ordering::Relaxed);
     }
 
-    unsafe extern "system" fn on_foreground_changed(_: *mut c_void, _: u32, _: *mut c_void, _: i32, _: i32, _: u32, _: u32) {
+    unsafe extern "system" fn on_foreground_changed(
+        _: *mut c_void,
+        _: u32,
+        _: *mut c_void,
+        _: i32,
+        _: i32,
+        _: u32,
+        _: u32,
+    ) {
         if WATCHING.load(Ordering::Relaxed) {
             if let Some(ctx) = CONTEXT.get() {
                 ctx.request_repaint();
@@ -1292,7 +1596,9 @@ fn load_fonts(ctx: &egui::Context, kind: FontKind) {
             .join("Fonts");
         for (key, file) in [("segoe-ui", "segoeui.ttf"), ("nirmala-ui", "Nirmala.ttf")] {
             if let Ok(bytes) = std::fs::read(dir.join(file)) {
-                fonts.font_data.insert(key.to_owned(), egui::FontData::from_owned(bytes));
+                fonts
+                    .font_data
+                    .insert(key.to_owned(), egui::FontData::from_owned(bytes));
                 system.push(key.to_owned());
             }
         }
@@ -1327,7 +1633,10 @@ mod own_window {
 
     #[link(name = "user32")]
     extern "system" {
-        fn EnumWindows(callback: Option<unsafe extern "system" fn(*mut c_void, isize) -> i32>, data: isize) -> i32;
+        fn EnumWindows(
+            callback: Option<unsafe extern "system" fn(*mut c_void, isize) -> i32>,
+            data: isize,
+        ) -> i32;
         fn GetWindowThreadProcessId(hwnd: *mut c_void, process_id: *mut u32) -> u32;
         fn GetWindowTextW(hwnd: *mut c_void, text: *mut u16, max_count: i32) -> i32;
         fn IsWindow(hwnd: *mut c_void) -> i32;
@@ -1349,7 +1658,8 @@ mod own_window {
         }
         let mut buffer = [0u16; 64];
         let length = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
-        if length > 0 && String::from_utf16_lossy(&buffer[..length as usize]) == super::WINDOW_TITLE {
+        if length > 0 && String::from_utf16_lossy(&buffer[..length as usize]) == super::WINDOW_TITLE
+        {
             search.found = hwnd as isize;
             return 0; // stop enumerating
         }
@@ -1362,7 +1672,10 @@ mod own_window {
         if cached != 0 && unsafe { IsWindow(cached as *mut c_void) } != 0 {
             return cached as *mut c_void;
         }
-        let mut search = Search { process_id: std::process::id(), found: 0 };
+        let mut search = Search {
+            process_id: std::process::id(),
+            found: 0,
+        };
         unsafe {
             EnumWindows(Some(visit), &mut search as *mut Search as isize);
         }
@@ -1391,7 +1704,14 @@ fn set_window_region(height: f32) {
     }
     #[link(name = "gdi32")]
     extern "system" {
-        fn CreateRoundRectRgn(left: i32, top: i32, right: i32, bottom: i32, ellipse_width: i32, ellipse_height: i32) -> *mut c_void;
+        fn CreateRoundRectRgn(
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+            ellipse_width: i32,
+            ellipse_height: i32,
+        ) -> *mut c_void;
     }
 
     unsafe {
@@ -1459,7 +1779,15 @@ fn bring_to_front(reposition: bool) {
         fn MonitorFromPoint(point: Point, flags: u32) -> *mut c_void;
         fn GetMonitorInfoW(monitor: *mut c_void, info: *mut MonitorInfo) -> i32;
         fn GetWindowRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
-        fn SetWindowPos(hwnd: *mut c_void, after: *mut c_void, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
+        fn SetWindowPos(
+            hwnd: *mut c_void,
+            after: *mut c_void,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> i32;
     }
     #[link(name = "kernel32")]
     extern "system" {
@@ -1488,10 +1816,18 @@ fn bring_to_front(reposition: bool) {
             // screen the top edge is lifted just enough to keep the whole window on screen.
             let mut cursor = Point::default();
             let mut window = Rect::default();
-            let mut info = MonitorInfo { size: std::mem::size_of::<MonitorInfo>() as u32, monitor: Rect::default(), work: Rect::default(), flags: 0 };
+            let mut info = MonitorInfo {
+                size: std::mem::size_of::<MonitorInfo>() as u32,
+                monitor: Rect::default(),
+                work: Rect::default(),
+                flags: 0,
+            };
             if GetCursorPos(&mut cursor) != 0 {
                 let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
-                if !monitor.is_null() && GetMonitorInfoW(monitor, &mut info) != 0 && GetWindowRect(hwnd, &mut window) != 0 {
+                if !monitor.is_null()
+                    && GetMonitorInfoW(monitor, &mut info) != 0
+                    && GetWindowRect(hwnd, &mut window) != 0
+                {
                     let width = window.right - window.left;
                     if width > 0 {
                         let scale = width as f32 / WINDOW_WIDTH;
@@ -1501,7 +1837,15 @@ fn bring_to_front(reposition: bool) {
                         let x = work.left + ((work.right - work.left) - width) / 2;
                         let centred_y = work.top + ((work.bottom - work.top) - bar) / 2;
                         let y = centred_y.min(work.bottom - tallest).max(work.top);
-                        SetWindowPos(hwnd, std::ptr::null_mut(), x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                        SetWindowPos(
+                            hwnd,
+                            std::ptr::null_mut(),
+                            x,
+                            y,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
                     }
                 }
             }
@@ -1518,7 +1862,9 @@ fn bring_to_front(reposition: bool) {
             GetWindowThreadProcessId(foreground, std::ptr::null_mut())
         };
         let ours = GetCurrentThreadId();
-        let attached = foreground_thread != 0 && foreground_thread != ours && AttachThreadInput(ours, foreground_thread, 1) != 0;
+        let attached = foreground_thread != 0
+            && foreground_thread != ours
+            && AttachThreadInput(ours, foreground_thread, 1) != 0;
         if reposition {
             // A synthetic key event marks this process as having just received input, which is
             // what lets SetForegroundWindow succeed. Only on the first attempt: repeating it on
@@ -1549,13 +1895,19 @@ fn already_running() -> bool {
     static INSTANCE_MUTEX: OnceLock<isize> = OnceLock::new();
     #[link(name = "kernel32")]
     extern "system" {
-        fn CreateMutexW(attributes: *mut c_void, initial_owner: i32, name: *const u16) -> *mut c_void;
+        fn CreateMutexW(
+            attributes: *mut c_void,
+            initial_owner: i32,
+            name: *const u16,
+        ) -> *mut c_void;
         fn GetLastError() -> u32;
         fn SetLastError(error: u32);
         fn CloseHandle(handle: *mut c_void) -> i32;
     }
     let name: Vec<u16> = std::ffi::OsStr::new("Local\\OkraBrownSearch")
-        .encode_wide().chain(std::iter::once(0)).collect();
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     unsafe {
         SetLastError(0);
         let handle = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
@@ -1578,32 +1930,47 @@ fn set_startup_registration(enabled: bool) -> Result<(), String> {
     let mut command = std::process::Command::new("reg.exe");
     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     if enabled {
-        let executable = std::env::current_exe().map_err(|e| format!("Could not locate the app executable: {e}"))?;
+        let executable = std::env::current_exe()
+            .map_err(|e| format!("Could not locate the app executable: {e}"))?;
         let value = format!("\"{}\" --background", executable.display());
         command.args([
             "add",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-            "/v", "OkraBrownSearch", "/t", "REG_SZ", "/d", value.as_str(), "/f",
+            "/v",
+            "OkraBrownSearch",
+            "/t",
+            "REG_SZ",
+            "/d",
+            value.as_str(),
+            "/f",
         ]);
     } else {
         command.args([
             "delete",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-            "/v", "OkraBrownSearch", "/f",
+            "/v",
+            "OkraBrownSearch",
+            "/f",
         ]);
     }
-    let output = command.output().map_err(|e| format!("Could not update Windows sign-in startup: {e}"))?;
+    let output = command
+        .output()
+        .map_err(|e| format!("Could not update Windows sign-in startup: {e}"))?;
     if output.status.success() {
         Ok(())
     } else {
-        Err(format!("Windows did not accept the startup setting: {}", String::from_utf8_lossy(&output.stderr).trim()))
+        Err(format!(
+            "Windows did not accept the startup setting: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
     }
 }
 
-/// True when the launcher was started with the environment variable `OKRA_OPAQUE` set.
-fn opaque_mode() -> bool {
-    static OPAQUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OPAQUE.get_or_init(|| std::env::var_os("OKRA_OPAQUE").is_some())
+/// True when the launcher was started with `OKRA_GLOW=1`: use the old OpenGL renderer (with the
+/// rounded window cut-out) instead of wgpu.
+fn glow_renderer() -> bool {
+    static GLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GLOW.get_or_init(|| std::env::var_os("OKRA_GLOW").is_some())
 }
 
 fn main() -> eframe::Result<()> {
@@ -1618,20 +1985,35 @@ fn main() -> eframe::Result<()> {
         .with_title(WINDOW_TITLE)
         .with_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
         .with_decorations(false)
-        .with_transparent(!opaque_mode())
+        .with_transparent(true)
         .with_min_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
         .with_max_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
         .with_always_on_top()
         // Launched with --background (sign-in start): never show the window, so there is no flash.
         .with_visible(!start_hidden);
 
-    if let Ok(icon) = image::load_from_memory(include_bytes!("../../../assets/okra-brown-search.png")) {
+    if let Ok(icon) =
+        image::load_from_memory(include_bytes!("../../../assets/okra-brown-search.png"))
+    {
         let rgba = icon.to_rgba8();
         let (width, height) = rgba.dimensions();
-        viewport = viewport.with_icon(Arc::new(egui::IconData { rgba: rgba.into_raw(), width, height }));
+        viewport = viewport.with_icon(Arc::new(egui::IconData {
+            rgba: rgba.into_raw(),
+            width,
+            height,
+        }));
     }
 
-    let options = eframe::NativeOptions { viewport, centered: true, ..Default::default() };
+    let options = eframe::NativeOptions {
+        viewport,
+        centered: true,
+        renderer: if glow_renderer() {
+            eframe::Renderer::Glow
+        } else {
+            eframe::Renderer::Wgpu
+        },
+        ..Default::default()
+    };
     eframe::run_native(
         "Okra Brown Search",
         options,
@@ -1645,7 +2027,14 @@ mod tests {
     use okra_core::{Action, Kind};
 
     fn item(title: &str, kind: Kind) -> Item {
-        Item { id: title.into(), title: title.into(), subtitle: String::new(), kind, action: Action::Copy(String::new()), score: 0 }
+        Item {
+            id: title.into(),
+            title: title.into(),
+            subtitle: String::new(),
+            kind,
+            action: Action::Copy(String::new()),
+            score: 0,
+        }
     }
 
     #[test]
@@ -1654,22 +2043,54 @@ mod tests {
         let runs = highlight_runs(title, &[0, 1, 2, 3]);
         assert_eq!(runs, vec![(0, 4, true), (4, title.len(), false)]);
         // No gaps or overlaps, whatever the match pattern (incl. multi-byte characters).
-        for (title, matched) in [("Éclair café", vec![0usize, 3, 4, 10]), ("abc", vec![]), ("abc", vec![0, 1, 2]), ("", vec![])] {
+        for (title, matched) in [
+            ("Éclair café", vec![0usize, 3, 4, 10]),
+            ("abc", vec![]),
+            ("abc", vec![0, 1, 2]),
+            ("", vec![]),
+        ] {
             let runs = highlight_runs(title, &matched);
             let rebuilt: String = runs.iter().map(|&(a, b, _)| &title[a..b]).collect();
             assert_eq!(rebuilt, title);
-            let flagged: usize = runs.iter().filter(|r| r.2).map(|&(a, b, _)| title[a..b].chars().count()).sum();
+            let flagged: usize = runs
+                .iter()
+                .filter(|r| r.2)
+                .map(|&(a, b, _)| title[a..b].chars().count())
+                .sum();
             assert_eq!(flagged, matched.len());
         }
     }
 
     #[test]
     fn rows_highlight_the_query_that_produced_them() {
-        let rows = build_rows(vec![item("Workbench 2023 R1", Kind::App), item("2+2", Kind::Calculation)], "a work");
-        assert_eq!(rows[0].title_runs.iter().filter(|r| r.2).count(), 1, "prefix `a ` is not highlighted");
-        assert!(rows[0].title_runs[0].2 && rows[0].title_runs[0].1 == 4, "\"work\" highlighted");
-        assert!(rows[1].title_runs.iter().all(|r| !r.2), "calculations are never highlighted");
-        assert_eq!(rows[0].subtitle, Kind::App.label(), "empty subtitle falls back to the kind label");
-        assert!(build_rows(vec![item("Notepad", Kind::App)], "")[0].title_runs.iter().all(|r| !r.2));
+        let rows = build_rows(
+            vec![
+                item("Workbench 2023 R1", Kind::App),
+                item("2+2", Kind::Calculation),
+            ],
+            "a work",
+        );
+        assert_eq!(
+            rows[0].title_runs.iter().filter(|r| r.2).count(),
+            1,
+            "prefix `a ` is not highlighted"
+        );
+        assert!(
+            rows[0].title_runs[0].2 && rows[0].title_runs[0].1 == 4,
+            "\"work\" highlighted"
+        );
+        assert!(
+            rows[1].title_runs.iter().all(|r| !r.2),
+            "calculations are never highlighted"
+        );
+        assert_eq!(
+            rows[0].subtitle,
+            Kind::App.label(),
+            "empty subtitle falls back to the kind label"
+        );
+        assert!(build_rows(vec![item("Notepad", Kind::App)], "")[0]
+            .title_runs
+            .iter()
+            .all(|r| !r.2));
     }
 }

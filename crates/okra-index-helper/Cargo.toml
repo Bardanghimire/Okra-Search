@@ -1,0 +1,17 @@
+[package]
+name = "okra-index-helper"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "NTFS index snapshot helper for Okra Brown Search"
+build = "build.rs"
+
+[features]
+default = []
+admin-manifest = []
+
+[dependencies]
+okra-core = { path = "../okra-core" }
+
+[build-dependencies]
+winres = "0.1"

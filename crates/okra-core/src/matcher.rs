@@ -129,7 +129,12 @@ pub fn fuzzy(query: &str, text: &str) -> Option<Match> {
     fuzzy_with(&Query::new(query), text)
 }
 
-fn run(q: &[char], text: &str, lower: Option<&str>, indices_out: Option<&mut Vec<usize>>) -> Option<i64> {
+fn run(
+    q: &[char],
+    text: &str,
+    lower: Option<&str>,
+    indices_out: Option<&mut Vec<usize>>,
+) -> Option<i64> {
     let m = q.len();
     if m == 0 {
         if let Some(out) = indices_out {
@@ -213,7 +218,11 @@ fn run(q: &[char], text: &str, lower: Option<&str>, indices_out: Option<&mut Vec
                     dp[j] = bonus - (j as i64).min(10);
                 } else {
                     // Far predecessors (k <= j-7) all pay the capped gap penalty: -(6) - 1.
-                    let (mut best, mut bk) = if pm_val != NEG { (pm_val - 7, pm_idx) } else { (NEG, NO_PREV) };
+                    let (mut best, mut bk) = if pm_val != NEG {
+                        (pm_val - 7, pm_idx)
+                    } else {
+                        (NEG, NO_PREV)
+                    };
                     // Nearby predecessors k in [j-6, j-1]: gap penalty grows with distance,
                     // an adjacent predecessor earns the consecutive-match bonus.
                     let lo = (i - 1).max(j.saturating_sub(6));
@@ -222,7 +231,11 @@ fn run(q: &[char], text: &str, lower: Option<&str>, indices_out: Option<&mut Vec
                         if prev == NEG {
                             continue;
                         }
-                        let gap = if k + 1 == j { 12 } else { -((j - k - 1) as i64).min(6) - 1 };
+                        let gap = if k + 1 == j {
+                            12
+                        } else {
+                            -((j - k - 1) as i64).min(6) - 1
+                        };
                         let s = prev + gap;
                         if s > best {
                             best = s;
@@ -302,7 +315,10 @@ mod tests {
     #[test]
     fn camel_and_boundary() {
         assert!(fuzzy("vsc", "VisualStudioCode").is_some());
-        assert!(fuzzy("vsc", "visual studio code").unwrap().score > fuzzy("vsc", "advisoryscan").unwrap().score);
+        assert!(
+            fuzzy("vsc", "visual studio code").unwrap().score
+                > fuzzy("vsc", "advisoryscan").unwrap().score
+        );
     }
     #[test]
     fn no_match() {
@@ -360,12 +376,16 @@ mod tests {
                         dp[0][j] = bonus - (j as i64).min(10);
                     } else {
                         let (mut best, mut bk) = (NEG, usize::MAX);
-                        for k in (i - 1)..j {
-                            if dp[i - 1][k] == NEG {
+                        for (k, &prev) in dp[i - 1].iter().enumerate().take(j).skip(i - 1) {
+                            if prev == NEG {
                                 continue;
                             }
-                            let gap = if k + 1 == j { 12 } else { -((j - k - 1) as i64).min(6) - 1 };
-                            let s = dp[i - 1][k] + gap;
+                            let gap = if k + 1 == j {
+                                12
+                            } else {
+                                -((j - k - 1) as i64).min(6) - 1
+                            };
+                            let s = prev + gap;
                             if s > best {
                                 best = s;
                                 bk = k;
@@ -379,9 +399,9 @@ mod tests {
                 }
             }
             let (mut bj, mut bs) = (usize::MAX, NEG);
-            for j in 0..n {
-                if dp[m - 1][j] > bs {
-                    bs = dp[m - 1][j];
+            for (j, &v) in dp[m - 1].iter().enumerate() {
+                if v > bs {
+                    bs = v;
                     bj = j;
                 }
             }
@@ -408,16 +428,22 @@ mod tests {
     }
 
     fn rng(seed: &mut u64) -> u64 {
-        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *seed >> 33
     }
 
     /// Random strings over a small alphabet (lots of repeated letters, separators, camelCase
     /// and non-ASCII) so ties, gaps longer than the penalty cap and boundary bonuses all occur.
     fn random_text(seed: &mut u64, max_len: usize) -> String {
-        const ALPHA: &[char] = &['a', 'b', 'c', 'A', 'B', 'C', ' ', '_', '-', '.', '/', 'é', 'É', 'ß', '1'];
+        const ALPHA: &[char] = &[
+            'a', 'b', 'c', 'A', 'B', 'C', ' ', '_', '-', '.', '/', 'é', 'É', 'ß', '1',
+        ];
         let len = 1 + (rng(seed) as usize % max_len);
-        (0..len).map(|_| ALPHA[rng(seed) as usize % ALPHA.len()]).collect()
+        (0..len)
+            .map(|_| ALPHA[rng(seed) as usize % ALPHA.len()])
+            .collect()
     }
 
     #[test]
@@ -440,14 +466,28 @@ mod tests {
                     matched += 1;
                     assert_eq!(ws, g.score, "score differs q={query:?} t={text:?}");
                     assert_eq!(wi, g.indices, "indices differ q={query:?} t={text:?}");
-                    assert_eq!(Some(ws), fast, "score-only path differs q={query:?} t={text:?}");
+                    assert_eq!(
+                        Some(ws),
+                        fast,
+                        "score-only path differs q={query:?} t={text:?}"
+                    );
                     let lower: String = text.chars().map(lc).collect();
-                    assert_eq!(Some(ws), score_with_lower(&Query::new(&query), &text, &lower), "lower path differs q={query:?} t={text:?}");
+                    assert_eq!(
+                        Some(ws),
+                        score_with_lower(&Query::new(&query), &text, &lower),
+                        "lower path differs q={query:?} t={text:?}"
+                    );
                 }
-                (w, g) => panic!("match/no-match disagreement q={query:?} t={text:?} ref={w:?} new={:?}", g.map(|m| m.score)),
+                (w, g) => panic!(
+                    "match/no-match disagreement q={query:?} t={text:?} ref={w:?} new={:?}",
+                    g.map(|m| m.score)
+                ),
             }
         }
-        assert!(matched > 5_000, "test not exercising enough matches ({matched}/{compared})");
+        assert!(
+            matched > 5_000,
+            "test not exercising enough matches ({matched}/{compared})"
+        );
     }
 
     #[test]
@@ -460,7 +500,11 @@ mod tests {
             let lower: String = text.chars().map(lc).collect();
             if is_subsequence(q.chars(), &lower) {
                 let tm = char_mask(lower.chars());
-                assert_eq!(q.mask() & !tm, 0, "mask rejected a subsequence match q={query:?} t={text:?}");
+                assert_eq!(
+                    q.mask() & !tm,
+                    0,
+                    "mask rejected a subsequence match q={query:?} t={text:?}"
+                );
             }
         }
     }

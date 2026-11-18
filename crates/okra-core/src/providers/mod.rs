@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 pub mod apps;
 pub mod calc;
-pub mod everything;
 pub mod files;
 pub mod settings;
 pub mod windows;

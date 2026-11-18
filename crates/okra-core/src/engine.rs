@@ -24,14 +24,14 @@ pub struct Engine {
     history: Mutex<History>,
     max_results: usize,
     on_index_refresh: Arc<OnceLock<RefreshCallback>>,
-    /// Something the user should know about from the start (for example: no Everything found).
+    /// Something the user should know about from the start (for example: indexing diagnostics).
     notice: Option<String>,
 }
 
 impl Engine {
     pub fn new(cfg: &Config) -> Self {
         // Okra Brown Search is intentionally a focused, built-in Windows search tool:
-        // apps, Everything-backed files, Windows Settings, and open windows.
+        // apps, Okra-indexed files, Windows Settings, and open windows.
         //
         // Construction never blocks on slow discovery: the app list comes from an on-disk cache
         // and is refreshed on a background thread (see `set_on_index_refresh`).
@@ -61,8 +61,18 @@ impl Engine {
         self.notice.as_deref()
     }
 
-    pub fn with_providers(providers: Vec<Box<dyn Provider>>, history: History, max_results: usize) -> Self {
-        Self { providers, history: Mutex::new(history), max_results, on_index_refresh: Arc::new(OnceLock::new()), notice: None }
+    pub fn with_providers(
+        providers: Vec<Box<dyn Provider>>,
+        history: History,
+        max_results: usize,
+    ) -> Self {
+        Self {
+            providers,
+            history: Mutex::new(history),
+            max_results,
+            on_index_refresh: Arc::new(OnceLock::new()),
+            notice: None,
+        }
     }
 
     /// Register a callback fired (from a background thread) whenever the application list has been
@@ -80,7 +90,14 @@ impl Engine {
                 }
             }
         }
-        (self.providers.iter().filter(|p| p.in_default()).map(|p| p.as_ref()).collect(), raw.trim())
+        (
+            self.providers
+                .iter()
+                .filter(|p| p.in_default())
+                .map(|p| p.as_ref())
+                .collect(),
+            raw.trim(),
+        )
     }
 
     /// Applications first: someone typing "chr" wants Chrome, not `chrome_installer.log`.
@@ -106,7 +123,12 @@ impl Engine {
     /// follows with the complete list. `stale` is polled between the phases so a query the user
     /// has already typed past never pays for the file search. An empty query emits nothing:
     /// the launcher shows only its search bar until something is typed.
-    pub fn search_progressive(&self, raw: &str, emit: &mut dyn FnMut(Vec<Item>), stale: &dyn Fn() -> bool) {
+    pub fn search_progressive(
+        &self,
+        raw: &str,
+        emit: &mut dyn FnMut(Vec<Item>),
+        stale: &dyn Fn() -> bool,
+    ) {
         if raw.trim().is_empty() {
             emit(Vec::new());
             return;
@@ -114,7 +136,10 @@ impl Engine {
         let (providers, query) = self.route(raw.trim_start());
         let (slow, fast): (Vec<&dyn Provider>, Vec<&dyn Provider>) =
             providers.into_iter().partition(|p| p.name() == "Files");
-        let mut items: Vec<Item> = fast.iter().flat_map(|p| p.query(query, self.max_results)).collect();
+        let mut items: Vec<Item> = fast
+            .iter()
+            .flat_map(|p| p.query(query, self.max_results))
+            .collect();
         if slow.is_empty() {
             emit(self.rank(items, raw));
             return;
@@ -144,7 +169,10 @@ impl Engine {
         // Drop duplicate ids (first, i.e. best, wins) without cloning every id into a set.
         let keep: Vec<bool> = {
             let mut seen = HashSet::with_capacity(items.len());
-            items.iter().map(|item| seen.insert(item.id.as_str())).collect()
+            items
+                .iter()
+                .map(|item| seen.insert(item.id.as_str()))
+                .collect()
         };
         let mut keep = keep.into_iter();
         items.retain(|_| keep.next().unwrap_or(true));
@@ -231,9 +259,15 @@ mod tests {
 
     struct Fake(&'static str, Option<&'static str>, bool);
     impl Provider for Fake {
-        fn name(&self) -> &'static str { self.0 }
-        fn prefix(&self) -> Option<&'static str> { self.1 }
-        fn in_default(&self) -> bool { self.2 }
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn prefix(&self) -> Option<&'static str> {
+            self.1
+        }
+        fn in_default(&self) -> bool {
+            self.2
+        }
         fn query(&self, q: &str, _limit: usize) -> Vec<Item> {
             vec![Item {
                 id: format!("{}:{}", self.0, q),
@@ -249,7 +283,10 @@ mod tests {
     #[test]
     fn prefix_routes_exclusively() {
         let engine = Engine::with_providers(
-            vec![Box::new(Fake("a", None, true)), Box::new(Fake("f", Some("f"), false))],
+            vec![
+                Box::new(Fake("a", None, true)),
+                Box::new(Fake("f", Some("f"), false)),
+            ],
             History::in_memory(),
             10,
         );
@@ -264,12 +301,19 @@ mod tests {
     #[test]
     fn fast_results_arrive_before_slow_ones_and_stale_queries_skip_the_slow_phase() {
         let engine = Engine::with_providers(
-            vec![Box::new(Fake("a", None, true)), Box::new(Fake("Files", None, true))],
+            vec![
+                Box::new(Fake("a", None, true)),
+                Box::new(Fake("Files", None, true)),
+            ],
             History::in_memory(),
             10,
         );
         let mut batches: Vec<Vec<String>> = Vec::new();
-        engine.search_progressive("x", &mut |items| batches.push(items.into_iter().map(|i| i.id).collect()), &|| false);
+        engine.search_progressive(
+            "x",
+            &mut |items| batches.push(items.into_iter().map(|i| i.id).collect()),
+            &|| false,
+        );
         assert_eq!(batches.len(), 2, "instant results first, then everything");
         assert_eq!(batches[0], vec!["a:x".to_string()]);
         assert_eq!(batches[1].len(), 2);
@@ -287,21 +331,29 @@ mod tests {
     #[test]
     fn history_boosts_ranking() {
         let engine = Engine::with_providers(
-            vec![Box::new(Fake("a", None, true)), Box::new(Fake("b", None, true))],
+            vec![
+                Box::new(Fake("a", None, true)),
+                Box::new(Fake("b", None, true)),
+            ],
             History::in_memory(),
             10,
         );
         let items = engine.search("x");
         let second = items[1].clone();
         for _ in 0..3 {
-            assert_eq!(engine.activate(&second).unwrap(), Outcome::CopyText("x".into()));
+            assert_eq!(
+                engine.activate(&second).unwrap(),
+                Outcome::CopyText("x".into())
+            );
         }
         assert_eq!(engine.search("x")[0].id, second.id);
     }
 
     struct Many(usize);
     impl Provider for Many {
-        fn name(&self) -> &'static str { "many" }
+        fn name(&self) -> &'static str {
+            "many"
+        }
         fn query(&self, q: &str, _limit: usize) -> Vec<Item> {
             (0..self.0)
                 .map(|i| Item {

@@ -32,14 +32,27 @@ pub fn icon_request(item: &Item) -> Option<IconRequest> {
         }
         (Kind::File, Action::OpenPath(path)) => {
             let source = path.to_string_lossy().into_owned();
-            let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
             // Programs and shortcuts each have their own icon; every other file type shares one
             // icon per extension, so a list of 40 PDFs costs a single lookup.
-            let per_file = matches!(ext.as_str(), "" | "exe" | "lnk" | "ico" | "url" | "msi" | "scr" | "cpl" | "appref-ms");
-            let key = if per_file { source.clone() } else { format!("ext:.{ext}") };
+            let per_file = matches!(
+                ext.as_str(),
+                "" | "exe" | "lnk" | "ico" | "url" | "msi" | "scr" | "cpl" | "appref-ms"
+            );
+            let key = if per_file {
+                source.clone()
+            } else {
+                format!("ext:.{ext}")
+            };
             Some((key, source))
         }
-        (Kind::Folder, Action::OpenPath(path)) => Some(("folder".to_string(), path.to_string_lossy().into_owned())),
+        (Kind::Folder, Action::OpenPath(path)) => {
+            Some(("folder".to_string(), path.to_string_lossy().into_owned()))
+        }
         _ => None,
     }
 }
@@ -57,14 +70,22 @@ pub struct Icons {
 impl Icons {
     pub fn new(ctx: &egui::Context) -> Self {
         let (done_tx, done) = channel();
-        Self { textures: HashMap::new(), requested: HashSet::new(), jobs: start_worker(ctx, done_tx), done, ctx: ctx.clone() }
+        Self {
+            textures: HashMap::new(),
+            requested: HashSet::new(),
+            jobs: start_worker(ctx, done_tx),
+            done,
+            ctx: ctx.clone(),
+        }
     }
 
     /// Queue any icons not already cached or on their way. Cheap to call for every result list.
     pub fn request<'a>(&mut self, wanted: impl Iterator<Item = &'a IconRequest>) {
         let Some(jobs) = &self.jobs else { return };
         let batch: Vec<IconRequest> = wanted
-            .filter(|(key, _)| !self.textures.contains_key(key) && self.requested.insert(key.clone()))
+            .filter(|(key, _)| {
+                !self.textures.contains_key(key) && self.requested.insert(key.clone())
+            })
             .cloned()
             .collect();
         if !batch.is_empty() {
@@ -75,7 +96,10 @@ impl Icons {
     /// Turn finished icons into textures. Call once per frame.
     pub fn poll(&mut self) {
         while let Ok((key, image)) = self.done.try_recv() {
-            let texture = image.map(|image| self.ctx.load_texture(format!("icon:{key}"), image, egui::TextureOptions::LINEAR));
+            let texture = image.map(|image| {
+                self.ctx
+                    .load_texture(format!("icon:{key}"), image, egui::TextureOptions::LINEAR)
+            });
             self.textures.insert(key, texture);
         }
         if self.textures.len() > MAX_CACHED {
@@ -130,7 +154,9 @@ fn run_worker(
                 pending.push_front(request);
             }
         }
-        let Some((key, source)) = pending.pop_front() else { continue };
+        let Some((key, source)) = pending.pop_front() else {
+            continue;
+        };
         let image = extract(&source);
         if image.is_none() {
             crate::debug_log(&format!("no icon for {source}"));
@@ -156,7 +182,9 @@ fn bgra_to_image(width: usize, height: usize, bgra: &[u8]) -> Option<egui::Color
     if pixels.chunks_exact(4).all(|p| p[3] == 0) {
         return None; // entirely transparent: nothing usable
     }
-    let premultiplied = pixels.chunks_exact(4).all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3]);
+    let premultiplied = pixels
+        .chunks_exact(4)
+        .all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3]);
     let mut rgba = Vec::with_capacity(len);
     for p in pixels.chunks_exact(4) {
         let alpha = p[3] as u32;
@@ -169,7 +197,10 @@ fn bgra_to_image(width: usize, height: usize, bgra: &[u8]) -> Option<egui::Color
         };
         rgba.extend_from_slice(&[straight(p[2]), straight(p[1]), straight(p[0]), p[3]]);
     }
-    Some(egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba))
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [width, height],
+        &rgba,
+    ))
 }
 
 #[cfg(windows)]
@@ -180,11 +211,13 @@ mod win {
     use windows::core::{ComInterface, PCWSTR};
     use windows::Win32::Foundation::SIZE;
     use windows::Win32::Graphics::Gdi::{
-        DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-        HGDIOBJ,
+        DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO,
+        BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
     };
     use windows::Win32::System::Com::{CoInitializeEx, IBindCtx, COINIT_APARTMENTTHREADED};
-    use windows::Win32::UI::Shell::{IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY};
+    use windows::Win32::UI::Shell::{
+        IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY,
+    };
 
     /// Pixels requested from the shell; the rows draw it at about 34 points.
     const ICON_PX: i32 = 64;
@@ -200,15 +233,22 @@ mod win {
     pub fn extract(source: &str) -> Option<egui::ColorImage> {
         unsafe {
             let wide: Vec<u16> = source.encode_utf16().chain(std::iter::once(0)).collect();
-            let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>)
-                .map_err(|e| crate::debug_log(&format!("icon: cannot open {source}: {e}")))
-                .ok()?;
+            let item: IShellItem =
+                SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>)
+                    .map_err(|e| crate::debug_log(&format!("icon: cannot open {source}: {e}")))
+                    .ok()?;
             let factory = item
                 .cast::<IShellItemImageFactory>()
                 .map_err(|e| crate::debug_log(&format!("icon: no image factory for {source}: {e}")))
                 .ok()?;
             let bitmap = factory
-                .GetImage(SIZE { cx: ICON_PX, cy: ICON_PX }, SIIGBF_ICONONLY)
+                .GetImage(
+                    SIZE {
+                        cx: ICON_PX,
+                        cy: ICON_PX,
+                    },
+                    SIIGBF_ICONONLY,
+                )
                 .map_err(|e| crate::debug_log(&format!("icon: GetImage failed for {source}: {e}")))
                 .ok()?;
             let image = bitmap_to_image(HGDIOBJ(bitmap.0));
@@ -219,7 +259,12 @@ mod win {
 
     unsafe fn bitmap_to_image(bitmap: HGDIOBJ) -> Option<egui::ColorImage> {
         let mut info = BITMAP::default();
-        if GetObjectW(bitmap, std::mem::size_of::<BITMAP>() as i32, Some(&mut info as *mut BITMAP as *mut c_void)) == 0 {
+        if GetObjectW(
+            bitmap,
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut info as *mut BITMAP as *mut c_void),
+        ) == 0
+        {
             return None;
         }
         let (width, height) = (info.bmWidth, info.bmHeight);
@@ -265,33 +310,87 @@ mod tests {
     use std::time::Duration;
 
     fn item(kind: Kind, action: Action) -> Item {
-        Item { id: "x".into(), title: "x".into(), subtitle: String::new(), kind, action, score: 0 }
+        Item {
+            id: "x".into(),
+            title: "x".into(),
+            subtitle: String::new(),
+            kind,
+            action,
+            score: 0,
+        }
     }
 
     #[test]
     fn apps_files_and_folders_get_the_right_icon_request() {
-        let lnk = PathBuf::from(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Ansys 2023 R1\Workbench 2023 R1.lnk");
-        let (key, source) = icon_request(&item(Kind::App, Action::Launch { path: lnk.clone(), exec: None })).unwrap();
+        let lnk = PathBuf::from(
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Ansys 2023 R1\Workbench 2023 R1.lnk",
+        );
+        let (key, source) = icon_request(&item(
+            Kind::App,
+            Action::Launch {
+                path: lnk.clone(),
+                exec: None,
+            },
+        ))
+        .unwrap();
         assert_eq!(key, lnk.to_string_lossy());
         assert_eq!(source, key);
 
-        let (key, source) = icon_request(&item(Kind::App, Action::LaunchAppId("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into()))).unwrap();
-        assert_eq!(key, r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App");
+        let (key, source) = icon_request(&item(
+            Kind::App,
+            Action::LaunchAppId("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into()),
+        ))
+        .unwrap();
+        assert_eq!(
+            key,
+            r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+        );
         assert_eq!(source, key);
 
         // Documents share one icon per extension (case-insensitive) but ask with a real path...
-        let (a, a_src) = icon_request(&item(Kind::File, Action::OpenPath(PathBuf::from(r"C:\Books\One.PDF")))).unwrap();
-        let (b, _) = icon_request(&item(Kind::File, Action::OpenPath(PathBuf::from(r"D:\Elsewhere\two.pdf")))).unwrap();
-        assert_eq!((a.as_str(), a_src.as_str()), ("ext:.pdf", r"C:\Books\One.PDF"));
+        let (a, a_src) = icon_request(&item(
+            Kind::File,
+            Action::OpenPath(PathBuf::from(r"C:\Books\One.PDF")),
+        ))
+        .unwrap();
+        let (b, _) = icon_request(&item(
+            Kind::File,
+            Action::OpenPath(PathBuf::from(r"D:\Elsewhere\two.pdf")),
+        ))
+        .unwrap();
+        assert_eq!(
+            (a.as_str(), a_src.as_str()),
+            ("ext:.pdf", r"C:\Books\One.PDF")
+        );
         assert_eq!(a, b);
         // ...while programs and shortcuts each keep their own.
-        let (e1, _) = icon_request(&item(Kind::File, Action::OpenPath(PathBuf::from(r"C:\a\tool.exe")))).unwrap();
-        let (e2, _) = icon_request(&item(Kind::File, Action::OpenPath(PathBuf::from(r"C:\b\other.exe")))).unwrap();
+        let (e1, _) = icon_request(&item(
+            Kind::File,
+            Action::OpenPath(PathBuf::from(r"C:\a\tool.exe")),
+        ))
+        .unwrap();
+        let (e2, _) = icon_request(&item(
+            Kind::File,
+            Action::OpenPath(PathBuf::from(r"C:\b\other.exe")),
+        ))
+        .unwrap();
         assert_ne!(e1, e2);
-        assert_eq!(icon_request(&item(Kind::Folder, Action::OpenPath(PathBuf::from(r"C:\Users")))).unwrap().0, "folder");
+        assert_eq!(
+            icon_request(&item(
+                Kind::Folder,
+                Action::OpenPath(PathBuf::from(r"C:\Users"))
+            ))
+            .unwrap()
+            .0,
+            "folder"
+        );
 
         // Settings, windows, calculations and everything else keep the coloured tile.
-        assert!(icon_request(&item(Kind::Setting, Action::OpenUri("ms-settings:bluetooth".into()))).is_none());
+        assert!(icon_request(&item(
+            Kind::Setting,
+            Action::OpenUri("ms-settings:bluetooth".into())
+        ))
+        .is_none());
         assert!(icon_request(&item(Kind::Window, Action::FocusWindow(1))).is_none());
         assert!(icon_request(&item(Kind::Calculation, Action::Copy("4".into()))).is_none());
     }
@@ -302,7 +401,9 @@ mod tests {
     }
 
     fn close(a: [u8; 4], b: [u8; 4]) -> bool {
-        a.iter().zip(&b).all(|(x, y)| (*x as i32 - *y as i32).abs() <= 2)
+        a.iter()
+            .zip(&b)
+            .all(|(x, y)| (*x as i32 - *y as i32).abs() <= 2)
     }
 
     #[test]
@@ -336,17 +437,30 @@ mod tests {
             std::thread::sleep(Duration::from_millis(60));
             Some(egui::ColorImage::new([1, 1], egui::Color32::WHITE))
         };
-        let handle = std::thread::spawn(move || run_worker(jobs_rx, done_tx, egui::Context::default(), slow));
+        let handle = std::thread::spawn(move || {
+            run_worker(jobs_rx, done_tx, egui::Context::default(), slow)
+        });
         let req = |n: &str| (n.to_string(), n.to_string());
 
         jobs_tx.send(vec![req("a1"), req("a2"), req("a3")]).unwrap();
-        assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap().0, "a1");
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap().0,
+            "a1"
+        );
         // While a2 is being fetched, the user types again: a new result list arrives.
         jobs_tx.send(vec![req("b1"), req("b2")]).unwrap();
-        let order: Vec<String> = (0..4).map(|_| done_rx.recv_timeout(Duration::from_secs(5)).unwrap().0).collect();
+        let order: Vec<String> = (0..4)
+            .map(|_| done_rx.recv_timeout(Duration::from_secs(5)).unwrap().0)
+            .collect();
         let pos = |k: &str| order.iter().position(|o| o == k).unwrap();
-        assert!(pos("b1") < pos("b2"), "row order inside a batch is kept: {order:?}");
-        assert!(pos("b2") < pos("a3"), "newest batch jumps ahead of older leftovers: {order:?}");
+        assert!(
+            pos("b1") < pos("b2"),
+            "row order inside a batch is kept: {order:?}"
+        );
+        assert!(
+            pos("b2") < pos("a3"),
+            "newest batch jumps ahead of older leftovers: {order:?}"
+        );
         drop(jobs_tx);
         handle.join().unwrap();
     }
@@ -357,11 +471,17 @@ mod tests {
         // Install a fake job channel so the dedupe logic can be observed on any platform.
         let (tx, rx) = channel();
         icons.jobs = Some(tx);
-        let wanted = vec![("k1".to_string(), "p1".to_string()), ("k2".to_string(), "p2".to_string())];
+        let wanted = [
+            ("k1".to_string(), "p1".to_string()),
+            ("k2".to_string(), "p2".to_string()),
+        ];
         icons.request(wanted.iter());
         icons.request(wanted.iter());
         assert_eq!(rx.try_recv().unwrap().len(), 2);
-        assert!(rx.try_recv().is_err(), "second identical request must be a no-op");
+        assert!(
+            rx.try_recv().is_err(),
+            "second identical request must be a no-op"
+        );
         // A failed lookup is cached as `None` and never asked for again.
         icons.textures.insert("k3".into(), None);
         icons.request([("k3".to_string(), "p3".to_string())].iter());

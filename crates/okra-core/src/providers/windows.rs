@@ -28,7 +28,10 @@ mod native {
 
     #[link(name = "user32")]
     extern "system" {
-        fn EnumWindows(callback: Option<unsafe extern "system" fn(Hwnd, isize) -> i32>, data: isize) -> i32;
+        fn EnumWindows(
+            callback: Option<unsafe extern "system" fn(Hwnd, isize) -> i32>,
+            data: isize,
+        ) -> i32;
         fn IsWindowVisible(hwnd: Hwnd) -> i32;
         fn GetWindowTextLengthW(hwnd: Hwnd) -> i32;
         fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, max_count: i32) -> i32;
@@ -64,9 +67,15 @@ mod native {
         if copied <= 0 {
             return 1;
         }
-        let title = String::from_utf16_lossy(&buffer[..copied as usize]).trim().to_string();
+        let title = String::from_utf16_lossy(&buffer[..copied as usize])
+            .trim()
+            .to_string();
         if !title.is_empty() {
-            windows.push(WindowEntry { hwnd: hwnd as isize, title, pid });
+            windows.push(WindowEntry {
+                hwnd: hwnd as isize,
+                title,
+                pid,
+            });
         }
         1
     }
@@ -74,7 +83,10 @@ mod native {
     pub fn enumerate() -> Vec<WindowEntry> {
         let mut windows = Vec::new();
         unsafe {
-            EnumWindows(Some(collect), &mut windows as *mut Vec<WindowEntry> as isize);
+            EnumWindows(
+                Some(collect),
+                &mut windows as *mut Vec<WindowEntry> as isize,
+            );
         }
         windows
     }
@@ -99,7 +111,9 @@ mod native {
 #[cfg(not(windows))]
 mod native {
     use super::WindowEntry;
-    pub fn enumerate() -> Vec<WindowEntry> { Vec::new() }
+    pub fn enumerate() -> Vec<WindowEntry> {
+        Vec::new()
+    }
     pub fn focus(_hwnd: isize) -> Result<(), String> {
         Err("Window switching is available in the Windows build".into())
     }
@@ -138,7 +152,11 @@ impl Provider for WindowsProvider {
             .entries()
             .into_iter()
             .filter_map(|window| {
-                let rank = if query.is_empty() { 0 } else { score(&query, &window.title)? + 25 };
+                let rank = if query.is_empty() {
+                    0
+                } else {
+                    score(&query, &window.title)? + 25
+                };
                 Some(Item {
                     id: format!("window:{}", window.hwnd),
                     title: window.title,

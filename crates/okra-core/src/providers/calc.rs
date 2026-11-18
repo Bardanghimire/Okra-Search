@@ -35,7 +35,10 @@ fn looks_like_math(text: &str) -> bool {
     if !text.chars().any(|c| c.is_ascii_digit()) {
         return false;
     }
-    if !text.chars().all(|c| c.is_ascii_digit() || " +-*/^%().\u{d7}\u{f7}".contains(c)) {
+    if !text
+        .chars()
+        .all(|c| c.is_ascii_digit() || " +-*/^%().\u{d7}\u{f7}".contains(c))
+    {
         return false;
     }
     // Needs a real operator: a lone leading minus ("-5") is not a calculation.
@@ -47,7 +50,10 @@ fn looks_like_math(text: &str) -> bool {
 }
 
 fn evaluate(text: &str) -> Option<f64> {
-    let mut parser = Parser { chars: text.chars().collect(), pos: 0 };
+    let mut parser = Parser {
+        chars: text.chars().collect(),
+        pos: 0,
+    };
     let value = parser.expr()?;
     parser.skip_spaces();
     if parser.pos == parser.chars.len() {
@@ -160,13 +166,19 @@ impl Parser {
             return Some(value);
         }
         let start = self.pos;
-        while self.pos < self.chars.len() && (self.chars[self.pos].is_ascii_digit() || self.chars[self.pos] == '.') {
+        while self.pos < self.chars.len()
+            && (self.chars[self.pos].is_ascii_digit() || self.chars[self.pos] == '.')
+        {
             self.pos += 1;
         }
         if start == self.pos {
             return None;
         }
-        self.chars[start..self.pos].iter().collect::<String>().parse().ok()
+        self.chars[start..self.pos]
+            .iter()
+            .collect::<String>()
+            .parse()
+            .ok()
     }
 }
 
