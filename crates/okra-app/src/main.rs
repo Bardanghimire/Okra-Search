@@ -2,9 +2,10 @@
 
 use eframe::egui::{self, Align2, Color32, FontId, Key, Modifiers, Pos2, RichText, Sense, Stroke, Vec2};
 use okra_core::matcher::{fuzzy_with, Query};
+use okra_core::providers::files::{ntfs_helper_status, HelperStatus};
 use okra_core::{Action, Config, Engine, FileBackendKind, FontKind, Item, Kind, Outcome, ThemeKind};
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::Arc;
 
 mod icons;
@@ -85,6 +86,11 @@ struct App {
     pending: bool,
     q_tx: Sender<(u64, String)>,
     r_rx: Receiver<(u64, Vec<Row>)>,
+    /// Helper health is fetched on one dedicated worker because named-pipe reads may stall.
+    helper_status: Option<HelperStatus>,
+    helper_status_request_tx: SyncSender<()>,
+    helper_status_rx: Receiver<HelperStatus>,
+    helper_status_last_requested: Option<std::time::Instant>,
     settings_open: bool,
     show_requested: Arc<std::sync::atomic::AtomicBool>,
     /// Set by the background app scanner when a fresh application list is available.
@@ -275,6 +281,23 @@ impl App {
             }
         });
 
+        // The status pipe is diagnostic only and can block if a helper client stalls. Keep all
+        // named-pipe I/O off the UI thread and use a one-slot queue so refresh requests coalesce.
+        let (helper_status_request_tx, helper_status_request_rx) =
+            std::sync::mpsc::sync_channel::<()>(1);
+        let (helper_status_tx, helper_status_rx) = channel::<HelperStatus>();
+        let helper_status_ctx = cc.egui_ctx.clone();
+        std::thread::spawn(move || {
+            while helper_status_request_rx.recv().is_ok() {
+                while helper_status_request_rx.try_recv().is_ok() {}
+                let status = ntfs_helper_status();
+                if helper_status_tx.send(status).is_err() {
+                    break;
+                }
+                helper_status_ctx.request_repaint();
+            }
+        });
+
         let show_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // When the background scan finds the (possibly new) list of installed apps, re-run the
@@ -309,6 +332,10 @@ impl App {
             pending: false,
             q_tx,
             r_rx,
+            helper_status: None,
+            helper_status_request_tx,
+            helper_status_rx,
+            helper_status_last_requested: None,
             settings_open: false,
             show_requested,
             index_refreshed,
@@ -404,6 +431,16 @@ impl App {
         }
     }
 
+    fn request_helper_status(&mut self) {
+        match self.helper_status_request_tx.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => {}
+            Err(TrySendError::Disconnected(())) => {
+                self.helper_status = Some(HelperStatus::NotRunning);
+            }
+        }
+        self.helper_status_last_requested = Some(std::time::Instant::now());
+    }
+
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         let pal = palette(self.config.theme);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -448,7 +485,33 @@ impl App {
                     ui.selectable_value(&mut self.config.file_backend, FileBackendKind::Everything, "Everything only");
                     ui.selectable_value(&mut self.config.file_backend, FileBackendKind::Builtin, "Built-in index only");
                 });
-            ui.label(RichText::new("Automatic uses the Everything SDK, then es.exe, then the local index.").size(12.0).color(pal.muted));
+            ui.label(RichText::new("Automatic uses Everything, es.exe, the optional elevated Okra NTFS helper, then the local index.").size(12.0).color(pal.muted));
+
+            section(ui, "NTFS helper health");
+            let helper_description = self
+                .helper_status
+                .map(|status| status.describe())
+                .unwrap_or_else(|| "Checking helper status…".to_string());
+            let helper_color = match self.helper_status {
+                Some(HelperStatus::Ready { .. } | HelperStatus::Busy) => {
+                    Color32::from_rgb(48, 155, 92)
+                }
+                Some(HelperStatus::Stale { .. } | HelperStatus::Incompatible) => {
+                    Color32::from_rgb(205, 135, 35)
+                }
+                _ => pal.muted,
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(helper_description).size(12.5).color(helper_color));
+                if ui.small_button("Refresh").clicked() {
+                    self.request_helper_status();
+                }
+            });
+            ui.label(
+                RichText::new("This optional index is used in Automatic mode when Everything is unavailable. Status checks never request elevation or start the helper.")
+                    .size(12.0)
+                    .color(pal.muted),
+            );
 
             section(ui, "Results");
             ui.add(egui::Slider::new(&mut self.config.max_results, 10..=80).text("Maximum results"));
@@ -634,6 +697,20 @@ impl eframe::App for App {
 
         self.icons.poll();
         self.previews.poll();
+
+        while let Ok(status) = self.helper_status_rx.try_recv() {
+            self.helper_status = Some(status);
+        }
+        if self.settings_open {
+            let refresh_due = self.helper_status_last_requested.map_or(true, |last| {
+                last.elapsed() >= std::time::Duration::from_secs(5)
+            });
+            if refresh_due {
+                self.request_helper_status();
+            }
+            // Repaint only while Settings is open; the worker also wakes the UI on replies.
+            ctx.request_repaint_after(std::time::Duration::from_secs(5));
+        }
         while let Ok((generation, rows)) = self.r_rx.try_recv() {
             if generation >= self.shown {
                 // A later batch for the same query (the file results joining the instant ones)
@@ -811,6 +888,8 @@ impl eframe::App for App {
                         .clicked()
                     {
                         self.settings_open = true;
+                        self.request_helper_status();
+                        ctx.request_repaint();
                     }
                 });
 

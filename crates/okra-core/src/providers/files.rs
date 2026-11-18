@@ -30,6 +30,231 @@ impl FileBackend for EsCli {
     }
 }
 
+/// Health of the optional elevated NTFS helper, as reported over its named pipe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelperStatus {
+    /// No helper owns the pipe (not installed, not started yet, or stopped).
+    NotRunning,
+    /// The helper owns the pipe but another request is being served right now.
+    Busy,
+    /// Running, but still building or resuming its index; searches fall through to the next backend.
+    Starting,
+    /// Serving searches from an up-to-date index.
+    Ready { entries: u32, last_sync_age_secs: u64, pid: u32, failed_syncs: u32 },
+    /// Running, but its sync loop has not completed a pass recently; it refuses searches.
+    Stale { last_sync_age_secs: u64 },
+    /// Shutting down.
+    Stopping,
+    /// Something answered on the pipe but did not speak this protocol version
+    /// (for example an older helper that needs restarting after an upgrade).
+    Incompatible,
+}
+
+/// Same threshold the helper uses before it refuses searches.
+const HELPER_STALE_AFTER_SECS: u64 = 60;
+const HELPER_STATUS_MAGIC: &[u8; 4] = b"OKT1";
+const HELPER_STATUS_LEN: usize = 28;
+
+impl HelperStatus {
+    /// True when searches are currently being answered by the helper.
+    pub fn is_serving(&self) -> bool {
+        matches!(self, HelperStatus::Ready { .. } | HelperStatus::Busy)
+    }
+
+    /// One-line human-readable summary.
+    pub fn describe(&self) -> String {
+        match self {
+            HelperStatus::NotRunning => "NTFS helper: not running".to_string(),
+            HelperStatus::Busy => "NTFS helper: running (busy with another request)".to_string(),
+            HelperStatus::Starting => "NTFS helper: starting (building or resuming its index)".to_string(),
+            HelperStatus::Ready { entries, last_sync_age_secs, pid, failed_syncs } => {
+                let mut line = format!(
+                    "NTFS helper: ready, {entries} paths, last synchronized {last_sync_age_secs}s ago (pid {pid})"
+                );
+                if *failed_syncs > 0 {
+                    line.push_str(&format!("; {failed_syncs} consecutive failed sync(s)"));
+                }
+                line
+            }
+            HelperStatus::Stale { last_sync_age_secs } => format!(
+                "NTFS helper: stale (no successful sync for {last_sync_age_secs}s); searches fall back to the next backend"
+            ),
+            HelperStatus::Stopping => "NTFS helper: stopping".to_string(),
+            HelperStatus::Incompatible => {
+                "NTFS helper: running a different protocol version; restart it".to_string()
+            }
+        }
+    }
+}
+
+/// Decode a 28-byte `OKT1` status reply. `now_unix` is the caller's clock, so staleness is
+/// judged locally and a helper that stopped updating cannot vouch for itself.
+pub fn decode_helper_status(reply: &[u8; HELPER_STATUS_LEN], now_unix: u64) -> HelperStatus {
+    if &reply[..4] != HELPER_STATUS_MAGIC {
+        return HelperStatus::Incompatible;
+    }
+    let u16_at = |at: usize| u16::from_le_bytes([reply[at], reply[at + 1]]);
+    let u32_at = |at: usize| u32::from_le_bytes([reply[at], reply[at + 1], reply[at + 2], reply[at + 3]]);
+    let last_ok = u64::from_le_bytes(reply[16..24].try_into().unwrap());
+    match u16_at(4) {
+        0 => HelperStatus::Starting,
+        2 => HelperStatus::Stopping,
+        1 => {
+            let age = now_unix.saturating_sub(last_ok);
+            if age > HELPER_STALE_AFTER_SECS {
+                HelperStatus::Stale { last_sync_age_secs: age }
+            } else {
+                HelperStatus::Ready {
+                    entries: u32_at(8),
+                    last_sync_age_secs: age,
+                    pid: u32_at(12),
+                    failed_syncs: u32_at(24),
+                }
+            }
+        }
+        _ => HelperStatus::Incompatible,
+    }
+}
+
+/// Ask the helper for its health. Never prompts for elevation and never starts anything.
+#[cfg(windows)]
+pub fn ntfs_helper_status() -> HelperStatus {
+    use std::fs::OpenOptions;
+    use std::io::{Read, Write};
+
+    const PIPE_PATH: &str = r"\\.\pipe\okra-brown-search-v1";
+    const ERROR_PIPE_BUSY: i32 = 231;
+
+    let mut pipe = match OpenOptions::new().read(true).write(true).open(PIPE_PATH) {
+        Ok(pipe) => pipe,
+        Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => return HelperStatus::Busy,
+        Err(_) => return HelperStatus::NotRunning,
+    };
+    if pipe.write_all(b"OKS1\0\0\0\0").is_err() {
+        return HelperStatus::Incompatible;
+    }
+    // Read the 8-byte prefix first: a Stage 3 helper answers an unknown request with an
+    // 8-byte `OKR1` refusal and would otherwise leave a full-length read hanging on EOF.
+    let mut reply = [0u8; HELPER_STATUS_LEN];
+    if pipe.read_exact(&mut reply[..8]).is_err() || &reply[..4] != HELPER_STATUS_MAGIC {
+        return HelperStatus::Incompatible;
+    }
+    if pipe.read_exact(&mut reply[8..]).is_err() {
+        return HelperStatus::Incompatible;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    decode_helper_status(&reply, now)
+}
+
+#[cfg(not(windows))]
+pub fn ntfs_helper_status() -> HelperStatus {
+    HelperStatus::NotRunning
+}
+
+/// One raw search round trip to the elevated NTFS helper (no scoring, no fallback). `None`
+/// when the helper is missing, not ready, or the request failed. Used by the benchmarks.
+#[cfg(windows)]
+pub fn ntfs_helper_search(q: &str, max: usize) -> Option<Vec<(PathBuf, bool)>> {
+    search_ntfs_pipe(q, max)
+}
+
+#[cfg(not(windows))]
+pub fn ntfs_helper_search(_q: &str, _max: usize) -> Option<Vec<(PathBuf, bool)>> {
+    None
+}
+
+/// Current-user named-pipe client for the separately elevated Okra NTFS helper.
+/// A missing helper is not an error: the provider chain continues to the built-in index.
+#[cfg(windows)]
+struct NtfsPipe;
+
+#[cfg(windows)]
+impl FileBackend for NtfsPipe {
+    fn name(&self) -> &'static str {
+        "Okra NTFS helper"
+    }
+    fn search(&self, q: &str, max: usize) -> Option<Vec<(PathBuf, bool)>> {
+        search_ntfs_pipe(q, max)
+    }
+}
+
+#[cfg(windows)]
+fn search_ntfs_pipe(q: &str, max: usize) -> Option<Vec<(PathBuf, bool)>> {
+    use std::fs::OpenOptions;
+    use std::io::{Read, Write};
+
+    const PIPE_PATH: &str = r"\\.\pipe\okra-brown-search-v1";
+    const REQUEST_MAGIC: &[u8; 4] = b"OKQ1";
+    const RESPONSE_MAGIC: &[u8; 4] = b"OKR1";
+    const MAX_QUERY_BYTES: usize = 1024;
+    const MAX_RESULTS: usize = 200;
+    const MAX_PATH_BYTES: usize = 128 * 1024;
+
+    let query = q.as_bytes();
+    if query.is_empty() || query.len() > MAX_QUERY_BYTES || query.iter().any(|byte| *byte < 0x20) {
+        return None;
+    }
+    let limit = max.clamp(1, MAX_RESULTS);
+    // The helper serves one client at a time on a single pipe instance, so a client that arrives
+    // between two requests sees ERROR_PIPE_BUSY for a moment. Retry briefly instead of giving
+    // up (and dropping to a slower backend) on the first busy answer.
+    const OPEN_BUSY: i32 = 231;
+    let mut busy_retries = 0;
+    let mut pipe = loop {
+        match OpenOptions::new().read(true).write(true).open(PIPE_PATH) {
+            Ok(pipe) => break pipe,
+            Err(error) if error.raw_os_error() == Some(OPEN_BUSY) && busy_retries < 40 => {
+                busy_retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(_) => return None,
+        }
+    };
+    let mut request = Vec::with_capacity(8 + query.len());
+    request.extend_from_slice(REQUEST_MAGIC);
+    request.extend_from_slice(&(limit as u16).to_le_bytes());
+    request.extend_from_slice(&(query.len() as u16).to_le_bytes());
+    request.extend_from_slice(query);
+    pipe.write_all(&request).ok()?;
+
+    let mut header = [0u8; 8];
+    pipe.read_exact(&mut header).ok()?;
+    if &header[..4] != RESPONSE_MAGIC {
+        return None;
+    }
+    let status = u16::from_le_bytes([header[4], header[5]]);
+    let count = u16::from_le_bytes([header[6], header[7]]) as usize;
+    if status != 0 || count > limit {
+        return None;
+    }
+
+    let mut results = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut entry_header = [0u8; 5];
+        pipe.read_exact(&mut entry_header).ok()?;
+        let is_dir = match entry_header[0] {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        let path_len = u32::from_le_bytes(entry_header[1..5].try_into().ok()?) as usize;
+        if path_len == 0 || path_len > MAX_PATH_BYTES {
+            return None;
+        }
+        let mut path = vec![0u8; path_len];
+        pipe.read_exact(&mut path).ok()?;
+        let path = String::from_utf8(path).ok()?;
+        results.push((PathBuf::from(path), is_dir));
+    }
+    // An empty scoped NTFS snapshot is not proof that the complete configured search space has
+    // no match (for example, another configured root may live on a different volume). Let the
+    // existing walker backend try before reporting no results.
+    if results.is_empty() { None } else { Some(results) }
+}
+
 // ---------------------------------------------------------------- built-in fallback index
 
 struct FileEntry {
@@ -164,7 +389,7 @@ impl FilesProvider {
                 notice = Some(
                     match cfg.file_backend {
                         FileBackendKind::Everything => "Everything not found: file search is unavailable",
-                        _ => "Everything not found: using the built-in file index (slower)",
+                        _ => "Everything not found: using the NTFS helper when available, then the built-in index",
                     }
                     .to_string(),
                 );
@@ -174,10 +399,16 @@ impl FilesProvider {
             FileBackendKind::Auto => {
                 let b = builtin();
                 if backends.is_empty() {
-                    // No Everything on this machine: index right away instead of on first query.
+                    // Preserve the existing behavior: warm the walker fallback at startup when
+                    // neither Everything transport is available, even if the optional helper may
+                    // answer queries before it.
                     b.index.get_or_init(|| build_index(b.roots.clone(), b.depth));
                 }
-                backends.push(Box::new(b)); // otherwise stays dormant until Everything fails
+
+                // Keep Everything first, then the optional elevated NTFS helper, then the walker.
+                #[cfg(windows)]
+                backends.push(Box::new(NtfsPipe));
+                backends.push(Box::new(b));
             }
             FileBackendKind::Builtin => {
                 let b = builtin();
@@ -192,6 +423,11 @@ impl FilesProvider {
     /// Set when the fast Everything path is not available, so the app can tell the user once.
     pub fn startup_notice(&self) -> Option<String> {
         self.notice.clone()
+    }
+
+    /// Current health of the optional elevated NTFS helper (a quick local pipe round trip).
+    pub fn helper_status(&self) -> HelperStatus {
+        ntfs_helper_status()
     }
 
     /// Which backend answered the most recent query (for diagnostics / status lines).
@@ -303,5 +539,64 @@ mod tests {
         }
         let ms = t.elapsed().as_secs_f64() * 1e3 / queries.len() as f64;
         println!("built-in index, 300k entries: {ms:.2} ms / query (returned {total} rows)");
+    }
+}
+
+#[cfg(test)]
+mod helper_status_tests {
+    use super::*;
+
+    fn reply(state: u16, entries: u32, pid: u32, last_ok: u64, failures: u32) -> [u8; HELPER_STATUS_LEN] {
+        let mut out = [0u8; HELPER_STATUS_LEN];
+        out[..4].copy_from_slice(HELPER_STATUS_MAGIC);
+        out[4..6].copy_from_slice(&state.to_le_bytes());
+        out[8..12].copy_from_slice(&entries.to_le_bytes());
+        out[12..16].copy_from_slice(&pid.to_le_bytes());
+        out[16..24].copy_from_slice(&last_ok.to_le_bytes());
+        out[24..28].copy_from_slice(&failures.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn decodes_each_state() {
+        assert_eq!(decode_helper_status(&reply(0, 0, 1, 0, 0), 100), HelperStatus::Starting);
+        assert_eq!(decode_helper_status(&reply(2, 5, 1, 90, 0), 100), HelperStatus::Stopping);
+        assert_eq!(
+            decode_helper_status(&reply(1, 70_799, 4242, 95, 3), 100),
+            HelperStatus::Ready { entries: 70_799, last_sync_age_secs: 5, pid: 4242, failed_syncs: 3 }
+        );
+        assert_eq!(decode_helper_status(&reply(9, 0, 1, 0, 0), 100), HelperStatus::Incompatible);
+    }
+
+    #[test]
+    fn staleness_is_judged_on_the_launchers_clock() {
+        let r = reply(1, 10, 1, 1_000, 0);
+        assert!(matches!(decode_helper_status(&r, 1_000 + HELPER_STALE_AFTER_SECS), HelperStatus::Ready { .. }));
+        assert_eq!(
+            decode_helper_status(&r, 1_001 + HELPER_STALE_AFTER_SECS),
+            HelperStatus::Stale { last_sync_age_secs: HELPER_STALE_AFTER_SECS + 1 }
+        );
+        // A helper clock ahead of ours must not underflow.
+        assert!(matches!(decode_helper_status(&r, 500), HelperStatus::Ready { last_sync_age_secs: 0, .. }));
+    }
+
+    #[test]
+    fn wrong_magic_is_incompatible_and_serving_flags_are_right() {
+        let mut r = reply(1, 1, 1, 100, 0);
+        r[..4].copy_from_slice(b"OKR1");
+        assert_eq!(decode_helper_status(&r, 100), HelperStatus::Incompatible);
+        assert!(HelperStatus::Ready { entries: 1, last_sync_age_secs: 0, pid: 1, failed_syncs: 0 }.is_serving());
+        assert!(HelperStatus::Busy.is_serving());
+        for s in [HelperStatus::NotRunning, HelperStatus::Starting, HelperStatus::Stopping, HelperStatus::Incompatible,
+                  HelperStatus::Stale { last_sync_age_secs: 61 }] {
+            assert!(!s.is_serving());
+        }
+    }
+
+    #[test]
+    fn descriptions_mention_the_key_facts() {
+        let line = HelperStatus::Ready { entries: 70_799, last_sync_age_secs: 2, pid: 7, failed_syncs: 1 }.describe();
+        assert!(line.contains("70799") && line.contains("2s ago") && line.contains("failed"));
+        assert!(HelperStatus::Stale { last_sync_age_secs: 99 }.describe().contains("stale"));
     }
 }

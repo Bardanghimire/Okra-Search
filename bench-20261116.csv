@@ -1,0 +1,13 @@
+backend,query,results,first_ms,median_ms,p95_ms,max_ms
+NTFS helper (pipe),ca,60,152.139,0.011,0.012,0.024
+NTFS helper (pipe),car,60,24.442,0.011,0.016,0.037
+Built-in walker (provider),ca,0,0.040,0.000,0.001,0.002
+Built-in walker (provider),car,0,0.002,0.000,0.000,0.000
+Built-in walker (provider),carg,0,0.001,0.000,0.000,0.000
+Built-in walker (provider),cargo,0,0.002,0.001,0.001,0.016
+Built-in walker (provider),Cargo.toml,0,0.003,0.001,0.001,0.001
+Built-in walker (provider),ipc.rs,0,0.002,0.001,0.001,0.001
+Built-in walker (provider),.rs,0,0.001,0.000,0.000,0.000
+Built-in walker (provider),okra,0,0.001,0.000,0.000,0.000
+Built-in walker (provider),readme,0,0.002,0.001,0.001,0.001
+Built-in walker (provider),zzqxjkvw,0,0.002,0.001,0.001,0.001

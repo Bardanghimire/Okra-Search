@@ -16,6 +16,7 @@ A minimal desktop search launcher written in Rust, focused on Windows. It search
 - **Preview pane:** the window is split like macOS Spotlight: results on the left, details of the selected result on the right. Files and folders show their icon, type, size (or item count), modified and created dates and location; PNG, JPEG, GIF and BMP images show a thumbnail and their pixel size; text files show their first lines; apps show where they live and how often you opened them; settings show what they open; calculator answers are shown large. File details are read on a worker thread, so moving through results never waits on the disk.
 - **Starts empty:** the launcher opens as just the search bar, centred on the screen where the mouse is, with no results until you type. The window itself keeps a fixed size so the bar never jumps while you type.
 - **Appearance:** warm-light and dark themes, a choice of the bundled Inter font or the system Segoe UI, plus a compact settings screen.
+- **NTFS helper diagnostics:** Settings shows whether the optional elevated helper is ready, starting, stale, stopped, or incompatible, together with index size and last-sync age when available. Health checks run on a background worker and never start the helper or request elevation.
 - **Heads-up messages:** if the Ctrl + Alt + Space shortcut is already taken by another program, or Everything is missing so file search is slower, a short note shows in the bar for the first few opens.
 
 ## Search syntax

@@ -1,0 +1,20 @@
+backend,query,results,first_ms,median_ms,p95_ms,max_ms,failed,runs
+NTFS helper (pipe),ca,60,120.985,14.689,18.785,18.785,91,100
+NTFS helper (pipe),car,60,11.862,10.616,10.995,10.995,96,100
+NTFS helper (pipe),carg,60,6.065,7.562,8.944,9.057,70,100
+NTFS helper (pipe),cargo,60,5.883,7.524,8.690,8.973,70,100
+NTFS helper (pipe),Cargo.toml,60,2.558,2.533,3.265,3.994,78,100
+NTFS helper (pipe),ipc.rs,60,2.704,1.858,2.094,2.423,88,100
+NTFS helper (pipe),.rs,60,11.188,9.899,14.031,14.062,87,100
+NTFS helper (pipe),okra,60,4.735,6.105,6.660,6.763,83,100
+NTFS helper (pipe),readme,60,3.917,4.225,5.458,5.465,84,100
+Built-in walker (provider),ca,20,1.396,1.161,1.824,1.973,0,100
+Built-in walker (provider),car,20,1.167,1.006,1.321,1.707,0,100
+Built-in walker (provider),carg,20,1.204,0.844,1.195,1.420,0,100
+Built-in walker (provider),cargo,20,0.907,0.595,0.897,1.329,0,100
+Built-in walker (provider),Cargo.toml,7,0.124,0.089,0.118,0.229,0,100
+Built-in walker (provider),ipc.rs,1,0.152,0.118,0.185,0.204,0,100
+Built-in walker (provider),.rs,20,0.524,0.440,0.576,23.617,0,100
+Built-in walker (provider),okra,20,1.417,0.601,1.208,3.231,0,100
+Built-in walker (provider),readme,20,1.422,1.091,1.172,1.478,0,100
+Built-in walker (provider),zzqxjkvw,0,0.016,0.005,0.005,0.008,0,100
