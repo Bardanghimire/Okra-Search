@@ -16,6 +16,7 @@ struct Args {
     state: PathBuf,
     max_depth: usize,
     roots: Vec<String>,
+    full_volume: bool,
     watch: bool,
     serve: bool,
     poll_seconds: u64,
@@ -141,6 +142,7 @@ fn parse_args() -> Result<Args, String> {
         state,
         max_depth,
         roots,
+        full_volume,
         watch: watch || serve,
         serve,
         poll_seconds,
@@ -209,6 +211,7 @@ fn run() -> Result<(), String> {
                 state: path_string(&args.state)?,
                 max_depth: args.max_depth,
                 roots: args.roots,
+                full_volume: args.full_volume,
                 poll_seconds: args.poll_seconds,
             };
             task::install(&request, start_now)

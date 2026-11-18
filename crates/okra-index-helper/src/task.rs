@@ -36,6 +36,7 @@ pub struct InstallRequest {
     pub state: String,
     pub max_depth: usize,
     pub roots: Vec<String>,
+    pub full_volume: bool,
     pub poll_seconds: u64,
 }
 
@@ -93,12 +94,16 @@ pub fn helper_arguments(request: &InstallRequest) -> Vec<String> {
         request.output.clone(),
         "--state".to_string(),
         request.state.clone(),
-        "--max-depth".to_string(),
-        request.max_depth.to_string(),
     ];
-    for root in &request.roots {
-        args.push("--root".to_string());
-        args.push(root.clone());
+    if request.full_volume {
+        args.push("--full-volume".to_string());
+    } else {
+        args.push("--max-depth".to_string());
+        args.push(request.max_depth.to_string());
+        for root in &request.roots {
+            args.push("--root".to_string());
+            args.push(root.clone());
+        }
     }
     args.push("--serve".to_string());
     args.push("--poll-seconds".to_string());
@@ -466,6 +471,7 @@ mod tests {
             state: r"C:\Users\barda\AppData\Local\okra-brown-search\mft-snapshot.state".into(),
             max_depth: 8,
             roots: vec![r"C:\Users\barda".into(), r"C:\Projects".into()],
+            full_volume: false,
             poll_seconds: 1,
         };
         let args = helper_arguments(&request);
@@ -476,5 +482,26 @@ mod tests {
         assert!(join_arguments(&args)
             .unwrap()
             .starts_with("--volume C: --output "));
+    }
+
+    #[test]
+    fn full_volume_task_arguments_preserve_full_volume_scope() {
+        let request = InstallRequest {
+            volume: "C:".into(),
+            output: r"C:\Users\barda\AppData\Local\okra-brown-search\mft-snapshot.tsv".into(),
+            state: r"C:\Users\barda\AppData\Local\okra-brown-search\mft-snapshot.state".into(),
+            max_depth: usize::MAX,
+            roots: vec![r"C:\".into()],
+            full_volume: true,
+            poll_seconds: 1,
+        };
+        let args = helper_arguments(&request);
+        assert!(args.iter().any(|arg| arg == "--full-volume"));
+        assert!(!args.iter().any(|arg| arg == "--root"));
+        assert!(!args.iter().any(|arg| arg == "--max-depth"));
+        assert!(args.iter().any(|arg| arg == "--serve"));
+        assert!(args.iter().any(|arg| arg == "--background"));
+        assert!(args.iter().any(|arg| arg == "--poll-seconds"));
+        assert!(args.iter().any(|arg| arg == "1"));
     }
 }
