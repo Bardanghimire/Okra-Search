@@ -131,7 +131,7 @@ through PATH or environment variables.
 | Resume the persistent index | unchanged Stage 2 resume (journal ID + cursor checks, MFT rebuild if invalid) |
 | Pipe + continuous USN polling | `--serve` (pipe is created first, then the sync loop runs) |
 | One instance only | `MultipleInstancesPolicy=IgnoreNew`, plus `FILE_FLAG_FIRST_PIPE_INSTANCE` |
-| Crash / failure recovery | `RestartOnFailure`: every 1 minute, up to 999 times, after a non-zero exit |
+| Crash / failure recovery | `RestartOnFailure`: every 1 minute, up to 999 times, after a non-zero exit; a repeating 1-minute `TimeTrigger` also restarts a helper that was killed (exit code is not a failure), ignored while one is running |
 | No runtime limit | `ExecutionTimeLimit=PT0S` |
 | Quiet background run | `--background`: console detached, output goes to `helper.log` next to the installed exe (rotated at 1 MiB) |
 

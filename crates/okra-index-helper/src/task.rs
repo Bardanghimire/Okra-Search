@@ -128,6 +128,14 @@ pub fn build_task_xml(spec: &TaskSpec) -> Result<String, String> {
       <Enabled>true</Enabled>
       <UserId>{user}</UserId>
     </LogonTrigger>
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT1M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2000-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
   </Triggers>
   <Principals>
     <Principal id="Author">
@@ -400,6 +408,8 @@ mod tests {
     fn task_xml_requests_logon_start_highest_privileges_and_restart_on_failure() {
         let xml = build_task_xml(&spec()).unwrap();
         assert!(xml.contains("<LogonTrigger>"));
+        assert!(xml.contains("<TimeTrigger>"));
+        assert!(xml.contains("<StartBoundary>"));
         assert!(xml.contains(r"<UserId>SILK\barda</UserId>"));
         assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
         assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
