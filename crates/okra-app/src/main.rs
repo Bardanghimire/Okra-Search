@@ -764,9 +764,9 @@ impl eframe::App for App {
             self.helper_status = Some(status);
         }
         if self.settings_open {
-            let refresh_due = self
-                .helper_status_last_requested
-                .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(5));
+            let refresh_due = self.helper_status_last_requested.map_or(true, |last| {
+                last.elapsed() >= std::time::Duration::from_secs(5)
+            });
             if refresh_due {
                 self.request_helper_status();
             }
