@@ -712,6 +712,13 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        {
+            static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+            if frame % 20 == 0 {
+                debug_log(&format!("frame {frame}"));
+            }
+        }
         // Register native controls on the first UI frame, after eframe has entered
         // the Win32 event loop required by the global-hotkey backend.
         if !self.resident_initialized {
@@ -910,7 +917,17 @@ impl eframe::App for App {
         #[cfg(windows)]
         if (height - self.region_height).abs() > 0.5 {
             self.region_height = height;
-            set_window_region(height);
+            debug_log(&format!("window region -> height {height}"));
+            if std::env::var_os("OKRA_FIT").is_some() {
+                fit_window_height(height);
+                round_window_corners();
+            } else if std::env::var_os("OKRA_COLORKEY").is_some() {
+                enable_color_key();
+            } else if std::env::var_os("OKRA_DWM_ALPHA").is_some() {
+                enable_dwm_alpha();
+            } else if std::env::var_os("OKRA_GLOW").is_some() && std::env::var_os("OKRA_NO_REGION").is_none() {
+                set_window_region(height);
+            }
         }
         let mut panel_rect: Option<egui::Rect> = None;
 
@@ -922,7 +939,7 @@ impl eframe::App for App {
                 let full = ui.max_rect();
                 let panel = egui::Rect::from_min_size(full.min, Vec2::new(full.width(), height));
                 ui.painter()
-                    .rect(panel, 14.0_f32, pal.bg, Stroke::new(1.0_f32, pal.border));
+                    .rect(panel, if fit_mode() { 0.0_f32 } else { 14.0_f32 }, pal.bg, Stroke::new(1.0_f32, pal.border));
                 panel_rect = Some(panel);
                 let mut content = ui.child_ui(
                     panel.shrink2(Vec2::new(16.0, 10.0)),
@@ -1959,6 +1976,176 @@ fn opaque_mode() -> bool {
     *OPAQUE.get_or_init(|| std::env::var_os("OKRA_OPAQUE").is_some())
 }
 
+/// Asks the Windows compositor to honour the window's alpha channel (the usual trick for a
+/// transparent OpenGL window). Used instead of `set_window_region` when `OKRA_DWM_ALPHA` is set.
+#[cfg(windows)]
+fn enable_dwm_alpha() {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[allow(dead_code)] // read by the OS through the pointer, not by Rust
+    struct BlurBehind {
+        flags: u32,
+        enable: i32,
+        region: *mut c_void,
+        transition_on_maximized: i32,
+    }
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmEnableBlurBehindWindow(hwnd: *mut c_void, blur: *const BlurBehind) -> i32;
+    }
+    #[link(name = "gdi32")]
+    extern "system" {
+        fn CreateRectRgn(left: i32, top: i32, right: i32, bottom: i32) -> *mut c_void;
+        fn DeleteObject(object: *mut c_void) -> i32;
+    }
+
+    unsafe {
+        let hwnd = own_window::handle();
+        if hwnd.is_null() {
+            return;
+        }
+        // DWM_BB_ENABLE | DWM_BB_BLURREGION with an empty region: no blur, but alpha is honoured.
+        let region = CreateRectRgn(0, 0, -1, -1);
+        let blur = BlurBehind {
+            flags: 3,
+            enable: 1,
+            region,
+            transition_on_maximized: 0,
+        };
+        let result = DwmEnableBlurBehindWindow(hwnd, &blur);
+        if !region.is_null() {
+            DeleteObject(region);
+        }
+        debug_log(&format!("DwmEnableBlurBehindWindow -> {result:#x}"));
+    }
+}
+
+/// Makes the window a layered window whose pure-black pixels are transparent (and click-through).
+/// Used instead of `set_window_region` when `OKRA_COLORKEY` is set.
+#[cfg(windows)]
+fn enable_color_key() {
+    use std::ffi::c_void;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetWindowLongPtrW(hwnd: *mut c_void, index: i32) -> isize;
+        fn SetWindowLongPtrW(hwnd: *mut c_void, index: i32, value: isize) -> isize;
+        fn SetLayeredWindowAttributes(hwnd: *mut c_void, key: u32, alpha: u8, flags: u32) -> i32;
+    }
+    const GWL_EXSTYLE: i32 = -20;
+    const WS_EX_LAYERED: isize = 0x0008_0000;
+    const LWA_COLORKEY: u32 = 1;
+
+    unsafe {
+        let hwnd = own_window::handle();
+        if hwnd.is_null() {
+            return;
+        }
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED);
+        let ok = SetLayeredWindowAttributes(hwnd, 0, 255, LWA_COLORKEY);
+        debug_log(&format!("SetLayeredWindowAttributes colour key -> {ok}"));
+    }
+}
+
+/// Resizes the real window to `height` points (keeping its position), so there is nothing left
+/// over to clip or make transparent. Used when `OKRA_FIT` is set.
+#[cfg(windows)]
+fn fit_window_height(height: f32) {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetWindowRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
+        fn SetWindowPos(
+            hwnd: *mut c_void,
+            after: *mut c_void,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> i32;
+    }
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+
+    unsafe {
+        let hwnd = own_window::handle();
+        if hwnd.is_null() {
+            return;
+        }
+        let mut rect = Rect::default();
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return;
+        }
+        let width = rect.right - rect.left;
+        if width <= 0 {
+            return;
+        }
+        let scale = width as f32 / WINDOW_WIDTH;
+        let tall = (height * scale).round() as i32;
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            width,
+            tall,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// True when the launcher was started with the environment variable `OKRA_FIT` set.
+fn fit_mode() -> bool {
+    static FIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FIT.get_or_init(|| std::env::var_os("OKRA_FIT").is_some())
+}
+
+/// Asks Windows 11 to round this window's corners (older Windows ignores it).
+#[cfg(windows)]
+fn round_window_corners() {
+    use std::ffi::c_void;
+
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: *mut c_void,
+            attribute: u32,
+            value: *const c_void,
+            size: u32,
+        ) -> i32;
+    }
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWCP_ROUND: i32 = 2;
+
+    unsafe {
+        let hwnd = own_window::handle();
+        if hwnd.is_null() {
+            return;
+        }
+        let value = DWMWCP_ROUND;
+        let result = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            std::ptr::addr_of!(value).cast::<c_void>(),
+            4,
+        );
+        debug_log(&format!("DwmSetWindowAttribute corner preference -> {result:#x}"));
+    }
+}
+
 fn main() -> eframe::Result<()> {
     #[cfg(windows)]
     if already_running() {
@@ -1978,6 +2165,13 @@ fn main() -> eframe::Result<()> {
         // Launched with --background (sign-in start): never show the window, so there is no flash.
         .with_visible(!start_hidden);
 
+    // OKRA_FIT: the window is resized to the panel, so it must be allowed to be shorter than before.
+    if std::env::var_os("OKRA_FIT").is_some() {
+        viewport = viewport
+            .with_min_inner_size([WINDOW_WIDTH, BAR_HEIGHT])
+            .with_max_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT]);
+    }
+
     if let Ok(icon) =
         image::load_from_memory(include_bytes!("../../../assets/okra-brown-search.png"))
     {
@@ -1993,6 +2187,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport,
         centered: true,
+        renderer: if std::env::var_os("OKRA_GLOW").is_some() { eframe::Renderer::Glow } else { eframe::Renderer::Wgpu },
         ..Default::default()
     };
     eframe::run_native(
