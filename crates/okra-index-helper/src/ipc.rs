@@ -1171,8 +1171,22 @@ mod tests {
             seed
         };
         const WORDS: &[&str] = &[
-            "doc", "document", "Documents", "data", "old", "Cargo", "cargo-lock", "unit", "meet",
-            "notes", "my document", "D_o_c", "Down Load", "report", "tmp", "config",
+            "doc",
+            "document",
+            "Documents",
+            "data",
+            "old",
+            "Cargo",
+            "cargo-lock",
+            "unit",
+            "meet",
+            "notes",
+            "my document",
+            "D_o_c",
+            "Down Load",
+            "report",
+            "tmp",
+            "config",
         ];
         for index in 0..6_000 {
             let a = WORDS[(next() % WORDS.len() as u64) as usize];
@@ -1188,7 +1202,9 @@ mod tests {
             cache.append_path(&name, is_dir).unwrap();
         }
         cache.rebuild_postings().unwrap();
-        for query_text in ["doc", "document", "cargo", "do", "dcmnt", "my doc", "unit", "d_o", "tmp"] {
+        for query_text in [
+            "doc", "document", "cargo", "do", "dcmnt", "my doc", "unit", "d_o", "tmp",
+        ] {
             for max in [1usize, 7, 50, 200] {
                 let query = Query::new(query_text);
                 let mut all: Vec<(i64, usize)> = Vec::new();
@@ -1245,7 +1261,10 @@ mod tests {
                 0 => format!(r"C:\Users\bench\Documents\document-{index}.{ext}"),
                 1 | 2 => format!(r"C:\Users\bench\Work\my-document-{stem}-{index}.{ext}"),
                 3 => format!(r"C:\Users\bench\Code\cargo-{stem}.{ext}"),
-                _ => format!(r"C:\Data\{}\{stem}{index}.{ext}", ["a", "b", "c", "d"][index % 4]),
+                _ => format!(
+                    r"C:\Data\{}\{stem}{index}.{ext}",
+                    ["a", "b", "c", "d"][index % 4]
+                ),
             };
             cache.append_path(&name, index % 13 == 0).unwrap();
         }
@@ -1263,7 +1282,9 @@ mod tests {
             samples_ms.sort_by(f64::total_cmp);
             let median = samples_ms[samples_ms.len() / 2];
             let p95 = samples_ms[(samples_ms.len() * 95 / 100).min(samples_ms.len() - 1)];
-            eprintln!("mixed {query}: {result_count} results; median {median:.2} ms; p95 {p95:.2} ms");
+            eprintln!(
+                "mixed {query}: {result_count} results; median {median:.2} ms; p95 {p95:.2} ms"
+            );
         }
     }
 
@@ -1302,12 +1323,20 @@ mod tests {
             let name = if is_dir {
                 format!("folder-{frn}")
             } else {
-                format!("file-{frn}.{}", ["txt", "dll", "png", "rs"][(rnd() % 4) as usize])
+                format!(
+                    "file-{frn}.{}",
+                    ["txt", "dll", "png", "rs"][(rnd() % 4) as usize]
+                )
             };
             if is_dir {
                 dirs.push(frn);
             }
-            entries.push(MftEntry { file_reference: frn, parent_reference: parent, name, is_dir });
+            entries.push(MftEntry {
+                file_reference: frn,
+                parent_reference: parent,
+                name,
+                is_dir,
+            });
         }
         let roots = vec!["C:\\".to_string()];
 
