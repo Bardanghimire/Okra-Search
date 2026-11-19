@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const STATE_MAGIC: &[u8; 8] = b"OKRAUSN1";
 const STATE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -18,6 +18,11 @@ const STATE_MAX_STRING_BYTES: usize = 1024 * 1024;
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 const USN_REASON_FILE_DELETE: u32 = 0x0000_0200;
+
+/// How long the resident cursor may run ahead of the persisted one while journal records keep
+/// arriving without changing any name. A crash then replays at most this much journal, which is
+/// idempotent; the interval stays far below the time the journal needs to wrap.
+const CURSOR_PERSIST_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct JournalInfo {
@@ -50,6 +55,10 @@ struct IndexState {
 #[derive(Debug, Default, Clone, Copy)]
 struct SyncStats {
     changes_read: usize,
+    /// Records that actually created, removed or altered an entry's parent, name or directory
+    /// flag. Records that merely touch an existing entry (data writes, closes, attribute or
+    /// security changes) do not count and never require a snapshot export.
+    namespace_changes: usize,
     cursor_before: i64,
     cursor_after: i64,
     rebuilt: bool,
@@ -251,18 +260,21 @@ impl MutableIndex {
         index
     }
 
-    fn apply(&mut self, change: UsnChange) {
+    /// Apply one journal record. Returns true only when the graph's names changed (an entry was
+    /// created, removed, or had its parent, name or directory flag altered).
+    fn apply(&mut self, change: UsnChange) -> bool {
         if change.reason & USN_REASON_FILE_DELETE != 0 {
             if let Some(position) = self.by_reference.remove(&change.file_reference) {
                 self.entries[position] = None;
+                return true;
             }
-            return;
+            return false;
         }
 
         // Some journal records (for example, close-only notifications) can omit a useful name.
         // They do not alter the namespace graph and should not erase a known name.
         if change.name.is_empty() {
-            return;
+            return false;
         }
 
         let entry = MftEntry {
@@ -272,12 +284,21 @@ impl MutableIndex {
             is_dir: change.is_dir,
         };
         if let Some(position) = self.by_reference.get(&entry.file_reference).copied() {
+            let unchanged = self.entries[position].as_ref().is_some_and(|existing| {
+                existing.parent_reference == entry.parent_reference
+                    && existing.is_dir == entry.is_dir
+                    && existing.name == entry.name
+            });
+            if unchanged {
+                return false;
+            }
             self.entries[position] = Some(entry);
         } else {
             let position = self.entries.len();
             self.by_reference.insert(entry.file_reference, position);
             self.entries.push(Some(entry));
         }
+        true
     }
 
     fn live_count(&self) -> usize {
@@ -341,7 +362,16 @@ struct ResidentVolumeIndex {
     journal_id: u64,
     cursor: i64,
     index: MutableIndex,
+    /// A name, scope or earlier persistence failure means the snapshot and state must both be
+    /// rewritten. While this is false, the exported snapshot is exactly what a fresh export of
+    /// the resident graph would produce, so only the cursor can be behind.
     dirty: bool,
+    /// The cursor advanced since the state file was last written.
+    state_unsaved: bool,
+    last_state_write: Instant,
+    /// Batches and records seen since the last write that changed no names (export skipped).
+    skipped_batches: u64,
+    skipped_records: u64,
 }
 
 impl ResidentVolumeIndex {
@@ -361,6 +391,10 @@ impl ResidentVolumeIndex {
             cursor: state.cursor,
             index,
             dirty,
+            state_unsaved: false,
+            last_state_write: Instant::now(),
+            skipped_batches: 0,
+            skipped_records: 0,
         }
     }
 
@@ -376,16 +410,62 @@ impl ResidentVolumeIndex {
     }
 }
 
-fn apply_changes(index: &mut MutableIndex, changes: Vec<UsnChange>) -> usize {
-    let count = changes.len();
+/// Outcome of applying one batch of journal records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BatchEffect {
+    records: usize,
+    namespace_changes: usize,
+}
+
+fn apply_changes_counted(index: &mut MutableIndex, changes: Vec<UsnChange>) -> BatchEffect {
+    let records = changes.len();
+    let mut namespace_changes = 0usize;
     for change in changes {
         // The USN value is parsed for diagnostics/ordering validation. The journal API returns
         // records in USN order, and the latest record for a file reference wins.
         let _record_usn = change.usn;
-        index.apply(change);
+        if index.apply(change) {
+            namespace_changes += 1;
+        }
     }
     index.compact_if_sparse();
-    count
+    BatchEffect {
+        records,
+        namespace_changes,
+    }
+}
+
+fn apply_changes(index: &mut MutableIndex, changes: Vec<UsnChange>) -> usize {
+    apply_changes_counted(index, changes).records
+}
+
+/// What a polling round must write to disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistPlan {
+    /// Nothing is due (the common case for batches that change no names).
+    Nothing,
+    /// Only the cursor is behind: rewrite the state file, leave the snapshot untouched.
+    StateOnly,
+    /// Names or scope changed (or a write failed earlier): rewrite snapshot and state.
+    Full,
+}
+
+fn plan_persistence(
+    dirty: bool,
+    rebuilt: bool,
+    scope_changed: bool,
+    has_outputs: bool,
+    state_unsaved: bool,
+    since_state_write: Duration,
+    force_state: bool,
+) -> PersistPlan {
+    if dirty || rebuilt || scope_changed || !has_outputs {
+        PersistPlan::Full
+    } else if state_unsaved && (force_state || since_state_write >= CURSOR_PERSIST_INTERVAL) {
+        PersistPlan::StateOnly
+    } else {
+        PersistPlan::Nothing
+    }
 }
 
 struct StateReader<R> {
@@ -674,6 +754,14 @@ fn persist_outputs(
     Ok(count)
 }
 
+/// Rewrite only the state file. Safe only while the exported snapshot already equals an export
+/// of the same graph (see `ResidentVolumeIndex::dirty`).
+fn persist_state_only(state: &IndexState, state_path: &Path) -> Result<(), String> {
+    let temporary_state = write_state_temporary(state_path, state)?;
+    crate::atomic::replace(&temporary_state, state_path)
+        .map_err(|error| format!("Could not replace persistent index: {error}"))
+}
+
 fn rebuild_state(
     volume: &str,
     roots: &[String],
@@ -759,6 +847,7 @@ fn rebuild_resident(
     *resident = Some(ResidentVolumeIndex::from_state(state, true));
     Ok(SyncStats {
         changes_read,
+        namespace_changes: changes_read,
         cursor_before: old_cursor,
         cursor_after,
         rebuilt: true,
@@ -821,6 +910,7 @@ fn sync_once(
     }
 
     let cursor_before = current_cursor;
+    let mut namespace_changes = 0usize;
     let (cursor_after, changes_read) = match native::read_changes(
         volume,
         cursor_before,
@@ -828,8 +918,11 @@ fn sync_once(
         journal.next_usn,
         |batch| {
             if let Some(current) = resident.as_mut() {
-                apply_changes(&mut current.index, batch);
-                current.dirty = true;
+                let effect = apply_changes_counted(&mut current.index, batch);
+                namespace_changes += effect.namespace_changes;
+                if effect.namespace_changes > 0 {
+                    current.dirty = true;
+                }
             }
         },
     ) {
@@ -864,9 +957,15 @@ fn sync_once(
             .ok_or_else(|| "NTFS resident index disappeared during synchronization".to_string())?;
         current.journal_id = latest.journal_id;
         current.cursor = cursor_after;
-        current.dirty |= changes_read > 0 || cursor_before != cursor_after || scope_changed;
+        // `dirty` is set above only by records that changed names. A cursor that merely moved
+        // forward past name-neutral records is tracked separately and persisted on a timer.
+        current.dirty |= scope_changed;
+        if changes_read > 0 || cursor_before != cursor_after {
+            current.state_unsaved = true;
+        }
         return Ok(SyncStats {
             changes_read,
+            namespace_changes,
             cursor_before,
             cursor_after,
             rebuilt: false,
@@ -905,35 +1004,96 @@ fn sync_volume_round(
         Err(error) => return Err(error),
     };
 
-    let current = resident
-        .as_ref()
-        .ok_or_else(|| "NTFS resident index is unavailable after synchronization".to_string())?;
     let has_outputs = volume.snapshot_path.exists() && volume.state_path.exists();
-    let changed = current.dirty
-        || stats.rebuilt
-        || stats.changes_read > 0
-        || stats.cursor_before != stats.cursor_after
-        || stats.scope_changed
-        || !has_outputs;
-    if !changed {
-        if !watch {
-            println!(
-                "NTFS index on {} is up to date at USN {}; no changes to apply.",
-                volume.volume, current.cursor
-            );
+    let plan = {
+        let current = resident.as_mut().ok_or_else(|| {
+            "NTFS resident index is unavailable after synchronization".to_string()
+        })?;
+        if stats.changes_read > 0 && stats.namespace_changes == 0 {
+            current.skipped_batches += 1;
+            current.skipped_records += stats.changes_read as u64;
         }
-        return Ok((true, None));
+        plan_persistence(
+            current.dirty,
+            stats.rebuilt,
+            stats.scope_changed,
+            has_outputs,
+            current.state_unsaved,
+            current.last_state_write.elapsed(),
+            !watch,
+        )
+    };
+
+    match plan {
+        PersistPlan::Nothing => {
+            if !watch {
+                let cursor = resident.as_ref().map_or(0, |current| current.cursor);
+                println!(
+                    "NTFS index on {} is up to date at USN {}; no changes to apply.",
+                    volume.volume, cursor
+                );
+            }
+            return Ok((true, None));
+        }
+        PersistPlan::StateOnly => {
+            let (state, skipped_batches, skipped_records) = {
+                let current = resident.as_ref().ok_or_else(|| {
+                    "NTFS resident index is unavailable after synchronization".to_string()
+                })?;
+                (
+                    current.snapshot_state(&volume.roots, volume.max_depth),
+                    current.skipped_batches,
+                    current.skipped_records,
+                )
+            };
+            // A failed cursor write cannot make the snapshot wrong (it still matches the graph),
+            // so it never marks the volume stale; retry after the next interval.
+            let result = persist_state_only(&state, &volume.state_path);
+            if let Some(current) = resident.as_mut() {
+                current.last_state_write = Instant::now();
+                if result.is_ok() {
+                    current.state_unsaved = false;
+                    current.skipped_batches = 0;
+                    current.skipped_records = 0;
+                }
+            }
+            match result {
+                Ok(()) => println!(
+                    "Saved NTFS cursor on {} at USN {}; {} batch(es) / {} journal record(s) since the last save changed no names, so no snapshot export was needed.",
+                    volume.volume, state.cursor, skipped_batches, skipped_records
+                ),
+                Err(error) => eprintln!(
+                    "Could not save the NTFS cursor for {}: {error}. The snapshot is still current; retrying later.",
+                    volume.volume
+                ),
+            }
+            return Ok((true, None));
+        }
+        PersistPlan::Full => {}
     }
 
-    // Clone the MFT entries only when a real journal/scope change needs persistence. The much
+    // Clone the MFT entries only when a real name/scope change needs persistence. The much
     // larger FRN HashMap and mutable graph remain resident and are not rebuilt every poll.
-    let state = current.snapshot_state(&volume.roots, volume.max_depth);
+    let (state, skipped_batches, skipped_records) = {
+        let current = resident.as_ref().ok_or_else(|| {
+            "NTFS resident index is unavailable after synchronization".to_string()
+        })?;
+        (
+            current.snapshot_state(&volume.roots, volume.max_depth),
+            current.skipped_batches,
+            current.skipped_records,
+        )
+    };
     match persist_outputs(&state, &volume.snapshot_path, &volume.state_path) {
         Ok(indexed) => {
             if let Some(current) = resident.as_mut() {
                 current.roots = volume.roots.clone();
                 current.max_depth = volume.max_depth;
                 current.dirty = false;
+                current.state_unsaved = false;
+                current.last_state_write = Instant::now();
+                current.skipped_batches = 0;
+                current.skipped_records = 0;
             }
             if stats.rebuilt {
                 println!(
@@ -947,11 +1107,14 @@ fn sync_volume_round(
                 );
             } else {
                 println!(
-                    "Applied {} USN journal records on {} (cursor {} -> {}); {} paths exported.",
+                    "Applied {} USN journal records on {} (cursor {} -> {}; {} changed names; {} earlier batch(es) / {} record(s) changed none); {} paths exported.",
                     stats.changes_read,
                     volume.volume,
                     stats.cursor_before,
                     stats.cursor_after,
+                    stats.namespace_changes,
+                    skipped_batches,
+                    skipped_records,
                     indexed
                 );
             }
@@ -975,6 +1138,29 @@ fn sync_volume_round(
             }
             Err(error)
         }
+    }
+}
+
+/// Best-effort write of a cursor that is ahead of the saved one, used at graceful shutdown so
+/// the next start replays as little journal as possible. Skipped when a full persist is owed
+/// (the snapshot would not match) or when nothing is pending.
+fn flush_pending_cursor(volume: &VolumeConfig, resident: &Option<ResidentVolumeIndex>) {
+    let Some(current) = resident.as_ref() else {
+        return;
+    };
+    if !current.state_unsaved || current.dirty {
+        return;
+    }
+    let state = current.snapshot_state(&volume.roots, volume.max_depth);
+    match persist_state_only(&state, &volume.state_path) {
+        Ok(()) => println!(
+            "Saved NTFS cursor on {} at USN {} before shutdown.",
+            volume.volume, state.cursor
+        ),
+        Err(error) => eprintln!(
+            "Could not save the NTFS cursor for {} at shutdown: {error}.",
+            volume.volume
+        ),
     }
 }
 
@@ -1071,6 +1257,9 @@ pub(super) fn run_many(
         if shutdown.sleep(Duration::from_secs(poll_seconds)) {
             break;
         }
+    }
+    for (position, volume) in volumes.iter().enumerate() {
+        flush_pending_cursor(volume, &resident[position]);
     }
     Ok(())
 }
@@ -1698,5 +1887,293 @@ mod tests {
             }
         )
         .is_none());
+    }
+
+    fn change(
+        file_reference: u64,
+        parent: u64,
+        name: &str,
+        is_dir: bool,
+        reason: u32,
+    ) -> UsnChange {
+        UsnChange {
+            file_reference,
+            parent_reference: parent,
+            usn: 0,
+            reason,
+            name: name.into(),
+            is_dir,
+        }
+    }
+
+    #[test]
+    fn apply_reports_whether_names_changed() {
+        const DATA_EXTEND: u32 = 0x0000_0002;
+        const CLOSE: u32 = 0x8000_0000;
+        const RENAME_NEW_NAME: u32 = 0x0000_2000;
+        let mut index = MutableIndex::new(sample_state().entries);
+
+        // A write/close notification for an entry that already has this exact name and parent.
+        assert!(!index.apply(change(22, 21, "notes.txt", false, DATA_EXTEND | CLOSE)));
+        // Close-only record with no name never erases or changes a known entry.
+        assert!(!index.apply(change(22, 21, "", false, CLOSE)));
+        // Rename, move to another parent, and directory-flag changes are all name changes.
+        assert!(index.apply(change(22, 21, "renamed.txt", false, RENAME_NEW_NAME)));
+        assert!(index.apply(change(22, 20, "renamed.txt", false, RENAME_NEW_NAME)));
+        assert!(index.apply(change(22, 20, "renamed.txt", true, RENAME_NEW_NAME)));
+        // Repeating the final state is a no-op again.
+        assert!(!index.apply(change(22, 20, "renamed.txt", true, CLOSE)));
+        // A brand-new entry is a change; deleting it is a change; deleting it again is not.
+        assert!(index.apply(change(99, 21, "new.txt", false, 0x0000_0100)));
+        assert!(index.apply(change(99, 21, "new.txt", false, USN_REASON_FILE_DELETE)));
+        assert!(!index.apply(change(99, 21, "new.txt", false, USN_REASON_FILE_DELETE)));
+    }
+
+    #[test]
+    fn batch_effect_counts_only_name_changes() {
+        let mut index = MutableIndex::new(sample_state().entries);
+        let effect = apply_changes_counted(
+            &mut index,
+            vec![
+                change(22, 21, "notes.txt", false, 0x0000_0002),
+                change(22, 21, "notes.txt", false, 0x8000_0000),
+                change(21, 20, "barda", true, 0x0000_0004),
+                change(22, 21, "notes2.txt", false, 0x0000_2000),
+            ],
+        );
+        assert_eq!(
+            effect,
+            BatchEffect {
+                records: 4,
+                namespace_changes: 1
+            }
+        );
+        // The batch that only touched existing names reports none.
+        let neutral = apply_changes_counted(
+            &mut index,
+            vec![change(22, 21, "notes2.txt", false, 0x8000_0000)],
+        );
+        assert_eq!(neutral.namespace_changes, 0);
+        assert_eq!(index.live_count(), 3);
+    }
+
+    #[test]
+    fn persistence_plan_exports_only_for_name_scope_or_failure_changes() {
+        let idle = Duration::from_secs(1);
+        let due = CURSOR_PERSIST_INTERVAL;
+        use PersistPlan::*;
+        // (dirty, rebuilt, scope, has_outputs, unsaved, since, force) -> plan
+        let cases = [
+            ((false, false, false, true, false, idle, false), Nothing),
+            ((false, false, false, true, true, idle, false), Nothing),
+            ((false, false, false, true, true, due, false), StateOnly),
+            ((false, false, false, true, true, idle, true), StateOnly),
+            ((false, false, false, true, false, due, true), Nothing),
+            ((true, false, false, true, true, due, false), Full),
+            ((false, true, false, true, false, idle, false), Full),
+            ((false, false, true, true, false, idle, false), Full),
+            ((false, false, false, false, false, idle, false), Full),
+        ];
+        for ((dirty, rebuilt, scope, outputs, unsaved, since, force), expected) in cases {
+            assert_eq!(
+                plan_persistence(dirty, rebuilt, scope, outputs, unsaved, since, force),
+                expected,
+                "dirty={dirty} rebuilt={rebuilt} scope={scope} outputs={outputs} unsaved={unsaved} since={since:?} force={force}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_only_save_round_trips_and_leaves_the_snapshot_untouched() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("okra-cursor-only-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let snapshot = dir.join("snap.tsv");
+        let state_path = dir.join("snap.state");
+
+        let state = sample_state();
+        persist_outputs(&state, &snapshot, &state_path).unwrap();
+        let snapshot_before = fs::read(&snapshot).unwrap();
+        let stamp_before = fs::metadata(&snapshot).unwrap().modified().unwrap();
+
+        let mut resident = ResidentVolumeIndex::from_state(sample_state(), false);
+        resident.cursor = 5_000;
+        let later = resident.snapshot_state(&state.roots, state.max_depth);
+        persist_state_only(&later, &state_path).unwrap();
+
+        let loaded = load_state(&state_path).unwrap().unwrap();
+        assert_eq!(loaded.cursor, 5_000);
+        assert_eq!(loaded.entries.len(), 3);
+        assert_eq!(fs::read(&snapshot).unwrap(), snapshot_before);
+        assert_eq!(
+            fs::metadata(&snapshot).unwrap().modified().unwrap(),
+            stamp_before
+        );
+        assert!(!state_path.with_extension("state.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Randomized simulation of the sync loop with a fake disk and random crashes. Invariants:
+    /// (1) whenever the plan is not `Full`, the saved snapshot's names equal the live graph's;
+    /// (2) after any crash and replay from the saved cursor, the graph equals the ground truth
+    ///     and `dirty` is set whenever the graph differs from the saved snapshot, so the stale
+    ///     snapshot is always rewritten before it can be trusted.
+    #[test]
+    fn skipped_exports_never_leave_a_stale_snapshot_across_crashes() {
+        type Names = Vec<(u64, u64, String, bool)>;
+        fn names(index: &MutableIndex) -> Names {
+            let mut all: Names = index
+                .entries
+                .iter()
+                .flatten()
+                .map(|e| {
+                    (
+                        e.file_reference,
+                        e.parent_reference,
+                        e.name.clone(),
+                        e.is_dir,
+                    )
+                })
+                .collect();
+            all.sort();
+            all
+        }
+        let mut seed = 0x0DDB_1A5E_5BAD_5EEDu64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        const DELETE: u32 = USN_REASON_FILE_DELETE;
+        for _round in 0..300 {
+            let mut log: Vec<UsnChange> = Vec::new();
+            // Independent ground truth: a plain map with the documented record semantics
+            // (delete removes, nameless records are ignored, anything else sets the entry).
+            let mut truth: std::collections::BTreeMap<u64, (u64, String, bool)> = sample_state()
+                .entries
+                .iter()
+                .map(|e| {
+                    (
+                        e.file_reference,
+                        (e.parent_reference, e.name.clone(), e.is_dir),
+                    )
+                })
+                .collect();
+            let truth_names =
+                |truth: &std::collections::BTreeMap<u64, (u64, String, bool)>| -> Names {
+                    truth
+                        .iter()
+                        .map(|(frn, (parent, name, is_dir))| (*frn, *parent, name.clone(), *is_dir))
+                        .collect()
+                };
+            let mut live = MutableIndex::new(sample_state().entries);
+            // Fake disk: snapshot names, and saved (entries, cursor).
+            let mut snapshot = names(&live);
+            let mut saved_entries = sample_state().entries;
+            let mut saved_cursor = 0usize;
+            let mut dirty = false;
+
+            for _step in 0..60 {
+                // Build a batch: mostly name-neutral touches, sometimes real changes.
+                let mut batch = Vec::new();
+                for _ in 0..(1 + next() % 4) {
+                    let frn = 20 + next() % 6;
+                    let record = match next() % 6 {
+                        0 => change(
+                            frn,
+                            20 + next() % 3,
+                            &format!("n{}", next() % 3),
+                            next() % 4 == 0,
+                            0x100,
+                        ),
+                        1 => change(frn, 20, "x", false, DELETE),
+                        2 => change(frn, 21, &format!("r{}", next() % 2), false, 0x2000),
+                        _ => {
+                            // Touch with whatever the entry currently is (name-neutral).
+                            match live
+                                .by_reference
+                                .get(&frn)
+                                .and_then(|p| live.entries[*p].clone())
+                            {
+                                Some(e) => {
+                                    change(frn, e.parent_reference, &e.name, e.is_dir, 0x8000_0002)
+                                }
+                                None => change(frn, 21, "", false, 0x8000_0000),
+                            }
+                        }
+                    };
+                    batch.push(record);
+                }
+                for record in &batch {
+                    log.push(record.clone());
+                    if record.reason & DELETE != 0 {
+                        truth.remove(&record.file_reference);
+                    } else if !record.name.is_empty() {
+                        truth.insert(
+                            record.file_reference,
+                            (record.parent_reference, record.name.clone(), record.is_dir),
+                        );
+                    }
+                }
+                let effect = apply_changes_counted(&mut live, batch);
+                if effect.namespace_changes > 0 {
+                    dirty = true;
+                }
+                assert_eq!(
+                    names(&live),
+                    truth_names(&truth),
+                    "graph diverged from ground truth"
+                );
+
+                let since = if next() % 3 == 0 {
+                    CURSOR_PERSIST_INTERVAL
+                } else {
+                    Duration::from_secs(1)
+                };
+                let plan = plan_persistence(dirty, false, false, true, true, since, false);
+                if plan != PersistPlan::Full {
+                    assert_eq!(snapshot, names(&live), "stale snapshot with plan {plan:?}");
+                }
+                match plan {
+                    PersistPlan::Full => {
+                        snapshot = names(&live);
+                        saved_entries = live.snapshot_entries();
+                        saved_cursor = log.len();
+                        dirty = false;
+                    }
+                    PersistPlan::StateOnly => {
+                        saved_entries = live.snapshot_entries();
+                        saved_cursor = log.len();
+                    }
+                    PersistPlan::Nothing => {}
+                }
+
+                // Random crash: restart from the saved state and replay the journal suffix.
+                if next() % 7 == 0 {
+                    live = MutableIndex::new(saved_entries.clone());
+                    dirty = false;
+                    let suffix = log[saved_cursor..].to_vec();
+                    let effect = apply_changes_counted(&mut live, suffix);
+                    if effect.namespace_changes > 0 {
+                        dirty = true;
+                    }
+                    assert_eq!(
+                        names(&live),
+                        truth_names(&truth),
+                        "replay diverged from ground truth"
+                    );
+                    if snapshot != names(&live) {
+                        assert!(
+                            dirty,
+                            "snapshot differs from graph after restart but dirty is false"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

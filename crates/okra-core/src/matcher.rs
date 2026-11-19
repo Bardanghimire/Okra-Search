@@ -296,20 +296,20 @@ fn sparse_core<T: Copy + Into<char>>(
     };
 
     prev.clear();
-    for j in 0..n {
-        if Into::<char>::into(tl[j]) == q[0] {
+    for (j, &value) in tl.iter().take(n).enumerate() {
+        if Into::<char>::into(value) == q[0] {
             prev.push((j as u32, bonus_at(j) - (j as i64).min(10)));
         }
     }
-    for i in 1..m {
+    for (i, &query_char) in q.iter().enumerate().skip(1) {
         cur.clear();
         // `far` walks the previous row once: it accumulates the running maximum over all
         // k <= j - 7 (same capped gap penalty), the smallest k winning ties.
         let mut far_val = NEG;
         let mut far_ptr = 0usize;
         let mut near_ptr = 0usize;
-        for j in i..n {
-            if Into::<char>::into(tl[j]) != q[i] {
+        for (j, &value) in tl.iter().take(n).enumerate().skip(i) {
+            if Into::<char>::into(value) != query_char {
                 continue;
             }
             while far_ptr < prev.len() && (prev[far_ptr].0 as usize) + 7 <= j {
@@ -848,7 +848,11 @@ mod tests {
                 // true prefix, true subsequence, or arbitrary short query
                 0 => {
                     let take = 1 + (next() % len as u64) as usize;
-                    lower.chars().take(take).filter(|c| !c.is_whitespace()).collect()
+                    lower
+                        .chars()
+                        .take(take)
+                        .filter(|c| !c.is_whitespace())
+                        .collect()
                 }
                 1 => lower
                     .chars()
@@ -866,12 +870,20 @@ mod tests {
             for lower_arg in [Some(lower.as_str()), None] {
                 let dp = run_dp(&q, &text, lower_arg, None);
                 let sparse = run_sparse(&q, &text, lower_arg);
-                assert_eq!(dp, sparse, "text {text:?} query {q:?} lower={}", lower_arg.is_some());
+                assert_eq!(
+                    dp,
+                    sparse,
+                    "text {text:?} query {q:?} lower={}",
+                    lower_arg.is_some()
+                );
                 compared += 1;
                 matched += dp.is_some() as usize;
             }
         }
-        assert!(matched > 200_000, "too few matching cases: {matched}/{compared}");
+        assert!(
+            matched > 200_000,
+            "too few matching cases: {matched}/{compared}"
+        );
     }
 
     /// The non-prefix ceiling must hold for every non-prefix candidate (it is what lets the
