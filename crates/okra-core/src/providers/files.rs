@@ -1,6 +1,8 @@
 use super::{Action, Item, Kind, Provider};
 use crate::config::Config;
-use crate::matcher::{char_mask, is_subsequence, lc, score, score_with_lower, Query};
+use crate::matcher::{char_mask, file_name_score, lc, score, Query};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use walkdir::WalkDir;
@@ -323,7 +325,10 @@ fn cache_path() -> Option<PathBuf> {
 
 /// Identifies what the cache was built from; a cache for other folders or another depth is ignored.
 fn cache_header(roots: &[PathBuf], max_depth: usize) -> String {
-    let roots: Vec<String> = roots.iter().map(|r| r.to_string_lossy().into_owned()).collect();
+    let roots: Vec<String> = roots
+        .iter()
+        .map(|r| r.to_string_lossy().into_owned())
+        .collect();
     format!("{CACHE_MAGIC}\t{max_depth}\t{}", roots.join("|"))
 }
 
@@ -332,7 +337,9 @@ fn serialize_index(data: &IndexData, roots: &[PathBuf], max_depth: usize) -> Str
     text.push('\n');
     for entry in &data.entries {
         // Names that could not survive a text line are simply left out of the cache.
-        let Some(path) = entry.path.to_str() else { continue };
+        let Some(path) = entry.path.to_str() else {
+            continue;
+        };
         if path.contains(['\t', '\n', '\r']) {
             continue;
         }
@@ -354,8 +361,15 @@ fn parse_index(text: &str, roots: &[PathBuf], max_depth: usize) -> Option<IndexD
     for line in lines {
         let (flag, path) = line.split_once('\t')?;
         let path = PathBuf::from(path);
-        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
-        entries.push(FileEntry { lower: name.chars().map(lc).collect(), name, path, is_dir: flag == "D" });
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        entries.push(FileEntry {
+            lower: name.chars().map(lc).collect(),
+            name,
+            path,
+            is_dir: flag == "D",
+        });
     }
     let mut data = IndexData::default();
     data.extend(entries);
@@ -381,7 +395,10 @@ fn build_index(roots: Vec<PathBuf>, max_depth: usize) -> Index {
         // A saved index answers searches right away; the scan below then replaces it.
         let mut warm = false;
         if let Some(path) = &cache_file {
-            if let Some(data) = std::fs::read_to_string(path).ok().and_then(|text| parse_index(&text, &roots, max_depth)) {
+            if let Some(data) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| parse_index(&text, &roots, max_depth))
+            {
                 *shared.write().unwrap() = data;
                 warm = true;
             }
@@ -429,29 +446,34 @@ impl FileBackend for Builtin {
             .get_or_init(|| build_index(self.roots.clone(), self.depth))
             .read()
             .unwrap();
-        // (score, position in index). Higher score first; equal scores keep index order.
-        let mut hits: Vec<(i64, usize)> = Vec::new();
-        let qm = query.mask();
+        if max == 0 {
+            return Some(Vec::new());
+        }
+        // Keep only the best candidates as they are scored. This bounds temporary memory for
+        // broad queries and applies the same exact-basename ranking as the elevated helper.
+        let mut best: BinaryHeap<Reverse<(i64, Reverse<usize>)>> = BinaryHeap::with_capacity(max);
+        let required = query.mask();
         for (pos, &mask) in idx.masks.iter().enumerate() {
-            if mask & qm != qm {
+            if mask & required != required {
                 continue; // lacks one of the query's characters: cannot match
             }
-            let e = &idx.entries[pos];
-            if is_subsequence(query.chars(), &e.lower) {
-                if let Some(s) = score_with_lower(&query, &e.name, &e.lower) {
-                    hits.push((s, pos));
+            let entry = &idx.entries[pos];
+            if let Some(rank) = file_name_score(&query, &entry.name, &entry.lower, entry.is_dir) {
+                let quality = (rank, Reverse(pos));
+                let candidate = Reverse(quality);
+                if best.len() < max {
+                    best.push(candidate);
+                } else if best.peek().is_some_and(|worst| quality > worst.0) {
+                    best.pop();
+                    best.push(candidate);
                 }
             }
         }
-        // Only the best `max` are needed: select them in O(n) and sort just those, instead of
-        // sorting every hit (a short query like "ch" can match a large share of the index).
-        let order = |a: &(i64, usize), b: &(i64, usize)| b.0.cmp(&a.0).then(a.1.cmp(&b.1));
-        if max > 0 && hits.len() > max {
-            hits.select_nth_unstable_by(max - 1, order);
-            hits.truncate(max);
-        }
-        hits.sort_by(order);
-        hits.truncate(max);
+        let mut hits: Vec<(i64, usize)> = best
+            .into_iter()
+            .map(|Reverse((rank, Reverse(position)))| (rank, position))
+            .collect();
+        hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         Some(
             hits.into_iter()
                 .map(|(_, pos)| (idx.entries[pos].path.clone(), idx.entries[pos].is_dir))
@@ -554,11 +576,10 @@ impl Provider for FilesProvider {
                         .unwrap_or_else(|| path.display().to_string());
                     // Helper results are ranked by basename; use the full path as a secondary
                     // match so folder names can still help a result surface.
-                    let rank = score(&query, &name)
+                    let lower_name: String = name.chars().map(lc).collect();
+                    let rank = file_name_score(&query, &name, &lower_name, is_dir)
                         .or_else(|| score(&query, &path.display().to_string()).map(|s| s - 40))
-                        .unwrap_or(-60)
-                        - 10
-                        + if is_dir { 5 } else { 0 };
+                        .unwrap_or(-60);
                     Item {
                         id: format!("file:{}", path.display()),
                         subtitle: path
@@ -641,14 +662,19 @@ mod tests {
 
         let roots = vec![dir.clone()];
         let mut scanned = IndexData::default();
-        scan(&roots, 8, &mut |batch: &mut Vec<FileEntry>| scanned.extend(batch.drain(..)));
+        scan(&roots, 8, &mut |batch: &mut Vec<FileEntry>| {
+            scanned.extend(batch.drain(..))
+        });
         assert_eq!(scanned.entries.len(), 3); // a.txt, sub, sub/b.txt
 
         let text = serialize_index(&scanned, &roots, 8);
         let loaded = parse_index(&text, &roots, 8).unwrap();
         assert_eq!(loaded.entries.len(), 3);
         assert_eq!(loaded.masks.len(), 3);
-        assert!(loaded.entries.iter().any(|e| e.name == "b.txt" && !e.is_dir));
+        assert!(loaded
+            .entries
+            .iter()
+            .any(|e| e.name == "b.txt" && !e.is_dir));
         assert!(loaded.entries.iter().any(|e| e.name == "sub" && e.is_dir));
 
         assert!(parse_index(&text, &roots, 3).is_none()); // other depth
@@ -682,6 +708,43 @@ mod tests {
         }
         let ms = t.elapsed().as_secs_f64() * 1e3 / queries.len() as f64;
         println!("built-in index, 300k entries: {ms:.2} ms / query (returned {total} rows)");
+    }
+    #[test]
+    fn walker_fallback_prefers_exact_filename_and_uses_bounded_results() {
+        let mut data = IndexData::default();
+        data.extend([
+            FileEntry {
+                name: "Hosts".into(),
+                lower: "hosts".into(),
+                path: PathBuf::from(r"C:\Hosts"),
+                is_dir: true,
+            },
+            FileEntry {
+                name: "hosts".into(),
+                lower: "hosts".into(),
+                path: PathBuf::from(r"C:\Windows\System32\drivers\etc\hosts"),
+                is_dir: false,
+            },
+            FileEntry {
+                name: "hosts-backup".into(),
+                lower: "hosts-backup".into(),
+                path: PathBuf::from(r"C:\backup\hosts-backup"),
+                is_dir: false,
+            },
+        ]);
+        let backend = Builtin {
+            roots: Vec::new(),
+            depth: 0,
+            index: OnceLock::new(),
+        };
+        assert!(backend.index.set(Arc::new(RwLock::new(data))).is_ok());
+        let results = backend.search("hosts", 2).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].0,
+            PathBuf::from(r"C:\Windows\System32\drivers\etc\hosts")
+        );
+        assert!(!results[0].1);
     }
 }
 

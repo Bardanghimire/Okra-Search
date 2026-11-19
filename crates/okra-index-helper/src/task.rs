@@ -31,7 +31,7 @@ pub struct TaskSpec {
 
 #[derive(Clone, Debug)]
 pub struct InstallRequest {
-    pub volume: String,
+    pub volumes: Vec<String>,
     pub output: String,
     pub state: String,
     pub max_depth: usize,
@@ -87,14 +87,17 @@ pub fn join_arguments(arguments: &[String]) -> Result<String, String> {
 /// Arguments the scheduled helper runs with: the same index configuration the user tested
 /// manually, plus `--serve` (pipe + watch) and `--background` (no console, log file).
 pub fn helper_arguments(request: &InstallRequest) -> Vec<String> {
-    let mut args = vec![
-        "--volume".to_string(),
-        request.volume.clone(),
+    let mut args = Vec::with_capacity(12 + request.volumes.len() * 2);
+    for volume in &request.volumes {
+        args.push("--volume".to_string());
+        args.push(volume.clone());
+    }
+    args.extend([
         "--output".to_string(),
         request.output.clone(),
         "--state".to_string(),
         request.state.clone(),
-    ];
+    ]);
     if request.full_volume {
         args.push("--full-volume".to_string());
     } else {
@@ -466,7 +469,7 @@ mod tests {
     #[test]
     fn scheduled_arguments_repeat_the_manual_configuration_and_add_serve_and_background() {
         let request = InstallRequest {
-            volume: "C:".into(),
+            volumes: vec!["C:".into()],
             output: r"C:\Users\barda\AppData\Local\okra-brown-search\mft-snapshot.tsv".into(),
             state: r"C:\Users\barda\AppData\Local\okra-brown-search\mft-snapshot.state".into(),
             max_depth: 8,
@@ -485,9 +488,32 @@ mod tests {
     }
 
     #[test]
+    fn multiple_full_volumes_are_preserved_in_task_arguments() {
+        let request = InstallRequest {
+            volumes: vec!["C:".into(), "D:".into()],
+            output: r"C:\Users\barda\AppData\Local\okra-brown-search\mft-snapshot.tsv".into(),
+            state: r"C:\Users\barda\AppData\Local\okra-brown-search\mft-snapshot.state".into(),
+            max_depth: usize::MAX,
+            roots: Vec::new(),
+            full_volume: true,
+            poll_seconds: 1,
+        };
+        let args = helper_arguments(&request);
+        let volume_args: Vec<&str> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--volume")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(volume_args, vec!["C:", "D:"]);
+        assert!(args.iter().any(|arg| arg == "--full-volume"));
+        assert!(args.iter().any(|arg| arg == "--serve"));
+        assert!(args.iter().any(|arg| arg == "--background"));
+    }
+
+    #[test]
     fn full_volume_task_arguments_preserve_full_volume_scope() {
         let request = InstallRequest {
-            volume: "C:".into(),
+            volumes: vec!["C:".into()],
             output: r"C:\Users\barda\AppData\Local\okra-brown-search\mft-snapshot.tsv".into(),
             state: r"C:\Users\barda\AppData\Local\okra-brown-search\mft-snapshot.state".into(),
             max_depth: usize::MAX,

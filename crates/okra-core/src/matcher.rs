@@ -66,14 +66,20 @@ pub fn is_subsequence(q: &[char], text: &str) -> bool {
 /// A query prepared once per search and reused for every candidate.
 pub struct Query {
     chars: Vec<char>,
+    normalized: String,
     mask: u64,
 }
 
 impl Query {
     pub fn new(query: &str) -> Self {
         let chars = normalize(query);
+        let normalized = chars.iter().copied().collect();
         let mask = char_mask(chars.iter().copied());
-        Self { chars, mask }
+        Self {
+            chars,
+            normalized,
+            mask,
+        }
     }
     /// See [`char_mask`]: `entry_mask & query.mask() == query.mask()` is necessary for a match.
     pub fn mask(&self) -> u64 {
@@ -81,6 +87,10 @@ impl Query {
     }
     pub fn chars(&self) -> &[char] {
         &self.chars
+    }
+    /// Lowercased query with whitespace removed, matching the filename normalization rules.
+    pub fn normalized(&self) -> &str {
+        &self.normalized
     }
     pub fn len(&self) -> usize {
         self.chars.len()
@@ -114,6 +124,50 @@ pub fn score(query: &Query, text: &str) -> Option<i64> {
 /// (same number of chars as `text`); saves lowercasing every candidate on every keystroke.
 pub fn score_with_lower(query: &Query, text: &str, lower: &str) -> Option<i64> {
     run(&query.chars, text, Some(lower), None)
+}
+
+const EXACT_FILENAME_SCORE: i64 = 100_000;
+const PREFIX_FILENAME_BONUS: i64 = 50_000;
+
+/// Filename-specific score shared by the NTFS helper and the unprivileged fallback.
+/// Exact basename matches beat prefixes, prefixes beat fuzzy matches, and exact files beat
+/// same-named directories.
+pub fn file_name_score(query: &Query, name: &str, lower: &str, is_dir: bool) -> Option<i64> {
+    // Exact names need no dynamic-programming pass. Use a separate score band rather than a
+    // small additive bonus: long (but valid) fuzzy names can otherwise accumulate enough
+    // boundary bonuses to outrank an exact filename. Windows basename limits keep the fuzzy
+    // score comfortably below this band.
+    if normalized_name_eq(lower, query.normalized()) {
+        return Some(EXACT_FILENAME_SCORE + if is_dir { -3 } else { 3 });
+    }
+
+    let mut value = score_with_lower(query, name, lower)?;
+    // Prefix matches get their own band, above fuzzy alignments. Query normalization removes
+    // whitespace, so check the same normalized view without allocating per candidate.
+    if normalized_name_starts_with(lower, query.normalized()) {
+        value += PREFIX_FILENAME_BONUS;
+    }
+    value += if is_dir { -3 } else { 3 };
+    Some(value)
+}
+
+fn normalized_name_eq(lower: &str, normalized_query: &str) -> bool {
+    lower
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .eq(normalized_query.chars())
+}
+
+fn normalized_name_starts_with(lower: &str, normalized_query: &str) -> bool {
+    let mut query = normalized_query.chars();
+    for character in lower.chars().filter(|character| !character.is_whitespace()) {
+        match query.next() {
+            Some(expected) if character == expected => {}
+            Some(_) => return false,
+            None => return true,
+        }
+    }
+    query.next().is_none()
 }
 
 /// Score plus the matched character positions.
@@ -320,6 +374,55 @@ mod tests {
                 > fuzzy("vsc", "advisoryscan").unwrap().score
         );
     }
+    #[test]
+    fn exact_filename_beats_a_same_named_directory() {
+        let query = Query::new("hosts");
+        let file = file_name_score(&query, "hosts", "hosts", false).unwrap();
+        let directory = file_name_score(&query, "Hosts", "hosts", true).unwrap();
+        let fuzzy = file_name_score(&query, "hosts-backup", "hosts-backup", false).unwrap();
+        assert!(file > directory);
+        assert!(file > fuzzy);
+    }
+
+    #[test]
+    fn exact_filename_stem_beats_a_fuzzy_match() {
+        let query = Query::new("cargo");
+        let exact_stem = file_name_score(&query, "Cargo.toml", "cargo.toml", false).unwrap();
+        let scattered =
+            file_name_score(&query, "c_a_r_g_o_notes", "c_a_r_g_o_notes", false).unwrap();
+        assert!(exact_stem > scattered);
+    }
+
+    #[test]
+    fn exact_and_prefix_bands_beat_long_boundary_heavy_fuzzy_names() {
+        let query_text = "a".repeat(128);
+        let query = Query::new(&query_text);
+        let exact = file_name_score(&query, &query_text, &query_text, false).unwrap();
+
+        // 255 characters: every query letter after the first follows a separator and receives
+        // a word-boundary bonus. This used to score above the old 2,000-point exact bonus.
+        let fuzzy_name = format!("{}a", "a_".repeat(127));
+        assert_eq!(fuzzy_name.chars().count(), 255);
+        let fuzzy = file_name_score(&query, &fuzzy_name, &fuzzy_name, false).unwrap();
+
+        let prefix_name = format!("{query_text}z");
+        let prefix = file_name_score(&query, &prefix_name, &prefix_name, false).unwrap();
+        assert!(exact > prefix, "exact={exact}, prefix={prefix}");
+        assert!(prefix > fuzzy, "prefix={prefix}, fuzzy={fuzzy}");
+    }
+
+    #[test]
+    fn exact_and_prefix_filename_ranking_ignore_whitespace() {
+        let exact_query = Query::new("my file");
+        let exact = file_name_score(&exact_query, "My File", "my file", false).unwrap();
+        let fuzzy =
+            file_name_score(&exact_query, "my final report", "my final report", false).unwrap();
+        assert!(exact > fuzzy);
+
+        let prefix_query = Query::new("my f");
+        assert!(file_name_score(&prefix_query, "My Folder.txt", "my folder.txt", false,).is_some());
+    }
+
     #[test]
     fn no_match() {
         assert!(fuzzy("xyz", "firefox").is_none());

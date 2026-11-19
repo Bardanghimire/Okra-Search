@@ -104,7 +104,10 @@ impl Engine {
     fn kind_bias(kind: Kind) -> i64 {
         match kind {
             Kind::Calculation => 0,
-            Kind::App => 70,
+            // Keep launcher/app results above the filename-specific exact-match score band.
+            // Explicit `f ` searches route only to Files, while unprefixed `chrome` should still
+            // put the Chrome application ahead of an exact `chrome.exe` filename.
+            Kind::App => 200_000,
             Kind::Window => 40,
             Kind::Setting => 10,
             Kind::Folder | Kind::File => 0,
@@ -129,6 +132,28 @@ impl Engine {
         emit: &mut dyn FnMut(Vec<Item>),
         stale: &dyn Fn() -> bool,
     ) {
+        self.search_progressive_inner(raw, emit, std::time::Duration::ZERO, stale);
+    }
+
+    /// UI search variant: keep instant results immediate, but let rapid keystrokes coalesce before
+    /// touching the slower file provider. A newer generation cancels this pause without ever
+    /// opening the NTFS pipe or scanning the local fallback for an obsolete query.
+    pub fn search_progressive_for_typing(
+        &self,
+        raw: &str,
+        emit: &mut dyn FnMut(Vec<Item>),
+        stale: &dyn Fn() -> bool,
+    ) {
+        self.search_progressive_inner(raw, emit, std::time::Duration::from_millis(55), stale);
+    }
+
+    fn search_progressive_inner(
+        &self,
+        raw: &str,
+        emit: &mut dyn FnMut(Vec<Item>),
+        slow_delay: std::time::Duration,
+        stale: &dyn Fn() -> bool,
+    ) {
         if raw.trim().is_empty() {
             emit(Vec::new());
             return;
@@ -149,6 +174,21 @@ impl Engine {
         }
         if stale() {
             return;
+        }
+        if !slow_delay.is_zero() {
+            // Don't launch an expensive file lookup for every intermediate character. Fast
+            // sources above remain immediate; this short quiet window only gates the file phase.
+            let delay_started = std::time::Instant::now();
+            while delay_started.elapsed() < slow_delay {
+                if stale() {
+                    return;
+                }
+                let remaining = slow_delay.saturating_sub(delay_started.elapsed());
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(5)));
+            }
+            if stale() {
+                return;
+            }
         }
         for provider in &slow {
             items.extend(provider.query(query, self.max_results));
@@ -281,6 +321,30 @@ mod tests {
     }
 
     #[test]
+    fn app_results_remain_ahead_of_exact_files_in_default_search() {
+        let engine = Engine::with_providers(Vec::new(), History::in_memory(), 10);
+        let app = Item {
+            id: "app:chrome".into(),
+            title: "Chrome".into(),
+            subtitle: String::new(),
+            kind: Kind::App,
+            action: Action::Copy("chrome".into()),
+            score: 120,
+        };
+        let exact_file = Item {
+            id: "file:chrome.exe".into(),
+            title: "chrome.exe".into(),
+            subtitle: String::new(),
+            kind: Kind::File,
+            action: Action::Copy("chrome.exe".into()),
+            score: 100_003,
+        };
+        let ranked = engine.rank(vec![exact_file, app], "chrome");
+        assert_eq!(ranked[0].id, "app:chrome");
+        assert_eq!(ranked[1].id, "file:chrome.exe");
+    }
+
+    #[test]
     fn prefix_routes_exclusively() {
         let engine = Engine::with_providers(
             vec![
@@ -326,6 +390,28 @@ mod tests {
         engine.search_progressive("   ", &mut |items| idle.push(items.len()), &|| false);
         assert_eq!(idle, vec![0], "an empty query shows nothing");
         assert!(engine.search("").is_empty());
+    }
+
+    #[test]
+    fn typing_search_cancels_file_phase_when_a_newer_query_arrives() {
+        let engine = Engine::with_providers(
+            vec![
+                Box::new(Fake("a", None, true)),
+                Box::new(Fake("Files", None, true)),
+            ],
+            History::in_memory(),
+            10,
+        );
+        let stale_checks = std::sync::atomic::AtomicUsize::new(0);
+        let mut batches = 0;
+        engine.search_progressive_for_typing("x", &mut |_| batches += 1, &|| {
+            stale_checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 1
+        });
+        assert_eq!(
+            batches, 1,
+            "the instant batch is kept, stale file work is skipped"
+        );
+        assert!(stale_checks.load(std::sync::atomic::Ordering::Relaxed) >= 2);
     }
 
     #[test]

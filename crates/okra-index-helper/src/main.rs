@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 struct Args {
-    volume: String,
+    volumes: Vec<String>,
     output: PathBuf,
     state: PathBuf,
     max_depth: usize,
@@ -32,7 +32,7 @@ enum Command {
 }
 
 fn usage() -> &'static str {
-    "Usage: okra-index-helper --volume C: --output <snapshot.tsv> (--max-depth N --root C:\\Users\\you [--root C:\\Projects] | --full-volume) [--state <index.state>] [--watch] [--serve] [--poll-seconds 2] [--background]\n       okra-index-helper --install-task [same options as above] [--start-now]\n       okra-index-helper --uninstall-task"
+    "Usage: okra-index-helper --volume C: [--volume D: ...] --output <snapshot.tsv> (--max-depth N --root C:\\Users\\you [--root C:\\Projects] | --full-volume) [--state <index.state>] [--watch] [--serve] [--poll-seconds 2] [--background]\n       Repeat --volume to merge multiple NTFS drives; multiple drives require --full-volume.\n       okra-index-helper --install-task [same options as above] [--start-now]\n       okra-index-helper --uninstall-task"
 }
 
 fn take_value(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String, String> {
@@ -85,7 +85,7 @@ fn resolve_index_scope(
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut volume = None;
+    let mut volumes = Vec::new();
     let mut output = None;
     let mut state = None;
     let mut max_depth = None;
@@ -106,7 +106,7 @@ fn parse_args() -> Result<Args, String> {
             "--background" => background = true,
             "--install-task" => install_task = true,
             "--start-now" => start_now = true,
-            "--volume" => volume = Some(take_value(&mut args, "--volume")?),
+            "--volume" => volumes.push(take_value(&mut args, "--volume")?),
             "--output" => output = Some(PathBuf::from(take_value(&mut args, "--output")?)),
             "--state" => state = Some(PathBuf::from(take_value(&mut args, "--state")?)),
             "--max-depth" => {
@@ -132,12 +132,31 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
-    let volume = volume.ok_or_else(|| usage().to_string())?;
+    if volumes.is_empty() {
+        return Err(usage().to_string());
+    }
+    let mut normalized = std::collections::HashSet::new();
+    for volume in &volumes {
+        if !normalized.insert(volume.to_ascii_uppercase()) {
+            return Err(format!("Duplicate volume {volume}"));
+        }
+    }
+    if volumes.len() > 1 && !full_volume {
+        return Err("Multiple volumes currently require --full-volume so each volume can be indexed independently".into());
+    }
     let output = output.ok_or_else(|| usage().to_string())?;
     let state = state.unwrap_or_else(|| output.with_extension("state"));
-    let (roots, max_depth) = resolve_index_scope(&volume, roots, max_depth, full_volume)?;
+    let (roots, max_depth) = resolve_index_scope(&volumes[0], roots, max_depth, full_volume)?;
+    for volume in &volumes {
+        let volume_roots = if full_volume {
+            vec![format!("{}\\", volume.trim_end_matches(['\\', '/']))]
+        } else {
+            roots.clone()
+        };
+        mft::validate_volume_and_roots(volume, &volume_roots)?;
+    }
     let args = Args {
-        volume,
+        volumes,
         output,
         state,
         max_depth,
@@ -153,8 +172,34 @@ fn parse_args() -> Result<Args, String> {
     if args.output == args.state {
         return Err("--output and --state must be different files".into());
     }
-    mft::validate_volume_and_roots(&args.volume, &args.roots)?;
     Ok(args)
+}
+
+fn volume_specific_path(
+    base: &std::path::Path,
+    volume: &str,
+    needs_suffix: bool,
+) -> Result<PathBuf, String> {
+    let bytes = volume.as_bytes();
+    if bytes.len() != 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+        return Err(format!("Invalid volume name {volume:?}"));
+    }
+    if !needs_suffix {
+        // The first configured volume keeps the legacy single-volume paths. Adding a second
+        // drive therefore reuses the first drive's existing MFT state instead of forcing a
+        // needless full-volume baseline rebuild.
+        return Ok(base.to_path_buf());
+    }
+    let drive = (bytes[0] as char).to_ascii_uppercase();
+    let stem = base
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("Invalid index file name {}", base.display()))?;
+    let file_name = match base.extension().and_then(|value| value.to_str()) {
+        Some(extension) => format!("{stem}-{drive}.{extension}"),
+        None => format!("{stem}-{drive}"),
+    };
+    Ok(base.with_file_name(file_name))
 }
 
 fn run_index(args: Args) -> Result<(), String> {
@@ -162,14 +207,45 @@ fn run_index(args: Args) -> Result<(), String> {
     if args.background {
         background::detach()?;
     }
-    eprintln!("Synchronizing NTFS index on {} ...", args.volume);
+    let mut volume_configs = Vec::with_capacity(args.volumes.len());
+    for (position, volume) in args.volumes.iter().enumerate() {
+        let roots = if args.full_volume {
+            vec![format!("{}\\", volume.trim_end_matches(['\\', '/']))]
+        } else {
+            args.roots.clone()
+        };
+        mft::validate_volume_and_roots(volume, &roots)?;
+        let snapshot_path = volume_specific_path(&args.output, volume, position > 0)?;
+        let state_path = volume_specific_path(&args.state, volume, position > 0)?;
+        if snapshot_path == state_path {
+            return Err(format!(
+                "Snapshot and state paths collide for volume {volume}"
+            ));
+        }
+        volume_configs.push(journal::VolumeConfig {
+            volume: volume.clone(),
+            roots,
+            max_depth: args.max_depth,
+            snapshot_path,
+            state_path,
+        });
+    }
+    eprintln!(
+        "Synchronizing NTFS index on {} ...",
+        args.volumes.join(", ")
+    );
     if args.serve {
         // Claim the pipe name first. It narrows the window in which another process could
         // squat on the name at logon, and it lets the launcher see "starting" (searches are
         // refused with a not-ready status) instead of a missing helper while the baseline
         // runs. If the secure pipe cannot be created the helper exits with an error; it never
         // falls back to a weaker ACL.
-        ipc::start_server(args.output.clone())?;
+        ipc::start_server(
+            volume_configs
+                .iter()
+                .map(|config| config.snapshot_path.clone())
+                .collect(),
+        )?;
         eprintln!(
             "USN watch mode enabled; polling every {} second(s). Press Ctrl+C to stop.",
             args.poll_seconds
@@ -180,15 +256,7 @@ fn run_index(args: Args) -> Result<(), String> {
             args.poll_seconds
         );
     }
-    let result = journal::run(
-        &args.volume,
-        &args.roots,
-        args.max_depth,
-        &args.output,
-        &args.state,
-        args.watch,
-        args.poll_seconds,
-    );
+    let result = journal::run_many(&volume_configs, args.watch, args.poll_seconds);
     status::global().mark_stopping();
     if result.is_ok() && shutdown::global().requested() {
         eprintln!(
@@ -206,7 +274,7 @@ fn run() -> Result<(), String> {
         Command::Run(args) => run_index(args),
         Command::InstallTask { args, start_now } => {
             let request = task::InstallRequest {
-                volume: args.volume,
+                volumes: args.volumes,
                 output: path_string(&args.output)?,
                 state: path_string(&args.state)?,
                 max_depth: args.max_depth,
@@ -318,7 +386,8 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod full_volume_tests {
-    use super::resolve_index_scope;
+    use super::{resolve_index_scope, volume_specific_path};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn full_volume_uses_the_volume_root_and_unlimited_depth() {
@@ -341,5 +410,32 @@ mod full_volume_tests {
             resolve_index_scope("C:", vec![r"C:\Users".into()], Some(8), false).unwrap(),
             (vec![r"C:\Users".to_string()], 8)
         );
+    }
+    #[test]
+    fn multiple_volumes_get_distinct_snapshot_and_state_names() {
+        let base = Path::new("index-dir").join("mft-snapshot.tsv");
+        assert_eq!(
+            volume_specific_path(&base, "C:", false).unwrap(),
+            PathBuf::from("index-dir").join("mft-snapshot.tsv")
+        );
+        assert_eq!(
+            volume_specific_path(&base, "D:", true).unwrap(),
+            PathBuf::from("index-dir").join("mft-snapshot-D.tsv")
+        );
+        assert_eq!(
+            volume_specific_path(
+                Path::new("index-dir").join("mft-snapshot.state").as_path(),
+                "D:",
+                true
+            )
+            .unwrap(),
+            PathBuf::from("index-dir").join("mft-snapshot-D.state")
+        );
+        assert_eq!(volume_specific_path(&base, "C:", false).unwrap(), base);
+    }
+
+    #[test]
+    fn multiple_volume_path_generation_rejects_non_drive_identifiers() {
+        assert!(volume_specific_path(Path::new("snapshot.tsv"), "Volume{123}", true).is_err());
     }
 }

@@ -300,7 +300,7 @@ impl App {
                     let _ = r_tx.send((generation, build_rows(items, &query)));
                     ctx.request_repaint();
                 };
-                eng.search_progressive(&query, &mut emit, &|| {
+                eng.search_progressive_for_typing(&query, &mut emit, &|| {
                     newest.load(Ordering::Relaxed) != generation
                 });
             }

@@ -35,22 +35,20 @@ File queries use Okra's native fuzzy filename matcher. Search by part of a filen
 ## Performance design
 
 - **Instant start.** The installed-app list is cached in `%LOCALAPPDATA%\okra-brown-search\apps.json` and loaded immediately; the slow part (Start Menu walk plus `Get-StartApps` via PowerShell) runs on a background thread, rewrites the cache, and re-runs the query on screen when it finishes. It repeats every 30 minutes so newly installed apps appear without a restart.
-- **Nothing slow on the keystroke path.** Typing is coalesced on a worker thread; only the newest query is ever searched.
+- **Nothing slow on the UI keystroke path.** Typing is coalesced on a worker thread; calculator, app, Settings, and window results stay immediate. File lookup waits for a short 55 ms quiet window, and a newer query cancels an obsolete file phase before it opens the NTFS pipe or scans the fallback.
+- **Exact filename ranking.** Exact basename matches outrank fuzzy matches, exact files beat same-named folders, and normalized filename prefixes rank next. The same scoring is used by the NTFS helper and the built-in fallback. Unprefixed searches retain application priority; `f ` explicitly routes to file-focused ranking.
+- **Compact NTFS search cache.** Snapshot paths and lowercase basenames share a UTF-8 byte arena with offset-based entries. A character-posting bitset intersects 64 candidates at a time, rare query characters are checked first, and a bounded top-results heap avoids retaining every fuzzy hit for broad queries.
+- **Streamed persistent state.** The MFT state file is read through a bounded buffered reader and written through a buffered temporary file, avoiding an additional file-sized byte vector at startup and save time. The existing state-file format remains compatible.
+- **Fast built-in fallback index.** The unprivileged walker keeps a contiguous 64-bit character-signature array to reject most entries before reading their strings; it also selects only the best results rather than sorting every hit.
 - **Allocation-free fuzzy matcher.** The query is prepared once per search, non-matches are rejected without allocating, and scoring is linear in name length. A randomized test checks it against the original reference implementation (identical scores and matched positions).
-- **Fast built-in index.** Each indexed file carries a 64-bit character signature in a contiguous array, so most files are rejected with one AND before any text is read; only the best results are selected rather than sorting every hit.
 - **Cheap ranking.** Usage history is resolved once per search (not once per result), so scoring hundreds of results allocates nothing. History is saved by a background thread with an atomic write-then-rename, so opening a result never waits on the disk.
 - **Draw once, not every frame.** Highlight ranges and shortened paths are computed on the search thread when results arrive; the UI only draws them.
 - **Real program icons, off the UI thread.** Results show each program's own icon (Start-menu shortcuts, Store apps, and per-type icons for files and folders), fetched from the shell by a worker thread, rows on screen first and cached for the session. Rows appear instantly with a coloured letter tile that is swapped for the icon as it arrives, so typing never waits on icons. Settings, open windows and calculator results keep the tile.
 - **Open windows are listed once per moment, not once per key.** The list of open windows is reused for under a second while you type.
 - **Closes when you click away.** On Windows the launcher asks the OS which window is in the foreground and is woken by a foreground-change hook, so there is no polling while it is open. If something misbehaves, set `OKRA_DEBUG=1` to log show/hide/focus events to `%TEMP%\okra-debug.log`.
-<<<<<<< HEAD
-- **The built-in index is saved between runs.** It is stored in `%LOCALAPPDATA%\okra-brown-search\file-index.tsv`, loads at start so file search works immediately, and is rescanned every 30 minutes in the background. Delete the file to force a fresh scan.
-- **Everything is still the fast path.** When Everything is running, file queries are answered by its own index; the built-in index is only a fallback.
-=======
 - **Native index first.** On Windows, file queries go to Okra's elevated NTFS helper first and then to Okra's built-in walker index. The fallback is warmed in the background so helper outages do not trigger a cold scan on the first query.
->>>>>>> stage5-ntfs-helper-health
 
-Micro-benchmarks: `cargo run --release -p okra-core --example bench`, and for the real built-in index path `cargo test --release -p okra-core -- --ignored --nocapture bench_builtin`; for per-keystroke ranking overhead `... bench_engine_overhead`.
+Micro-benchmarks: `cargo run --release -p okra-core --example bench`; for the real built-in index path `cargo test --release -p okra-core -- --ignored --nocapture bench_builtin`; for per-keystroke ranking overhead `cargo test --release -p okra-core -- --ignored --nocapture bench_engine_overhead`; and for the NTFS helper's compact search cache at one million synthetic paths `cargo test --release -p okra-index-helper -- --ignored --nocapture bench_million_entry_search`. The million-entry test reports reserved cache-vector memory plus warm-query median/p95; it is a synthetic in-memory benchmark, not a cold-load or whole-volume timing.
 
 ## Requirements
 
@@ -95,7 +93,7 @@ Legacy `file_backend`, `everything_dll`, and `es_exe` fields from older config f
 
 ## Current boundaries
 
-This build includes the resident launcher and Windows top-level window switching. It does **not** yet index browser tabs, keep a clipboard-history database, or extract/search text inside documents. Native filename search is implemented; native `ext:`, size/date filters, regex, and document-content indexing are future work. The NTFS helper incrementally follows the USN journal for its configured roots; the built-in filename index walks the configured roots as a fallback. No plugin loader is included by design. The current default index scope is the user's home folder at depth 8, not every path on every volume.
+This build includes the resident launcher and Windows top-level window switching. It does **not** yet index browser tabs, keep a clipboard-history database, or extract/search text inside documents. Native filename search is implemented; native `ext:`, size/date filters, regex, and document-content indexing are future work. The NTFS helper incrementally follows the USN journal for its configured NTFS volume(s); the built-in filename index walks configured roots as a fallback. Full-volume indexing can be enabled for one or more fixed NTFS drive letters (repeat `--volume` when installing the helper task). All configured drives must be online for the merged helper index to report ready; automatic drive discovery is not included yet. No plugin loader is included by design. The default configuration for the built-in fallback remains the user's home folder at depth 8.
 
 ## Project layout
 

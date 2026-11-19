@@ -37,12 +37,18 @@ Run once to initialize or synchronize:
 
 ### Full-volume indexing
 
-The helper can export every path on one selected NTFS volume, from its root through all directory
+The helper can export every path on a selected NTFS volume, from its root through all directory
 levels. Use `--full-volume` instead of `--max-depth` and `--root`; the option expands to the volume
-root and removes the depth filter. This is a per-volume setting: the first implementation indexes
-one drive letter per installed helper task (for example, `C:`). The current named-pipe/task setup
-serves one configured volume at a time; changing it to another drive replaces that configuration.
-Automatic multi-volume discovery and merged search across drives are a later milestone.
+root and removes the depth filter. Repeat `--volume` to configure several NTFS drive letters in one
+helper process. Each drive gets its own state and snapshot, and the named-pipe cache merges those
+snapshots into one result set. For example, `--volume C: --volume D: --full-volume` indexes both
+volumes. Multiple-volume mode requires `--full-volume` and distinct drive letters.
+
+The helper requires every configured volume to be available and synchronizable for a successful
+initial start. If a configured drive is offline or loses its journal, the aggregate helper health
+becomes stale and search requests are refused until all configured drives recover. This is
+intentional fail-closed behaviour: Okra does not report a complete multi-drive index while a drive
+is missing. Automatic drive discovery and per-volume partial-readiness are not implemented yet.
 
 A full-volume scope changes only the export filter. The persistent state already retains the whole
 MFT graph for the selected volume, so when its volume and USN cursor are still valid the helper
@@ -74,6 +80,28 @@ rewrites the full-volume snapshot. If the journal identity changed, the cursor e
 cannot be read, it performs a new MFT baseline. Keep the previous task configuration backed up
 until the new helper reaches `ready` and whole-volume searches are verified.
 
+To install two fixed NTFS volumes in one task, repeat `--volume` and keep the same base output
+and state paths:
+
+```powershell
+& ".\target\release\okra-index-helper.exe" `
+  --install-task --start-now `
+  --volume C: `
+  --volume D: `
+  --output "$indexDir\mft-snapshot.tsv" `
+  --state "$indexDir\mft-snapshot.state" `
+  --full-volume `
+  --poll-seconds 1
+```
+
+The first configured drive keeps the original base paths (`mft-snapshot.tsv` and
+`mft-snapshot.state`) so adding a second drive with `C:` first reuses the existing C: index. Each
+additional drive gets a suffix (`mft-snapshot-D.tsv`, `mft-snapshot-D.state`) and the snapshots are
+merged for search. Keep the original drive first when reinstalling so its state is reused. Every
+configured drive must be online and have a valid NTFS USN journal when the helper starts; a missing
+drive prevents the aggregate helper from reporting ready. Reinstall the task whenever you change
+its configured drive list.
+
 Use `--watch` to keep the elevated helper running and poll the journal. The default polling interval
 is two seconds; `--poll-seconds 5` changes it to five seconds. Press Ctrl+C to stop. The watch mode
 is a development process, not an installed Windows service. Run only one helper instance for a given
@@ -89,6 +117,35 @@ If the journal is recreated, its ID changes, or the saved cursor falls behind th
 history, the helper discards the old in-memory graph and rebuilds from the MFT. A failed or
 incompatible state file also causes a rebuild. The cache is written before the cursor state, so a
 crash between those writes causes safe replay rather than silently skipping changes.
+
+## Search cache layout and ranking
+
+The helper loads each configured volume’s persistent FRN graph once through a buffered reader and keeps it resident between USN polling cycles. Journal records are applied in place; a no-change poll does not reload the state file, rebuild the FRN map, clone all MFT entries, or rewrite the snapshot. A new snapshot/state pair is serialized only after a baseline, journal delta, or scope change. State is written through a buffered temporary file rather than a second file-sized byte vector; the on-disk format remains unchanged. A restart loads the saved graph once and resumes from its cursor.
+
+The IPC server loads each configured snapshot into one compact in-memory cache. Original UTF-8
+paths and lowercase basenames share a byte arena; entries store offsets and lengths rather than two
+separately allocated `String` values. This reduces per-entry allocation overhead on large volumes.
+
+The candidate index is a 64-character posting bitset. Each query intersects 64-entry blocks, starting
+with the least frequent query-character postings, before running the fuzzy scorer on surviving
+candidates. The server keeps only the best requested results in a bounded heap (at most 200), rather
+than allocating a score record for every fuzzy match. The helper logs the compact cache's reserved
+memory estimate and load time; this estimate covers the cache vectors, not the whole process working
+set. A release-only ignored benchmark creates one million synthetic entries and reports warm query
+median/p95 latency and compact-cache memory.
+
+Filename ranking is shared with the built-in walker: exact normalized basenames take an allocation-free
+fast path and outrank fuzzy candidates; normalized prefixes receive the next bonus, then fuzzy
+alignment decides the remaining order. Exact files receive a small tie-break over same-named directories. Whitespace is
+ignored for exact/prefix checks, matching the query normalizer. In unprefixed searches, the app provider
+class retains priority over exact file matches; `f ` routes exclusively to the file provider. The UI keeps fast providers immediate
+and gives the file phase a short 55 ms quiet window; a newer generation cancels a stale file query
+before the helper request begins.
+
+Multiple NTFS drive letters can be configured explicitly by repeating `--volume`. Each gets its own
+persistent state and snapshot; the IPC cache merges them. Keep the original C: volume first to reuse
+its existing state. This is explicit configuration, not automatic drive discovery, and every
+configured volume must be online and healthy for the aggregate helper to report ready.
 
 ## Stage 3: logon-session-restricted local search IPC
 
@@ -106,7 +163,8 @@ the same account from opening the pipe. The pipe has an explicit medium-integrit
 so the standard-integrity desktop app can write requests without granting write access to lower-
 integrity clients. The helper enables `SeSecurityPrivilege` only during pipe creation and restores
 its previous state immediately afterward. The protocol is versioned and length-prefixed,
-validates query and result bounds, and only returns paths from the configured-root snapshot. A
+validates query and result bounds, and only returns paths from the configured NTFS volume
+snapshots. With multiple volumes, those snapshots are merged into one in-memory search cache. A
 missing or unavailable helper is treated as a normal backend miss, so the app falls through to
 Okra's built-in walker index. The native backend order is the Okra NTFS helper followed by the local
 walker fallback. No external search application or SDK is loaded.
@@ -244,8 +302,8 @@ On non-Windows builds the existing status API reports `NotRunning`, as expected 
 - The pipe server is a single-request-at-a-time development bridge. It reloads the TSV only when
   its file metadata changes.
 - The IPC endpoint returns at most 200 filename-fuzzy matches per request and accepts paths up to
-  128 KiB in UTF-8. It is intended for the current configured roots and depth, not as a
-  general-purpose filesystem broker. It handles one request at a time; if busy, the app falls
+  128 KiB in UTF-8. It is intended for the configured NTFS volumes, not as a general-purpose
+  filesystem broker. It handles one request at a time; if busy, the app falls
   through to the built-in index for that query.
 - Non-NTFS volumes, unsupported record versions, inaccessible records, and helper failures still
   require the normal file-search fallback.
@@ -257,9 +315,10 @@ and its own walker fallback second; it does not load a third-party SDK, probe fo
 or send queries to another search process. This removes the external runtime dependency, but it
 does not yet claim feature or performance parity with dedicated file-search products.
 
-1. **Coverage:** discover all configured fixed NTFS volumes, expand root/depth controls, and add
-   correct multi-name hard-link modelling. Keep a walker fallback for non-NTFS and inaccessible
-   locations. The current default remains the user's home folder at depth 8.
+1. **Coverage:** add automatic discovery and per-volume partial readiness for fixed NTFS volumes,
+   then complete correct multi-name hard-link modelling. Keep a walker fallback for non-NTFS and
+   inaccessible locations. Multi-drive indexing is currently explicit through repeated `--volume`
+   arguments; the app does not yet discover drives automatically.
 2. **Index integrity:** handle USN record versions and volume changes explicitly, add exclusions,
    repair/recovery tests, and prove create/delete/rename/move/hard-link cases.
 3. **IPC and security:** add bounded named-pipe I/O timeouts, cancellation, concurrent-client
@@ -267,8 +326,9 @@ does not yet claim feature or performance parity with dedicated file-search prod
 4. **Query language:** implement native `ext:`, `path:`, size/date/type filters and a safe regex
    mode. Document-content search requires its own extractor/index and is not implemented yet.
 5. **Scale and speed:** benchmark cold indexing, incremental update latency, query latency, CPU,
-   disk activity, memory, and result quality at 100k / 1M / 5M entries. Optimize index layout and
-   candidate retrieval based on those measurements, not microbenchmarks alone.
+   disk activity, memory, and result quality at 100k / 1M / 5M entries. The search cache now uses a
+   compact UTF-8 arena, character-posting bitsets, rarest-character-first filtering, and bounded
+   top-result selection; validate these changes against real multi-million-entry volumes.
 
 The supplied benchmark CSVs contain Okra-helper and walker measurements, but no same-scope
 Everything measurements; they are not evidence of head-to-head parity.

@@ -8,7 +8,9 @@
 //! refused with a non-zero `OKR1` status while the helper is starting, stopping, or stale, so
 //! the launcher falls through to its next backend instead of showing outdated results.
 
-use okra_core::matcher::{char_mask, lc, score_with_lower, Query};
+use okra_core::matcher::{char_mask, file_name_score, lc, Query};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -18,127 +20,254 @@ const MAX_QUERY_BYTES: usize = 1024;
 const MAX_RESULTS: usize = 200;
 const MAX_PATH_BYTES: usize = 128 * 1024;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct SnapshotEntry {
-    path: String,
-    name_start: usize,
-    lower_name: String,
+    path_start: u32,
+    path_len: u32,
+    name_start: u32,
+    lower_start: u32,
+    lower_len: u32,
     is_dir: bool,
 }
 
-impl SnapshotEntry {
-    fn from_path(path: String, is_dir: bool) -> Self {
+struct SnapshotCache {
+    paths: Vec<PathBuf>,
+    stamps: Option<Vec<(u64, Option<SystemTime>)>>,
+    /// Original UTF-8 paths and lowercase basenames share one compact byte arena. This avoids two
+    /// heap allocations per entry and cuts per-entry metadata from two String headers to offsets.
+    strings: Vec<u8>,
+    entries: Vec<SnapshotEntry>,
+    /// Character postings stored bit-sliced: postings[character_bit * words + word] contains
+    /// candidate entry bits. This keeps the same ~8 bytes per entry as the old mask array while
+    /// allowing each query to intersect 64-entry blocks instead of testing every entry mask.
+    postings: Vec<u64>,
+    posting_words: usize,
+    character_counts: [usize; 64],
+}
+
+// Keep the cache compatible with toolchains where arrays longer than 32 elements do not
+// implement Default. This also makes the initial contents of the posting counters explicit.
+impl Default for SnapshotCache {
+    fn default() -> Self {
+        Self {
+            paths: Vec::new(),
+            stamps: None,
+            strings: Vec::new(),
+            entries: Vec::new(),
+            postings: Vec::new(),
+            posting_words: 0,
+            character_counts: [0; 64],
+        }
+    }
+}
+
+impl SnapshotCache {
+    fn new(paths: Vec<PathBuf>) -> Self {
+        Self {
+            paths,
+            ..Self::default()
+        }
+    }
+
+    fn path_text(&self, entry: &SnapshotEntry) -> &str {
+        let start = entry.path_start as usize;
+        let end = start + entry.path_len as usize;
+        std::str::from_utf8(&self.strings[start..end]).expect("snapshot paths are UTF-8")
+    }
+
+    fn name_text<'a>(&'a self, entry: &SnapshotEntry) -> &'a str {
+        let path = self.path_text(entry);
+        &path[entry.name_start as usize..]
+    }
+
+    fn lower_text(&self, entry: &SnapshotEntry) -> &str {
+        let start = entry.lower_start as usize;
+        let end = start + entry.lower_len as usize;
+        std::str::from_utf8(&self.strings[start..end]).expect("lowercase names are UTF-8")
+    }
+
+    fn append_path(&mut self, path: &str, is_dir: bool) -> Result<(), String> {
         let name_start = path
             .rfind(['\\', '/'])
             .map(|separator| separator + 1)
             .filter(|start| *start < path.len())
             .unwrap_or(0);
-        let lower_name: String = path[name_start..].chars().map(lc).collect();
-        Self {
-            path,
-            name_start,
-            lower_name,
+        let path_start = u32::try_from(self.strings.len())
+            .map_err(|_| "NTFS search cache exceeds the 4 GiB path arena limit".to_string())?;
+        let path_len = u32::try_from(path.len())
+            .map_err(|_| "A snapshot path exceeds the 4 GiB path length limit".to_string())?;
+        let lower_start = path_start
+            .checked_add(path_len)
+            .ok_or_else(|| "NTFS search cache path offset overflow".to_string())?;
+        let name_start_u32 = u32::try_from(name_start)
+            .map_err(|_| "A snapshot basename offset is too large".to_string())?;
+        let lower_bytes = path[name_start..]
+            .chars()
+            .map(|character| lc(character).len_utf8())
+            .sum::<usize>();
+        let lower_bytes_u32 = u32::try_from(lower_bytes)
+            .map_err(|_| "A lowercase basename exceeds the 4 GiB offset limit".to_string())?;
+        // The arena uses 32-bit offsets, so validate the *end* of both strings, not just their
+        // starting offsets. This prevents the final append from crossing the 4 GiB boundary.
+        lower_start
+            .checked_add(lower_bytes_u32)
+            .ok_or_else(|| "NTFS search cache exceeds the 4 GiB path arena limit".to_string())?;
+        let additional = path
+            .len()
+            .checked_add(lower_bytes)
+            .ok_or_else(|| "NTFS search cache string size overflow".to_string())?;
+        self.strings
+            .try_reserve(additional)
+            .map_err(|error| format!("Could not allocate NTFS path strings: {error}"))?;
+        self.entries
+            .try_reserve(1)
+            .map_err(|error| format!("Could not allocate NTFS path metadata: {error}"))?;
+
+        self.strings.extend_from_slice(path.as_bytes());
+        let lower_begin = self.strings.len();
+        for character in path[name_start..].chars() {
+            let lower = lc(character);
+            let mut encoded = [0u8; 4];
+            self.strings
+                .extend_from_slice(lower.encode_utf8(&mut encoded).as_bytes());
+        }
+        let lower_len = u32::try_from(self.strings.len() - lower_begin)
+            .map_err(|_| "A lowercase basename is too long".to_string())?;
+        debug_assert_eq!(lower_len as usize, lower_bytes);
+        self.entries.push(SnapshotEntry {
+            path_start,
+            path_len,
+            name_start: name_start_u32,
+            lower_start,
+            lower_len,
             is_dir,
-        }
+        });
+        Ok(())
     }
 
-    fn name(&self) -> &str {
-        self.path.get(self.name_start..).unwrap_or(&self.path)
-    }
-}
+    fn rebuild_postings(&mut self) -> Result<(), String> {
+        let words = self.entries.len().div_ceil(64);
+        let slots = words
+            .checked_mul(64)
+            .ok_or_else(|| "NTFS search posting index size overflow".to_string())?;
+        self.postings.clear();
+        self.character_counts.fill(0);
+        self.postings
+            .try_reserve_exact(slots)
+            .map_err(|error| format!("Could not allocate NTFS search postings: {error}"))?;
+        self.postings.resize(slots, 0);
 
-#[derive(Default)]
-struct SnapshotCache {
-    path: Option<PathBuf>,
-    stamp: Option<(u64, Option<SystemTime>)>,
-    entries: Vec<SnapshotEntry>,
-    /// `masks[i]` is `char_mask(entries[i].lower_name)`, kept in its own contiguous array so the
-    /// first filtering pass streams 8 bytes per entry instead of touching every entry's strings.
-    masks: Vec<u64>,
-}
-
-impl SnapshotCache {
-    fn new(path: PathBuf) -> Self {
-        Self {
-            path: Some(path),
-            ..Self::default()
+        for (position, entry) in self.entries.iter().enumerate() {
+            let mut mask = char_mask(self.lower_text(entry).chars());
+            while mask != 0 {
+                let character_bit = mask.trailing_zeros() as usize;
+                let slot = character_bit * words + position / 64;
+                self.postings[slot] |= 1u64 << (position % 64);
+                self.character_counts[character_bit] =
+                    self.character_counts[character_bit].saturating_add(1);
+                mask &= mask - 1;
+            }
         }
+        self.posting_words = words;
+        Ok(())
+    }
+
+    fn memory_bytes(&self) -> usize {
+        self.strings.capacity()
+            + self.entries.capacity() * std::mem::size_of::<SnapshotEntry>()
+            + self.postings.capacity() * std::mem::size_of::<u64>()
+            + std::mem::size_of_val(&self.character_counts)
     }
 
     fn refresh(&mut self) -> Result<(), String> {
-        let Some(path) = self.path.as_ref() else {
+        if self.paths.is_empty() {
             // Unit tests may populate the in-memory entries directly.
             return Ok(());
-        };
-        let metadata = std::fs::metadata(path)
-            .map_err(|error| format!("NTFS snapshot is not available yet: {error}"))?;
-        let stamp = (metadata.len(), metadata.modified().ok());
-        if self.stamp == Some(stamp) {
+        }
+        let mut stamps = Vec::with_capacity(self.paths.len());
+        for path in &self.paths {
+            let metadata = std::fs::metadata(path).map_err(|error| {
+                format!("NTFS snapshot {} is not available: {error}", path.display())
+            })?;
+            stamps.push((metadata.len(), metadata.modified().ok()));
+        }
+        if self.stamps.as_ref() == Some(&stamps) {
             return Ok(());
         }
         use std::io::BufRead;
 
         let reload_started = std::time::Instant::now();
-        // A full-volume cache can be large. Drop the previous snapshot before loading its
-        // replacement so refresh does not temporarily keep two complete indexes in memory.
+        // Reuse the same arena allocations on refresh; the old combined cache is released before
+        // the replacement snapshots are read, avoiding a second all-volume cache during updates.
+        self.strings.clear();
         self.entries.clear();
-        self.masks.clear();
-        self.stamp = None;
-        let file = std::fs::File::open(path)
-            .map_err(|error| format!("Could not open NTFS snapshot: {error}"))?;
-        let mut reader = std::io::BufReader::new(file);
-        let mut line = String::new();
-        if reader
-            .read_line(&mut line)
-            .map_err(|error| format!("Could not read NTFS snapshot header: {error}"))?
-            == 0
-        {
-            return Err("NTFS snapshot is empty".into());
-        }
-        let header = line.trim_end_matches(['\r', '\n']);
-        if !header.starts_with("okra-index-v1\t") {
-            return Err("NTFS snapshot has an unsupported header".into());
-        }
-        let mut entries = Vec::new();
-        loop {
-            line.clear();
+        self.postings.clear();
+        self.posting_words = 0;
+        self.character_counts.fill(0);
+        self.stamps = None;
+        // Clone only the small configured volume-path list so append_path can mutably update
+        // the cache while each snapshot is streamed. The large path index is not cloned.
+        let snapshot_paths = self.paths.clone();
+        for path in &snapshot_paths {
+            let file = std::fs::File::open(path).map_err(|error| {
+                format!("Could not open NTFS snapshot {}: {error}", path.display())
+            })?;
+            let mut reader = std::io::BufReader::new(file);
+            let mut line = String::new();
             if reader
                 .read_line(&mut line)
-                .map_err(|error| format!("Could not read NTFS snapshot: {error}"))?
+                .map_err(|error| format!("Could not read NTFS snapshot header: {error}"))?
                 == 0
             {
-                break;
+                return Err(format!("NTFS snapshot {} is empty", path.display()));
             }
-            let row = line.trim_end_matches(['\r', '\n']);
-            let Some((kind, raw_path)) = row.split_once('\t') else {
-                continue;
-            };
-            if raw_path.is_empty()
-                || raw_path.len() > MAX_PATH_BYTES
-                || raw_path.contains(['\n', '\r', '\t'])
-            {
-                continue;
+            let header = line.trim_end_matches(['\r', '\n']);
+            if !header.starts_with("okra-index-v1\t") {
+                return Err(format!(
+                    "NTFS snapshot {} has an unsupported header",
+                    path.display()
+                ));
             }
-            let is_dir = match kind {
-                "D" => true,
-                "F" => false,
-                _ => continue,
-            };
-            entries.push(SnapshotEntry::from_path(raw_path.to_string(), is_dir));
-            if entries.len() % 250_000 == 0 {
-                eprintln!("NTFS IPC snapshot load: {} paths parsed ...", entries.len());
+            loop {
+                line.clear();
+                if reader
+                    .read_line(&mut line)
+                    .map_err(|error| format!("Could not read NTFS snapshot: {error}"))?
+                    == 0
+                {
+                    break;
+                }
+                let row = line.trim_end_matches(['\r', '\n']);
+                let Some((kind, raw_path)) = row.split_once('\t') else {
+                    continue;
+                };
+                if raw_path.is_empty()
+                    || raw_path.len() > MAX_PATH_BYTES
+                    || raw_path.contains(['\n', '\r', '\t'])
+                {
+                    continue;
+                }
+                let is_dir = match kind {
+                    "D" => true,
+                    "F" => false,
+                    _ => continue,
+                };
+                self.append_path(raw_path, is_dir)?;
+                if self.entries.len() % 250_000 == 0 {
+                    eprintln!(
+                        "NTFS IPC snapshot load: {} paths parsed ...",
+                        self.entries.len()
+                    );
+                }
             }
         }
-        self.entries = entries;
-        self.masks = self
-            .entries
-            .iter()
-            .map(|entry| char_mask(entry.lower_name.chars()))
-            .collect();
-        self.stamp = Some(stamp);
+        self.rebuild_postings()?;
+        self.stamps = Some(stamps);
         eprintln!(
-            "NTFS IPC snapshot cache loaded: {} paths in {:.1} ms",
+            "NTFS IPC snapshot cache loaded: {} paths from {} volume snapshot(s), {:.1} MiB compact index, {:.1} ms",
             self.entries.len(),
+            self.paths.len(),
+            self.memory_bytes() as f64 / (1024.0 * 1024.0),
             reload_started.elapsed().as_secs_f64() * 1000.0
         );
         Ok(())
@@ -148,40 +277,76 @@ impl SnapshotCache {
         self.refresh()?;
         let max = max.clamp(1, MAX_RESULTS);
         let query = Query::new(query_text);
-        if query.len() < 2 {
+        if query.len() < 2 || self.entries.is_empty() {
             return Ok(Vec::new());
         }
-        if self.masks.len() != self.entries.len() {
-            // Unit tests fill `entries` directly, so rebuild the mask array when it is out of step.
-            self.masks = self
-                .entries
-                .iter()
-                .map(|entry| char_mask(entry.lower_name.chars()))
-                .collect();
+        let words = self.entries.len().div_ceil(64);
+        if self.posting_words != words || self.postings.len() != words * 64 {
+            self.rebuild_postings()?;
         }
-        let query_mask = query.mask();
-        let mut hits: Vec<(i64, usize)> = Vec::new();
-        for (position, &mask) in self.masks.iter().enumerate() {
-            if mask & query_mask != query_mask {
-                continue;
+
+        // Keep only the best `max` results while scanning. A bounded heap avoids allocating a
+        // potentially huge Vec of every fuzzy match for broad two-character queries.
+        let mut best: BinaryHeap<Reverse<(i64, Reverse<usize>)>> = BinaryHeap::with_capacity(max);
+        // Intersect the rarest query-character postings first. Empty blocks then short-circuit
+        // before the common letters are touched, which is especially useful for short queries.
+        let mut required_bits = [0u8; 64];
+        let mut required_len = 0usize;
+        let mut required = query.mask();
+        while required != 0 {
+            required_bits[required_len] = required.trailing_zeros() as u8;
+            required_len += 1;
+            required &= required - 1;
+        }
+        required_bits[..required_len]
+            .sort_unstable_by_key(|bit| self.character_counts[*bit as usize]);
+
+        let mut word = 0usize;
+        while word < words {
+            let mut candidate_word = u64::MAX;
+            for character_bit in &required_bits[..required_len] {
+                candidate_word &= self.postings[*character_bit as usize * words + word];
+                if candidate_word == 0 {
+                    break;
+                }
             }
-            let entry = &self.entries[position];
-            if let Some(score) = score_with_lower(&query, entry.name(), &entry.lower_name) {
-                let rank = score - 10 + if entry.is_dir { 5 } else { 0 };
-                hits.push((rank, position));
+            while candidate_word != 0 {
+                let bit = candidate_word.trailing_zeros() as usize;
+                let position = word * 64 + bit;
+                candidate_word &= candidate_word - 1;
+                if position >= self.entries.len() {
+                    continue;
+                }
+                let entry = &self.entries[position];
+                if let Some(rank) = file_name_score(
+                    &query,
+                    self.name_text(entry),
+                    self.lower_text(entry),
+                    entry.is_dir,
+                ) {
+                    let quality = (rank, Reverse(position));
+                    let candidate = Reverse(quality);
+                    if best.len() < max {
+                        best.push(candidate);
+                    } else if best.peek().is_some_and(|worst| quality > worst.0) {
+                        best.pop();
+                        best.push(candidate);
+                    }
+                }
             }
+            word += 1;
         }
-        let order = |a: &(i64, usize), b: &(i64, usize)| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1));
-        if hits.len() > max {
-            hits.select_nth_unstable_by(max - 1, order);
-            hits.truncate(max);
-        }
-        hits.sort_by(order);
+
+        let mut hits: Vec<(i64, usize)> = best
+            .into_iter()
+            .map(|Reverse((rank, Reverse(position)))| (rank, position))
+            .collect();
+        hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         Ok(hits
             .into_iter()
             .map(|(_, position)| {
                 let entry = &self.entries[position];
-                (entry.path.clone(), entry.is_dir)
+                (self.path_text(entry).to_owned(), entry.is_dir)
             })
             .collect())
     }
@@ -238,12 +403,12 @@ fn encode_response(results: &[(String, bool)], status: u16) -> Result<Vec<u8>, S
 }
 
 #[cfg(windows)]
-pub fn start_server(snapshot_path: PathBuf) -> Result<(), String> {
-    win_pipe::start(snapshot_path)
+pub fn start_server(snapshot_paths: Vec<PathBuf>) -> Result<(), String> {
+    win_pipe::start(snapshot_paths)
 }
 
 #[cfg(not(windows))]
-pub fn start_server(_snapshot_path: PathBuf) -> Result<(), String> {
+pub fn start_server(_snapshot_paths: Vec<PathBuf>) -> Result<(), String> {
     Err("The Okra named-pipe server is available only in the Windows build".into())
 }
 
@@ -675,7 +840,7 @@ mod win_pipe {
         write_all(pipe, &response)
     }
 
-    pub fn start(snapshot_path: PathBuf) -> Result<(), String> {
+    pub fn start(snapshot_paths: Vec<PathBuf>) -> Result<(), String> {
         let logon_sid = current_logon_sid()?;
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
         thread::Builder::new()
@@ -684,7 +849,7 @@ mod win_pipe {
                 Ok(pipe) => {
                     eprintln!("NTFS search IPC listening on {PIPE_NAME} (ACL restricted to this logon session and SYSTEM)");
                     let _ = ready_tx.send(Ok(()));
-                    server_loop(pipe, snapshot_path);
+                    server_loop(pipe, snapshot_paths);
                 }
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
@@ -760,8 +925,8 @@ mod win_pipe {
         Ok(OwnedHandle(pipe))
     }
 
-    fn server_loop(pipe: OwnedHandle, snapshot_path: PathBuf) {
-        let mut cache = SnapshotCache::new(snapshot_path);
+    fn server_loop(pipe: OwnedHandle, snapshot_paths: Vec<PathBuf>) {
+        let mut cache = SnapshotCache::new(snapshot_paths);
 
         // Reuse the same instance between clients. Keeping the handle alive prevents a gap in
         // which another process could take ownership of the pipe name.
@@ -829,7 +994,7 @@ mod tests {
             "okra-index-v1\t8\tC:\\Users\\me\nF\tC:\\Users\\me\\notes.txt\nD\tC:\\Users\\me\\note-folder\n",
         )
         .unwrap();
-        let mut cache = SnapshotCache::new(path.clone());
+        let mut cache = SnapshotCache::new(vec![path.clone()]);
         let results = cache.search("note", 10).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results
@@ -847,16 +1012,130 @@ mod tests {
 
     #[test]
     fn snapshot_search_matches_file_names_and_respects_the_limit() {
-        let mut cache = SnapshotCache {
-            entries: vec![
-                SnapshotEntry::from_path(r"C:\Users\me\notes.txt".into(), false),
-                SnapshotEntry::from_path(r"C:\Users\me\note-folder".into(), true),
-                SnapshotEntry::from_path(r"C:\Users\me\photo.jpg".into(), false),
-            ],
-            ..Default::default()
-        };
+        let mut cache = SnapshotCache::default();
+        cache.append_path(r"C:\Users\me\notes.txt", false).unwrap();
+        cache.append_path(r"C:\Users\me\note-folder", true).unwrap();
+        cache.append_path(r"C:\Users\me\photo.jpg", false).unwrap();
+        cache.rebuild_postings().unwrap();
         assert_eq!(cache.search("note", 10).unwrap().len(), 2);
         assert_eq!(cache.search("photo", 1).unwrap().len(), 1);
         assert!(cache.search("zzzz", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn exact_filename_ranks_above_same_named_directory() {
+        let mut cache = SnapshotCache::default();
+        cache.append_path(r"C:\Hosts", true).unwrap();
+        cache
+            .append_path(r"C:\Windows\System32\drivers\etc\hosts", false)
+            .unwrap();
+        cache.rebuild_postings().unwrap();
+        let results = cache.search("hosts", 10).unwrap();
+        assert_eq!(results[0].0, r"C:\Windows\System32\drivers\etc\hosts");
+        assert!(!results[0].1);
+    }
+
+    #[test]
+    fn snapshot_cache_merges_multiple_volume_snapshots() {
+        let suffix = std::process::id();
+        let c_path = std::env::temp_dir().join(format!("okra-ipc-C-{suffix}.tsv"));
+        let d_path = std::env::temp_dir().join(format!("okra-ipc-D-{suffix}.tsv"));
+        std::fs::write(
+            &c_path,
+            concat!(
+                "okra-index-v1\t18446744073709551615\tC:\\",
+                "\nF\tC:\\Windows\\hosts\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &d_path,
+            concat!(
+                "okra-index-v1\t18446744073709551615\tD:\\",
+                "\nF\tD:\\Projects\\hosts\n"
+            ),
+        )
+        .unwrap();
+        let mut cache = SnapshotCache::new(vec![c_path.clone(), d_path.clone()]);
+        let results = cache.search("hosts", 10).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|(path, _)| path.starts_with("C:\\")));
+        assert!(results.iter().any(|(path, _)| path.starts_with("D:\\")));
+        let _ = std::fs::remove_file(c_path);
+        let _ = std::fs::remove_file(d_path);
+    }
+
+    #[test]
+    fn bitset_postings_do_not_drop_unicode_or_repeated_character_candidates() {
+        let mut cache = SnapshotCache::default();
+        cache.append_path(r"C:\Users\me\résumé.txt", false).unwrap();
+        cache.append_path(r"C:\Users\me\cacao.txt", false).unwrap();
+        cache
+            .append_path(r"C:\Users\me\unrelated.bin", false)
+            .unwrap();
+        cache.rebuild_postings().unwrap();
+        assert!(cache
+            .search("résumé", 10)
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path.ends_with("résumé.txt")));
+        assert!(cache
+            .search("cacao", 10)
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path.ends_with("cacao.txt")));
+    }
+
+    #[test]
+    fn bounded_top_k_keeps_only_the_requested_result_count() {
+        let mut cache = SnapshotCache::default();
+        for index in 0..10_000 {
+            cache
+                .append_path(&format!(r"C:\synthetic\cargo-{index:05}.toml"), false)
+                .unwrap();
+        }
+        cache.rebuild_postings().unwrap();
+        let results = cache.search("cargo", 17).unwrap();
+        assert_eq!(results.len(), 17);
+        assert!(results.iter().all(|(path, _)| path.contains("cargo-")));
+    }
+
+    /// `cargo test --release -p okra-index-helper -- --ignored --nocapture bench_million_entry_search`
+    #[test]
+    #[ignore]
+    fn bench_million_entry_search() {
+        let mut cache = SnapshotCache::default();
+        for index in 0..1_000_000 {
+            let name = match index % 8 {
+                0 => format!(r"C:\Users\bench\Cargo-{index:07}.toml"),
+                1 => format!(r"C:\Program Files\Chrome\Chrome-{index:07}.exe"),
+                2 => format!(r"C:\Windows\System32\Hosts-{index:07}.dll"),
+                _ => format!(r"C:\Data\Archive\document-{index:07}.txt"),
+            };
+            cache.append_path(&name, false).unwrap();
+        }
+        cache.rebuild_postings().unwrap();
+        eprintln!(
+            "synthetic index: {:.1} MiB reserved compact-index memory for {} entries",
+            cache.memory_bytes() as f64 / (1024.0 * 1024.0),
+            cache.entries.len()
+        );
+        for query in ["cargo", "chrome", "hosts", "document", "zzqxjkvw"] {
+            // Warm once, then collect a small latency distribution rather than reporting a
+            // single noisy sample. This measures in-memory query cost, not cold TSV loading.
+            let _ = cache.search(query, 200).unwrap();
+            let mut samples_ms = Vec::with_capacity(25);
+            let mut result_count = 0usize;
+            for _ in 0..25 {
+                let started = std::time::Instant::now();
+                let hits = cache.search(query, 200).unwrap();
+                samples_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+                result_count = hits.len();
+            }
+            samples_ms.sort_by(f64::total_cmp);
+            let median = samples_ms[samples_ms.len() / 2];
+            let p95 = samples_ms[(samples_ms.len() * 95 / 100).min(samples_ms.len() - 1)];
+            eprintln!("{query}: {result_count} results; median {median:.2} ms; p95 {p95:.2} ms");
+        }
     }
 }

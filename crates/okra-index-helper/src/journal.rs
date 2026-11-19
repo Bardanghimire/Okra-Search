@@ -7,7 +7,8 @@
 use crate::mft::{self, MftEntry};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const STATE_MAGIC: &[u8; 8] = b"OKRAUSN1";
@@ -53,6 +54,17 @@ struct SyncStats {
     cursor_after: i64,
     rebuilt: bool,
     scope_changed: bool,
+}
+
+/// One independently journaled NTFS volume. Each volume owns separate persistent state and a
+/// snapshot, while the IPC server merges those snapshots into one searchable index.
+#[derive(Debug, Clone)]
+pub(super) struct VolumeConfig {
+    pub volume: String,
+    pub roots: Vec<String>,
+    pub max_depth: usize,
+    pub snapshot_path: std::path::PathBuf,
+    pub state_path: std::path::PathBuf,
 }
 
 fn read_u16(bytes: &[u8], at: usize) -> Result<u16, String> {
@@ -179,28 +191,36 @@ fn resume_problem(state: &IndexState, volume: &str, journal: JournalInfo) -> Opt
 }
 
 fn journal_resume_problem(state: &IndexState, journal: JournalInfo) -> Option<String> {
-    if state.journal_id != journal.journal_id {
+    journal_resume_problem_at(state.journal_id, state.cursor, journal)
+}
+
+fn journal_resume_problem_at(
+    saved_journal_id: u64,
+    saved_cursor: i64,
+    journal: JournalInfo,
+) -> Option<String> {
+    if saved_journal_id != journal.journal_id {
         return Some(format!(
-            "USN journal ID changed (saved {}, current {})",
-            state.journal_id, journal.journal_id
+            "USN journal ID changed (saved {saved_journal_id}, current {})",
+            journal.journal_id
         ));
     }
-    if state.cursor < journal.first_usn {
+    if saved_cursor < journal.first_usn {
         return Some(format!(
-            "saved USN cursor {} has expired; journal FirstUsn is {}",
-            state.cursor, journal.first_usn
+            "saved USN cursor {saved_cursor} has expired; journal FirstUsn is {}",
+            journal.first_usn
         ));
     }
-    if state.cursor < journal.lowest_valid_usn {
+    if saved_cursor < journal.lowest_valid_usn {
         return Some(format!(
-            "saved USN cursor {} predates the journal's LowestValidUsn {}",
-            state.cursor, journal.lowest_valid_usn
+            "saved USN cursor {saved_cursor} predates the journal's LowestValidUsn {}",
+            journal.lowest_valid_usn
         ));
     }
-    if state.cursor > journal.next_usn {
+    if saved_cursor > journal.next_usn {
         return Some(format!(
-            "saved USN cursor {} is ahead of journal NextUsn {}",
-            state.cursor, journal.next_usn
+            "saved USN cursor {saved_cursor} is ahead of journal NextUsn {}",
+            journal.next_usn
         ));
     }
     None
@@ -260,10 +280,99 @@ impl MutableIndex {
         }
     }
 
+    fn live_count(&self) -> usize {
+        self.by_reference.len()
+    }
+
+    /// Approximate retained graph storage (entry vector, FRN buckets, and UTF-8 name buffers).
+    /// Allocator metadata and HashMap control bytes are intentionally excluded; process RSS is
+    /// measured separately in the Windows validation script.
+    fn memory_bytes(&self) -> usize {
+        let entry_strings = self
+            .entries
+            .iter()
+            .flatten()
+            .map(|entry| entry.name.capacity())
+            .sum::<usize>();
+        self.entries.capacity() * std::mem::size_of::<Option<MftEntry>>()
+            + self.by_reference.capacity() * std::mem::size_of::<(u64, usize)>()
+            + entry_strings
+    }
+
+    fn snapshot_entries(&self) -> Vec<MftEntry> {
+        let mut entries: Vec<MftEntry> = self.entries.iter().flatten().cloned().collect();
+        entries.sort_unstable_by_key(|entry| entry.file_reference);
+        entries
+    }
+
+    fn compact_if_sparse(&mut self) {
+        let live = self.by_reference.len();
+        let slots = self.entries.len();
+        let deleted = slots.saturating_sub(live);
+        if slots < 100_000 || deleted.saturating_mul(4) < slots {
+            return;
+        }
+
+        let mut compacted = Vec::with_capacity(live);
+        let mut by_reference = HashMap::with_capacity(live);
+        for entry in self.entries.drain(..).flatten() {
+            let position = compacted.len();
+            by_reference.insert(entry.file_reference, position);
+            compacted.push(Some(entry));
+        }
+        self.entries = compacted;
+        self.by_reference = by_reference;
+    }
+
     fn finish(self) -> Vec<MftEntry> {
         let mut entries: Vec<MftEntry> = self.entries.into_iter().flatten().collect();
         entries.sort_unstable_by_key(|entry| entry.file_reference);
         entries
+    }
+}
+
+/// The helper keeps this mutable FRN graph resident between USN polling cycles. Previously each
+/// one-second poll re-read the entire state file and rebuilt the large file-reference HashMap,
+/// even when the journal contained no changes.
+struct ResidentVolumeIndex {
+    volume: String,
+    roots: Vec<String>,
+    max_depth: usize,
+    journal_id: u64,
+    cursor: i64,
+    index: MutableIndex,
+    dirty: bool,
+}
+
+impl ResidentVolumeIndex {
+    fn from_state(state: IndexState, dirty: bool) -> Self {
+        let volume = state.volume;
+        let index = MutableIndex::new(state.entries);
+        eprintln!(
+            "Resident NTFS graph on {volume}: {} MFT entries, approximately {:.1} MiB retained graph storage; FRN map will be reused between journal polls",
+            index.live_count(),
+            index.memory_bytes() as f64 / (1024.0 * 1024.0)
+        );
+        Self {
+            volume,
+            roots: state.roots,
+            max_depth: state.max_depth,
+            journal_id: state.journal_id,
+            cursor: state.cursor,
+            index,
+            dirty,
+        }
+    }
+
+    fn snapshot_state(&self, roots: &[String], max_depth: usize) -> IndexState {
+        IndexState {
+            volume: self.volume.clone(),
+            roots: roots.to_vec(),
+            max_depth,
+            journal_id: self.journal_id,
+            cursor: self.cursor,
+            entries: self.index.snapshot_entries(),
+        }
     }
 }
 
@@ -275,94 +384,44 @@ fn apply_changes(index: &mut MutableIndex, changes: Vec<UsnChange>) -> usize {
         let _record_usn = change.usn;
         index.apply(change);
     }
+    index.compact_if_sparse();
     count
 }
 
-fn encode_state(state: &IndexState) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(STATE_MAGIC);
-    put_string(&mut bytes, &state.volume)?;
-    put_u32(
-        &mut bytes,
-        u32::try_from(state.roots.len()).map_err(|_| "Too many configured roots".to_string())?,
-    );
-    for root in &state.roots {
-        put_string(&mut bytes, root)?;
-    }
-    put_u64(&mut bytes, state.max_depth as u64);
-    put_u64(&mut bytes, state.journal_id);
-    put_u64(&mut bytes, state.cursor as u64);
-    put_u64(&mut bytes, state.entries.len() as u64);
-    for entry in &state.entries {
-        put_u64(&mut bytes, entry.file_reference);
-        put_u64(&mut bytes, entry.parent_reference);
-        bytes.push(u8::from(entry.is_dir));
-        put_string(&mut bytes, &entry.name)?;
-    }
-    if bytes.len() as u64 > STATE_MAX_BYTES {
-        return Err(format!(
-            "Persistent index would be {} bytes, larger than the {}-byte safety limit",
-            bytes.len(),
-            STATE_MAX_BYTES
-        ));
-    }
-    Ok(bytes)
+struct StateReader<R> {
+    reader: R,
+    remaining: u64,
 }
 
-fn put_u32(bytes: &mut Vec<u8>, value: u32) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-fn put_u64(bytes: &mut Vec<u8>, value: u64) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-fn put_string(bytes: &mut Vec<u8>, value: &str) -> Result<(), String> {
-    if value.len() > STATE_MAX_STRING_BYTES {
-        return Err("A persistent index string exceeds the safety limit".into());
-    }
-    put_u32(
-        bytes,
-        u32::try_from(value.len())
-            .map_err(|_| "Persistent index string is too long".to_string())?,
-    );
-    bytes.extend_from_slice(value.as_bytes());
-    Ok(())
-}
-
-struct StateReader<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> StateReader<'a> {
-    fn take(&mut self, length: usize) -> Result<&'a [u8], String> {
-        let end = self
-            .offset
-            .checked_add(length)
-            .ok_or_else(|| "Persistent index offset overflow".to_string())?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or_else(|| "Persistent index file is truncated".to_string())?;
-        self.offset = end;
-        Ok(value)
+impl<R: std::io::Read> StateReader<R> {
+    fn read_exact(&mut self, target: &mut [u8]) -> Result<(), String> {
+        let length = target.len() as u64;
+        if length > self.remaining {
+            return Err("Persistent index file is truncated".into());
+        }
+        self.reader
+            .read_exact(target)
+            .map_err(|error| format!("Persistent index file is truncated: {error}"))?;
+        self.remaining -= length;
+        Ok(())
     }
 
     fn u8(&mut self) -> Result<u8, String> {
-        Ok(self.take(1)?[0])
+        let mut bytes = [0u8; 1];
+        self.read_exact(&mut bytes)?;
+        Ok(bytes[0])
     }
 
     fn u32(&mut self) -> Result<u32, String> {
-        let value = self.take(4)?;
-        Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+        let mut bytes = [0u8; 4];
+        self.read_exact(&mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
     }
 
     fn u64(&mut self) -> Result<u64, String> {
-        let value = self.take(8)?;
-        Ok(u64::from_le_bytes([
-            value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
-        ]))
+        let mut bytes = [0u8; 8];
+        self.read_exact(&mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
     }
 
     fn string(&mut self) -> Result<String, String> {
@@ -370,19 +429,118 @@ impl<'a> StateReader<'a> {
         if length > STATE_MAX_STRING_BYTES {
             return Err("Persistent index string exceeds the safety limit".into());
         }
-        String::from_utf8(self.take(length)?.to_vec())
-            .map_err(|_| "Persistent index contains invalid UTF-8".to_string())
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|error| format!("Could not allocate persistent index string: {error}"))?;
+        bytes.resize(length, 0);
+        self.read_exact(&mut bytes)?;
+        String::from_utf8(bytes).map_err(|_| "Persistent index contains invalid UTF-8".to_string())
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        if self.remaining != 0 {
+            return Err("Persistent index contains unexpected trailing data".into());
+        }
+        let mut extra = [0u8; 1];
+        match std::io::Read::read(&mut self.reader, &mut extra) {
+            Ok(0) => Ok(()),
+            Ok(_) => Err("Persistent index contains unexpected trailing data".into()),
+            Err(error) => Err(format!(
+                "Could not finish reading persistent index: {error}"
+            )),
+        }
     }
 }
 
-fn decode_state(bytes: &[u8]) -> Result<IndexState, String> {
-    if bytes.len() < STATE_MAGIC.len() || &bytes[..STATE_MAGIC.len()] != STATE_MAGIC {
+struct StateWriter<'a, W> {
+    writer: &'a mut W,
+    written: u64,
+}
+
+impl<'a, W: std::io::Write> StateWriter<'a, W> {
+    fn raw(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let next = self
+            .written
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| "Persistent index size overflow".to_string())?;
+        if next > STATE_MAX_BYTES {
+            return Err(format!(
+                "Persistent index would exceed the {}-byte safety limit",
+                STATE_MAX_BYTES
+            ));
+        }
+        self.writer
+            .write_all(bytes)
+            .map_err(|error| format!("Could not write persistent index: {error}"))?;
+        self.written = next;
+        Ok(())
+    }
+
+    fn u32(&mut self, value: u32) -> Result<(), String> {
+        self.raw(&value.to_le_bytes())
+    }
+
+    fn u64(&mut self, value: u64) -> Result<(), String> {
+        self.raw(&value.to_le_bytes())
+    }
+
+    fn string(&mut self, value: &str) -> Result<(), String> {
+        if value.len() > STATE_MAX_STRING_BYTES {
+            return Err("A persistent index string exceeds the safety limit".into());
+        }
+        self.u32(
+            u32::try_from(value.len())
+                .map_err(|_| "Persistent index string is too long".to_string())?,
+        )?;
+        self.raw(value.as_bytes())
+    }
+}
+
+fn write_state<W: std::io::Write>(writer: &mut W, state: &IndexState) -> Result<u64, String> {
+    let mut output = StateWriter { writer, written: 0 };
+    output.raw(STATE_MAGIC)?;
+    output.string(&state.volume)?;
+    output.u32(
+        u32::try_from(state.roots.len()).map_err(|_| "Too many configured roots".to_string())?,
+    )?;
+    for root in &state.roots {
+        output.string(root)?;
+    }
+    output.u64(state.max_depth as u64)?;
+    output.u64(state.journal_id)?;
+    output.u64(state.cursor as u64)?;
+    output.u64(state.entries.len() as u64)?;
+    for entry in &state.entries {
+        output.u64(entry.file_reference)?;
+        output.u64(entry.parent_reference)?;
+        output.raw(&[u8::from(entry.is_dir)])?;
+        output.string(&entry.name)?;
+    }
+    Ok(output.written)
+}
+
+#[cfg(test)]
+fn encode_state(state: &IndexState) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    write_state(&mut bytes, state)?;
+    Ok(bytes)
+}
+
+fn decode_state_reader<R: std::io::Read>(reader: R, size: u64) -> Result<IndexState, String> {
+    if size < STATE_MAGIC.len() as u64 {
         return Err("Persistent index has an unknown file signature".into());
     }
     let mut reader = StateReader {
-        bytes,
-        offset: STATE_MAGIC.len(),
+        reader,
+        remaining: size,
     };
+    let mut magic = [0u8; STATE_MAGIC.len()];
+    reader.read_exact(&mut magic)?;
+    if &magic != STATE_MAGIC {
+        return Err("Persistent index has an unknown file signature".into());
+    }
+
     let volume = reader.string()?;
     let root_count = reader.u32()? as usize;
     if root_count == 0 || root_count > 4096 {
@@ -403,14 +561,16 @@ fn decode_state(bytes: &[u8]) -> Result<IndexState, String> {
     // Each encoded entry needs at least 21 bytes (two u64 references, a directory byte, and a
     // u32 string length). Check this before reserving memory so a tiny corrupt state file cannot
     // claim a huge entry count and trigger an excessive allocation.
-    let remaining = bytes.len().saturating_sub(reader.offset);
-    let maximum_possible_entries = (remaining / 21) as u64;
+    let maximum_possible_entries = reader.remaining / 21;
     if entry_count > maximum_possible_entries {
         return Err("Persistent index entry count exceeds the remaining file data".into());
     }
     let entry_capacity = usize::try_from(entry_count)
         .map_err(|_| "Persistent index entry count does not fit this platform".to_string())?;
-    let mut entries = Vec::with_capacity(entry_capacity);
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(entry_capacity)
+        .map_err(|error| format!("Could not allocate persistent MFT entries: {error}"))?;
     for _ in 0..entry_count {
         let file_reference = reader.u64()?;
         let parent_reference = reader.u64()?;
@@ -427,9 +587,7 @@ fn decode_state(bytes: &[u8]) -> Result<IndexState, String> {
             is_dir,
         });
     }
-    if reader.offset != bytes.len() {
-        return Err("Persistent index contains unexpected trailing data".into());
-    }
+    reader.finish()?;
     Ok(IndexState {
         volume,
         roots,
@@ -438,6 +596,11 @@ fn decode_state(bytes: &[u8]) -> Result<IndexState, String> {
         cursor,
         entries,
     })
+}
+
+#[cfg(test)]
+fn decode_state(bytes: &[u8]) -> Result<IndexState, String> {
+    decode_state_reader(std::io::Cursor::new(bytes), bytes.len() as u64)
 }
 
 fn load_state(path: &Path) -> Result<Option<IndexState>, String> {
@@ -453,12 +616,12 @@ fn load_state(path: &Path) -> Result<Option<IndexState>, String> {
             STATE_MAX_BYTES
         ));
     }
-    let bytes =
-        fs::read(path).map_err(|error| format!("Could not read persistent index: {error}"))?;
-    decode_state(&bytes).map(Some)
+    let file = fs::File::open(path)
+        .map_err(|error| format!("Could not open persistent index: {error}"))?;
+    decode_state_reader(std::io::BufReader::new(file), metadata.len()).map(Some)
 }
 
-fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn write_state_temporary(path: &Path, state: &IndexState) -> Result<PathBuf, String> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -467,10 +630,21 @@ fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
             .map_err(|error| format!("Could not create state folder: {error}"))?;
     }
     let temporary = path.with_extension("state.tmp");
-    fs::write(&temporary, bytes)
-        .map_err(|error| format!("Could not write temporary state file: {error}"))?;
-    crate::atomic::replace(&temporary, path)
-        .map_err(|error| format!("Could not replace persistent state file: {error}"))
+    let file = fs::File::create(&temporary)
+        .map_err(|error| format!("Could not create temporary state file: {error}"))?;
+    let mut writer = std::io::BufWriter::new(file);
+    if let Err(error) = write_state(&mut writer, state) {
+        drop(writer);
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = writer.flush() {
+        drop(writer);
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("Could not flush temporary state file: {error}"));
+    }
+    drop(writer);
+    Ok(temporary)
 }
 
 fn persist_outputs(
@@ -478,20 +652,25 @@ fn persist_outputs(
     snapshot_path: &Path,
     state_path: &Path,
 ) -> Result<usize, String> {
-    // Serialize and validate the state before replacing the snapshot. The cache itself is streamed
-    // to a temporary file so a whole-volume export does not require a second volume-sized String.
-    let state_bytes = encode_state(state)?;
-    let count = mft::write_cache_atomically(
+    // Stage the state file first, but stream it through a bounded buffer instead of allocating a
+    // second volume-sized byte Vec. The search snapshot is then replaced before the cursor state:
+    // a crash between those replacements safely replays journal records on the next start.
+    let temporary_state = write_state_temporary(state_path, state)?;
+    let count = match mft::write_cache_atomically(
         snapshot_path,
         &state.entries,
         &state.roots,
         state.max_depth,
         &state.volume,
-    )?;
-    // Write the derived cache first. If saving the cursor subsequently fails, replaying the same
-    // journal records on the next run is safe and idempotent; saving the cursor first could leave
-    // a stale cache if the process stopped between the two writes.
-    write_bytes_atomically(state_path, &state_bytes)?;
+    ) {
+        Ok(count) => count,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary_state);
+            return Err(error);
+        }
+    };
+    crate::atomic::replace(&temporary_state, state_path)
+        .map_err(|error| format!("Could not replace persistent index: {error}"))?;
     Ok(count)
 }
 
@@ -568,201 +747,326 @@ fn rebuild_state(
     Err("The USN journal changed repeatedly during the MFT baseline. Run the helper again.".into())
 }
 
+fn rebuild_resident(
+    volume: &str,
+    roots: &[String],
+    max_depth: usize,
+    old_cursor: i64,
+    resident: &mut Option<ResidentVolumeIndex>,
+) -> Result<SyncStats, String> {
+    let (state, changes_read) = rebuild_state(volume, roots, max_depth)?;
+    let cursor_after = state.cursor;
+    *resident = Some(ResidentVolumeIndex::from_state(state, true));
+    Ok(SyncStats {
+        changes_read,
+        cursor_before: old_cursor,
+        cursor_after,
+        rebuilt: true,
+        scope_changed: false,
+    })
+}
+
+/// Synchronize a volume against its resident FRN graph. Persistent state is loaded once when the
+/// helper starts; subsequent polling cycles query the USN journal and apply deltas in place.
 fn sync_once(
     volume: &str,
     roots: &[String],
     max_depth: usize,
     state_path: &Path,
-) -> Result<(IndexState, SyncStats), String> {
+    resident: &mut Option<ResidentVolumeIndex>,
+) -> Result<SyncStats, String> {
     let journal = native::query_journal(volume)?;
-    let loaded = match load_state(state_path) {
-        Ok(state) => state,
-        Err(error) => {
-            eprintln!("Persistent index cannot be resumed ({error}); rebuilding from the MFT.");
-            None
-        }
-    };
 
-    if let Some(state) = loaded {
-        let scope_changed = !config_matches(&state, volume, roots, max_depth);
-        // The saved FRN graph contains the whole volume; roots/depth are export filters only.
-        // Reuse that graph for a scope change as long as this is the same volume and the USN
-        // cursor is still valid. A volume or journal identity change still requires a rebuild.
-        let reason = resume_problem(&state, volume, journal);
-        if let Some(reason) = reason {
-            eprintln!("Cannot resume the saved index: {reason}. Rebuilding from the MFT.");
-        } else {
-            let cursor_before = state.cursor;
-            let mut index = MutableIndex::new(state.entries);
-            let (cursor_after, changes_read) = match native::read_changes(
-                volume,
-                cursor_before,
-                journal.journal_id,
-                journal.next_usn,
-                |batch| {
-                    apply_changes(&mut index, batch);
-                },
-            ) {
-                Ok(result) => result,
-                Err(error) => {
-                    let latest = native::query_journal(volume)?;
-                    if latest.journal_id == journal.journal_id
-                        && cursor_before >= latest.first_usn
-                        && cursor_before >= latest.lowest_valid_usn
-                        && cursor_before <= latest.next_usn
-                    {
-                        return Err(error);
-                    }
-                    eprintln!("The saved journal position expired while reading; rebuilding from the MFT.");
-                    return rebuild_with_stats(volume, roots, max_depth, cursor_before);
-                }
-            };
-
-            let latest = native::query_journal(volume)?;
-            if latest.journal_id == journal.journal_id
-                && cursor_after >= latest.first_usn
-                && cursor_after >= latest.lowest_valid_usn
-                && cursor_after <= latest.next_usn
-            {
-                let updated = IndexState {
-                    volume: state.volume,
-                    roots: roots.to_vec(),
-                    max_depth,
-                    journal_id: latest.journal_id,
-                    cursor: cursor_after,
-                    entries: index.finish(),
-                };
-                return Ok((
-                    updated,
-                    SyncStats {
-                        changes_read,
-                        cursor_before,
-                        cursor_after,
-                        rebuilt: false,
-                        scope_changed,
-                    },
-                ));
+    if resident.is_none() {
+        let loaded = match load_state(state_path) {
+            Ok(state) => state,
+            Err(error) => {
+                eprintln!("Persistent index cannot be resumed ({error}); rebuilding from the MFT.");
+                None
             }
-            eprintln!("The USN journal changed during synchronization; rebuilding from the MFT.");
+        };
+        match loaded {
+            Some(state) => {
+                if let Some(reason) = resume_problem(&state, volume, journal) {
+                    eprintln!("Cannot resume the saved index: {reason}. Rebuilding from the MFT.");
+                    let old_cursor = state.cursor;
+                    return rebuild_resident(volume, roots, max_depth, old_cursor, resident);
+                }
+                let scope_changed = !config_matches(&state, volume, roots, max_depth);
+                *resident = Some(ResidentVolumeIndex::from_state(state, scope_changed));
+            }
+            None => return rebuild_resident(volume, roots, max_depth, 0, resident),
         }
     }
 
-    rebuild_with_stats(volume, roots, max_depth, 0)
-}
+    let (current_volume_matches, current_cursor, current_journal_id, scope_changed) = {
+        let current = resident
+            .as_ref()
+            .ok_or_else(|| "NTFS resident index initialization failed".to_string())?;
+        (
+            current.volume.eq_ignore_ascii_case(volume),
+            current.cursor,
+            current.journal_id,
+            normalized_roots(&current.roots) != normalized_roots(roots)
+                || current.max_depth != max_depth,
+        )
+    };
+    if !current_volume_matches {
+        eprintln!("The resident index belongs to a different volume; rebuilding from the MFT.");
+        return rebuild_resident(volume, roots, max_depth, current_cursor, resident);
+    }
+    if let Some(reason) = journal_resume_problem_at(current_journal_id, current_cursor, journal) {
+        eprintln!("Cannot resume the resident index: {reason}. Rebuilding from the MFT.");
+        return rebuild_resident(volume, roots, max_depth, current_cursor, resident);
+    }
 
-fn rebuild_with_stats(
-    volume: &str,
-    roots: &[String],
-    max_depth: usize,
-    old_cursor: i64,
-) -> Result<(IndexState, SyncStats), String> {
-    let (state, changes_read) = rebuild_state(volume, roots, max_depth)?;
-    let cursor_after = state.cursor;
-    Ok((
-        state,
-        SyncStats {
-            changes_read,
-            cursor_before: old_cursor,
-            cursor_after,
-            rebuilt: true,
-            scope_changed: false,
+    let cursor_before = current_cursor;
+    let (cursor_after, changes_read) = match native::read_changes(
+        volume,
+        cursor_before,
+        journal.journal_id,
+        journal.next_usn,
+        |batch| {
+            if let Some(current) = resident.as_mut() {
+                apply_changes(&mut current.index, batch);
+                current.dirty = true;
+            }
         },
-    ))
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            let latest = native::query_journal(volume)?;
+            if latest.journal_id == journal.journal_id
+                && cursor_before >= latest.first_usn
+                && cursor_before >= latest.lowest_valid_usn
+                && cursor_before <= latest.next_usn
+            {
+                // Earlier batches may already have been applied. Keep the old cursor and retry;
+                // replaying those records is idempotent and the dirty flag forces persistence.
+                if let Some(current) = resident.as_mut() {
+                    current.dirty = true;
+                }
+                return Err(error);
+            }
+            eprintln!("The saved journal position expired while reading; rebuilding from the MFT.");
+            return rebuild_resident(volume, roots, max_depth, cursor_before, resident);
+        }
+    };
+
+    let latest = native::query_journal(volume)?;
+    if latest.journal_id == journal.journal_id
+        && cursor_after >= latest.first_usn
+        && cursor_after >= latest.lowest_valid_usn
+        && cursor_after <= latest.next_usn
+    {
+        let current = resident
+            .as_mut()
+            .ok_or_else(|| "NTFS resident index disappeared during synchronization".to_string())?;
+        current.journal_id = latest.journal_id;
+        current.cursor = cursor_after;
+        current.dirty |= changes_read > 0 || cursor_before != cursor_after || scope_changed;
+        return Ok(SyncStats {
+            changes_read,
+            cursor_before,
+            cursor_after,
+            rebuilt: false,
+            scope_changed,
+        });
+    }
+
+    eprintln!("The USN journal changed during synchronization; rebuilding from the MFT.");
+    rebuild_resident(volume, roots, max_depth, cursor_before, resident)
 }
 
-/// Synchronize one volume. By default the helper exits after one sync; `--watch` keeps it alive
-/// and polls for new USN records at the configured interval.
-pub(super) fn run(
-    volume: &str,
-    roots: &[String],
-    max_depth: usize,
-    snapshot_path: &Path,
-    state_path: &Path,
+/// Synchronize one volume for a single polling round. The boolean says whether this volume
+/// completed successfully; the optional count is present only when its snapshot was rewritten.
+fn sync_volume_round(
+    volume: &VolumeConfig,
+    watch: bool,
+    initialized: bool,
+    poll_seconds: u64,
+    resident: &mut Option<ResidentVolumeIndex>,
+) -> Result<(bool, Option<usize>), String> {
+    let stats = match sync_once(
+        &volume.volume,
+        &volume.roots,
+        volume.max_depth,
+        &volume.state_path,
+        resident,
+    ) {
+        Ok(stats) => stats,
+        Err(error) if watch && initialized => {
+            eprintln!(
+                "USN synchronization failed for {}: {error}. Retrying in {poll_seconds}s.",
+                volume.volume
+            );
+            return Ok((false, None));
+        }
+        Err(error) => return Err(error),
+    };
+
+    let current = resident
+        .as_ref()
+        .ok_or_else(|| "NTFS resident index is unavailable after synchronization".to_string())?;
+    let has_outputs = volume.snapshot_path.exists() && volume.state_path.exists();
+    let changed = current.dirty
+        || stats.rebuilt
+        || stats.changes_read > 0
+        || stats.cursor_before != stats.cursor_after
+        || stats.scope_changed
+        || !has_outputs;
+    if !changed {
+        if !watch {
+            println!(
+                "NTFS index on {} is up to date at USN {}; no changes to apply.",
+                volume.volume, current.cursor
+            );
+        }
+        return Ok((true, None));
+    }
+
+    // Clone the MFT entries only when a real journal/scope change needs persistence. The much
+    // larger FRN HashMap and mutable graph remain resident and are not rebuilt every poll.
+    let state = current.snapshot_state(&volume.roots, volume.max_depth);
+    match persist_outputs(&state, &volume.snapshot_path, &volume.state_path) {
+        Ok(indexed) => {
+            if let Some(current) = resident.as_mut() {
+                current.roots = volume.roots.clone();
+                current.max_depth = volume.max_depth;
+                current.dirty = false;
+            }
+            if stats.rebuilt {
+                println!(
+                    "Built NTFS index on {}: {} MFT entries, {} journal changes replayed, {} paths exported.",
+                    volume.volume, state.entries.len(), stats.changes_read, indexed
+                );
+            } else if stats.scope_changed {
+                println!(
+                    "Updated NTFS index scope on {} using the resident MFT graph; applied {} USN journal records (cursor {} -> {}); {} paths exported.",
+                    volume.volume, stats.changes_read, stats.cursor_before, stats.cursor_after, indexed
+                );
+            } else {
+                println!(
+                    "Applied {} USN journal records on {} (cursor {} -> {}); {} paths exported.",
+                    stats.changes_read,
+                    volume.volume,
+                    stats.cursor_before,
+                    stats.cursor_after,
+                    indexed
+                );
+            }
+            Ok((true, Some(indexed)))
+        }
+        Err(error) if watch && initialized => {
+            // Leave the resident graph and cursor in memory, marked dirty. The next poll retries
+            // writing the same current snapshot/state; a process restart safely replays from disk.
+            if let Some(current) = resident.as_mut() {
+                current.dirty = true;
+            }
+            eprintln!(
+                "Could not persist the NTFS index for {}: {error}. Retrying in {poll_seconds}s.",
+                volume.volume
+            );
+            Ok((false, None))
+        }
+        Err(error) => {
+            if let Some(current) = resident.as_mut() {
+                current.dirty = true;
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Synchronize one or more NTFS volumes. Each volume has its own MFT/USN state and snapshot;
+/// all snapshots are served through one search pipe. For a single volume, paths are unchanged.
+pub(super) fn run_many(
+    volumes: &[VolumeConfig],
     watch: bool,
     poll_seconds: u64,
 ) -> Result<(), String> {
-    mft::validate_volume_and_roots(volume, roots)?;
+    if volumes.is_empty() {
+        return Err("At least one NTFS volume must be configured".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for volume in volumes {
+        mft::validate_volume_and_roots(&volume.volume, &volume.roots)?;
+        if !seen.insert(volume.volume.to_ascii_uppercase()) {
+            return Err(format!("Duplicate NTFS volume {}", volume.volume));
+        }
+        if volume.snapshot_path == volume.state_path {
+            return Err(format!(
+                "Snapshot and state paths collide for {}",
+                volume.volume
+            ));
+        }
+    }
+
     let mut initialized = false;
+    let mut path_counts: Vec<Option<usize>> = vec![None; volumes.len()];
+    let mut resident: Vec<Option<ResidentVolumeIndex>> = std::iter::repeat_with(|| None)
+        .take(volumes.len())
+        .collect();
     let health = super::status::global();
     let shutdown = super::shutdown::global();
 
-    // A journal cursor is only advanced after its changes were applied and both output files
-    // were written (see `persist_outputs`), so stopping between passes never loses changes.
+    // A cycle is considered ready only after every configured volume has completed a successful
+    // synchronization round. A failed/offline volume therefore becomes visible as stale instead
+    // of silently serving an incomplete multi-drive result set.
     while !shutdown.requested() {
-        match sync_once(volume, roots, max_depth, state_path) {
-            Ok((state, stats)) => {
-                let has_outputs = snapshot_path.exists() && state_path.exists();
-                let changed = stats.rebuilt
-                    || stats.changes_read > 0
-                    || stats.cursor_before != stats.cursor_after
-                    || stats.scope_changed
-                    || !has_outputs;
-                let mut outputs_current = true;
-                if changed {
-                    match persist_outputs(&state, snapshot_path, state_path) {
-                        Ok(indexed) => {
-                            health.set_entries(indexed);
-                            if stats.rebuilt {
-                                println!(
-                                    "Built NTFS index: {} MFT entries, {} journal changes replayed, {} paths exported.",
-                                    state.entries.len(), stats.changes_read, indexed
-                                );
-                            } else if stats.scope_changed {
-                                println!(
-                                    "Updated NTFS index scope using the saved MFT graph; applied {} USN journal records (cursor {} -> {}); {} paths exported.",
-                                    stats.changes_read, stats.cursor_before, stats.cursor_after, indexed
-                                );
-                            } else {
-                                println!(
-                                    "Applied {} USN journal records (cursor {} -> {}); {} paths exported.",
-                                    stats.changes_read, stats.cursor_before, stats.cursor_after, indexed
-                                );
-                            }
-                        }
-                        Err(error) if watch && initialized => {
-                            // Do not advance the persisted cursor when either output could not
-                            // be replaced. The next pass reloads the old state and safely replays
-                            // these journal records; this is preferable to killing a healthy
-                            // logon helper for a transient Windows sharing conflict.
-                            outputs_current = false;
-                            health.mark_sync_failed();
-                            eprintln!(
-                                "Could not persist the NTFS index: {error}. Retrying in {poll_seconds}s."
-                            );
-                        }
-                        Err(error) => return Err(error),
+        let mut all_current = true;
+        for (position, volume) in volumes.iter().enumerate() {
+            match sync_volume_round(
+                volume,
+                watch,
+                initialized,
+                poll_seconds,
+                &mut resident[position],
+            ) {
+                Ok((current, Some(count))) => {
+                    path_counts[position] = Some(count);
+                    all_current &= current;
+                }
+                Ok((current, None)) => {
+                    if path_counts[position].is_none() && volume.snapshot_path.exists() {
+                        path_counts[position] = Some(count_snapshot_paths(&volume.snapshot_path));
                     }
-                } else {
-                    if health.snapshot().entries == 0 {
-                        // Resumed from saved files with nothing new: report the size of the
-                        // snapshot that is already on disk (header line excluded).
-                        health.set_entries(count_snapshot_paths(snapshot_path));
-                    }
-                    if !watch {
-                        println!(
-                            "NTFS index is up to date at USN {}; no changes to apply.",
-                            state.cursor
-                        );
+                    all_current &= current;
+                    // A missing initial snapshot must not be reported as healthy.
+                    if path_counts[position].is_none() {
+                        all_current = false;
                     }
                 }
-                // Only now is the on-disk snapshot known to be current, so only now may the
-                // pipe serve it (the first success flips the helper from starting to ready).
-                if outputs_current {
-                    health.mark_sync_ok(super::status::now_unix());
-                }
+                Err(error) => return Err(error),
             }
-            Err(error) if watch && initialized => {
-                health.mark_sync_failed();
-                eprintln!("USN synchronization failed: {error}. Retrying in {poll_seconds}s.");
+            if !volume.snapshot_path.exists() || !volume.state_path.exists() {
+                all_current = false;
             }
-            // Before the first success there is nothing to serve; exit non-zero so Task
-            // Scheduler's restart-on-failure policy retries instead of idling unhealthy.
-            Err(error) => return Err(error),
+        }
+
+        if all_current && path_counts.iter().all(Option::is_some) {
+            let total = path_counts
+                .iter()
+                .flatten()
+                .copied()
+                .fold(0usize, usize::saturating_add);
+            health.set_entries(total);
+            health.mark_sync_ok(super::status::now_unix());
+        } else {
+            health.mark_sync_failed();
+            eprintln!("One or more configured NTFS volumes are not current; helper health will become stale until all configured volumes recover.");
         }
 
         initialized = true;
         if !watch {
-            return Ok(());
+            return if all_current {
+                Ok(())
+            } else {
+                Err(
+                    "One or more configured NTFS volumes did not complete the initial index pass"
+                        .into(),
+                )
+            };
         }
         if shutdown.sleep(Duration::from_secs(poll_seconds)) {
             break;
@@ -771,17 +1075,24 @@ pub(super) fn run(
     Ok(())
 }
 
-/// Number of exported paths in an existing snapshot (every line after the header).
+/// Number of exported paths in an existing snapshot (every line after the header). Stream the
+/// count so a multi-million-path TSV is never read into a second full-size byte buffer.
 fn count_snapshot_paths(path: &Path) -> usize {
-    fs::read(path)
-        .map(|bytes| {
-            bytes
-                .iter()
-                .filter(|b| **b == b'\n')
-                .count()
-                .saturating_sub(1)
-        })
-        .unwrap_or(0)
+    use std::io::BufRead;
+    let Ok(file) = fs::File::open(path) else {
+        return 0;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    let mut lines = 0usize;
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => lines = lines.saturating_add(1),
+        }
+    }
+    lines.saturating_sub(1)
 }
 
 #[cfg(windows)]
@@ -1114,6 +1425,40 @@ mod tests {
     }
 
     #[test]
+    fn resident_graph_applies_journal_deltas_without_rebuilding_the_frn_map() {
+        let mut resident = ResidentVolumeIndex::from_state(sample_state(), false);
+        let initial_map_capacity = resident.index.by_reference.capacity();
+        assert_eq!(resident.index.live_count(), 3);
+
+        let applied = apply_changes(
+            &mut resident.index,
+            vec![UsnChange {
+                file_reference: 22,
+                parent_reference: 21,
+                usn: 120,
+                reason: 0x0000_2000, // USN_REASON_RENAME_NEW_NAME
+                name: "notes-renamed.txt".into(),
+                is_dir: false,
+            }],
+        );
+        resident.dirty = applied > 0;
+        resident.cursor = 120;
+
+        assert_eq!(applied, 1);
+        assert_eq!(resident.index.live_count(), 3);
+        assert_eq!(resident.index.by_reference.capacity(), initial_map_capacity);
+        assert!(resident.dirty);
+
+        let snapshot = resident.snapshot_state(&[r"C:".into()], usize::MAX);
+        assert_eq!(snapshot.cursor, 120);
+        assert_eq!(snapshot.roots, vec![r"C:"]);
+        assert!(snapshot
+            .entries
+            .iter()
+            .any(|entry| { entry.file_reference == 22 && entry.name == "notes-renamed.txt" }));
+    }
+
+    #[test]
     fn full_volume_scope_change_reuses_valid_same_volume_mft_state() {
         let state = sample_state();
         let journal = JournalInfo {
@@ -1268,6 +1613,21 @@ mod tests {
         assert_eq!(decoded.journal_id, state.journal_id);
         assert_eq!(decoded.cursor, state.cursor);
         assert_eq!(decoded.entries.len(), state.entries.len());
+
+        // Production startup reads through BufReader rather than duplicating the entire state
+        // file in memory. Exercise the same path used by the elevated helper.
+        let path = std::env::temp_dir().join(format!(
+            "okra-state-stream-{}-{}.state",
+            std::process::id(),
+            state.cursor
+        ));
+        let temporary = write_state_temporary(&path, &state).unwrap();
+        crate::atomic::replace(&temporary, &path).unwrap();
+        let streamed = load_state(&path).unwrap().unwrap();
+        assert_eq!(streamed.volume, state.volume);
+        assert_eq!(streamed.roots, state.roots);
+        assert_eq!(streamed.entries.len(), state.entries.len());
+        let _ = fs::remove_file(&path);
 
         let mut with_trailing = encoded.clone();
         with_trailing.push(0);
