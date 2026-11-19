@@ -8,7 +8,9 @@
 //! refused with a non-zero `OKR1` status while the helper is starting, stopping, or stale, so
 //! the launcher falls through to its next backend instead of showing outdated results.
 
-use okra_core::matcher::{char_mask, file_name_score, lc, Query};
+use okra_core::matcher::{
+    char_mask, file_name_score, is_normalized_prefix, lc, non_prefix_score_ceiling, Query,
+};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::path::PathBuf;
@@ -301,6 +303,8 @@ impl SnapshotCache {
         required_bits[..required_len]
             .sort_unstable_by_key(|bit| self.character_counts[*bit as usize]);
 
+        let non_prefix_ceiling = non_prefix_score_ceiling(query.len());
+        let mut heap_floor_beats_non_prefix = false;
         let mut word = 0usize;
         while word < words {
             let mut candidate_word = u64::MAX;
@@ -318,6 +322,15 @@ impl SnapshotCache {
                     continue;
                 }
                 let entry = &self.entries[position];
+                // Prefix-band results always outrank non-prefix ones. Once the heap is full and
+                // its worst entry is at or above the best score any non-prefix candidate can
+                // reach, such a candidate cannot enter the heap (later positions lose ties), so
+                // it is skipped without running the scorer.
+                if heap_floor_beats_non_prefix
+                    && !is_normalized_prefix(self.lower_text(entry), &query)
+                {
+                    continue;
+                }
                 if let Some(rank) = file_name_score(
                     &query,
                     self.name_text(entry),
@@ -331,6 +344,11 @@ impl SnapshotCache {
                     } else if best.peek().is_some_and(|worst| quality > worst.0) {
                         best.pop();
                         best.push(candidate);
+                    }
+                    if best.len() >= max {
+                        heap_floor_beats_non_prefix = best
+                            .peek()
+                            .is_some_and(|worst| (worst.0).0 >= non_prefix_ceiling);
                     }
                 }
             }
@@ -1137,5 +1155,176 @@ mod tests {
             let p95 = samples_ms[(samples_ms.len() * 95 / 100).min(samples_ms.len() - 1)];
             eprintln!("{query}: {result_count} results; median {median:.2} ms; p95 {p95:.2} ms");
         }
+    }
+
+    /// Pruning must never change results: compare against scoring every entry (no bitset, no
+    /// heap, no ceiling) on a corpus with many prefix hits and many fuzzy-only hits.
+    #[test]
+    fn pruned_search_equals_brute_force_ranking() {
+        let mut cache = SnapshotCache::default();
+        let mut names = Vec::new();
+        let mut seed = 0x1234_5678_9ABC_DEF0u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        const WORDS: &[&str] = &[
+            "doc", "document", "Documents", "data", "old", "Cargo", "cargo-lock", "unit", "meet",
+            "notes", "my document", "D_o_c", "Down Load", "report", "tmp", "config",
+        ];
+        for index in 0..6_000 {
+            let a = WORDS[(next() % WORDS.len() as u64) as usize];
+            let b = WORDS[(next() % WORDS.len() as u64) as usize];
+            let ext = ["txt", "rs", "pdf", "md"][(next() % 4) as usize];
+            let name = match next() % 3 {
+                0 => format!(r"C:\x\{a}{index}.{ext}"),
+                1 => format!(r"C:\x\{a}_{b}-{index}.{ext}"),
+                _ => format!(r"C:\x\{b}{a}{index}.{ext}"),
+            };
+            let is_dir = next() % 11 == 0;
+            names.push((name.clone(), is_dir));
+            cache.append_path(&name, is_dir).unwrap();
+        }
+        cache.rebuild_postings().unwrap();
+        for query_text in ["doc", "document", "cargo", "do", "dcmnt", "my doc", "unit", "d_o", "tmp"] {
+            for max in [1usize, 7, 50, 200] {
+                let query = Query::new(query_text);
+                let mut all: Vec<(i64, usize)> = Vec::new();
+                for (position, entry) in cache.entries.iter().enumerate() {
+                    if let Some(rank) = file_name_score(
+                        &query,
+                        cache.name_text(entry),
+                        cache.lower_text(entry),
+                        entry.is_dir,
+                    ) {
+                        all.push((rank, position));
+                    }
+                }
+                all.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+                let expected: Vec<(String, bool)> = all
+                    .into_iter()
+                    .take(max)
+                    .map(|(_, p)| {
+                        let e = &cache.entries[p];
+                        (cache.path_text(e).to_owned(), e.is_dir)
+                    })
+                    .collect();
+                let actual = cache.search(query_text, max).unwrap();
+                assert_eq!(actual, expected, "query {query_text:?} max {max}");
+            }
+        }
+    }
+
+    /// Synthetic but less pathological than `bench_million_entry_search`: pseudo-random
+    /// syllable names, with only a small share of names starting with or containing the
+    /// queries. `cargo test --release -- --ignored --nocapture bench_mixed_corpus_search`
+    #[test]
+    #[ignore]
+    fn bench_mixed_corpus_search() {
+        let mut cache = SnapshotCache::default();
+        let mut seed = 0xC0FF_EE00_1234_5678u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        const SYL: &[&str] = &[
+            "ba", "co", "de", "fi", "go", "hu", "ja", "ki", "lo", "mu", "ne", "or", "pa", "qu",
+            "re", "so", "tu", "um", "vi", "wa", "xe", "yo", "ze", "do", "cu", "me", "nt", "ta",
+        ];
+        for index in 0..1_000_000usize {
+            let mut stem = String::new();
+            for _ in 0..(2 + next() % 4) {
+                stem.push_str(SYL[(next() % SYL.len() as u64) as usize]);
+            }
+            let ext = ["txt", "dll", "png", "rs", "pdf", "js", "json"][(next() % 7) as usize];
+            let name = match index % 1000 {
+                0 => format!(r"C:\Users\bench\Documents\document-{index}.{ext}"),
+                1 | 2 => format!(r"C:\Users\bench\Work\my-document-{stem}-{index}.{ext}"),
+                3 => format!(r"C:\Users\bench\Code\cargo-{stem}.{ext}"),
+                _ => format!(r"C:\Data\{}\{stem}{index}.{ext}", ["a", "b", "c", "d"][index % 4]),
+            };
+            cache.append_path(&name, index % 13 == 0).unwrap();
+        }
+        cache.rebuild_postings().unwrap();
+        for query in ["document", "doc", "cargo", "dcmnt", "report", "zzqxjkvw"] {
+            let _ = cache.search(query, 200).unwrap();
+            let mut samples_ms = Vec::with_capacity(25);
+            let mut result_count = 0usize;
+            for _ in 0..25 {
+                let started = std::time::Instant::now();
+                let hits = cache.search(query, 200).unwrap();
+                samples_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+                result_count = hits.len();
+            }
+            samples_ms.sort_by(f64::total_cmp);
+            let median = samples_ms[samples_ms.len() / 2];
+            let p95 = samples_ms[(samples_ms.len() * 95 / 100).min(samples_ms.len() - 1)];
+            eprintln!("mixed {query}: {result_count} results; median {median:.2} ms; p95 {p95:.2} ms");
+        }
+    }
+
+    /// Cost of what one small USN batch triggers today at ~800k entries: serialize the whole
+    /// snapshot, then (in the IPC server) re-parse it and rebuild the postings on the next
+    /// search. Portable pieces only; the state-file write is extra. Run with:
+    /// `cargo test --release -- --ignored --nocapture bench_full_reload_cost`
+    #[test]
+    #[ignore]
+    fn bench_full_reload_cost() {
+        use crate::mft::{write_cache_atomically, MftEntry};
+        let dir = std::env::temp_dir().join("okra-reload-bench");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tsv = dir.join("mft-snapshot.tsv");
+
+        let mut entries = vec![MftEntry {
+            file_reference: 5,
+            parent_reference: 5,
+            name: String::new(),
+            is_dir: true,
+        }];
+        let mut next_frn = 100u64;
+        let mut dirs = vec![5u64];
+        let mut seed = 0xABCD_EF01_2345_6789u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        while entries.len() < 795_000 {
+            let parent = dirs[(rnd() % dirs.len() as u64) as usize];
+            let is_dir = rnd() % 8 == 0 && dirs.len() < 100_000;
+            let frn = next_frn;
+            next_frn += 1;
+            let name = if is_dir {
+                format!("folder-{frn}")
+            } else {
+                format!("file-{frn}.{}", ["txt", "dll", "png", "rs"][(rnd() % 4) as usize])
+            };
+            if is_dir {
+                dirs.push(frn);
+            }
+            entries.push(MftEntry { file_reference: frn, parent_reference: parent, name, is_dir });
+        }
+        let roots = vec!["C:\\".to_string()];
+
+        let started = std::time::Instant::now();
+        let written = write_cache_atomically(&tsv, &entries, &roots, usize::MAX, "C:").unwrap();
+        let write_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let mut cache = SnapshotCache::new(vec![tsv.clone()]);
+        let started = std::time::Instant::now();
+        cache.refresh().unwrap();
+        let reload_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let size = std::fs::metadata(&tsv).unwrap().len();
+        eprintln!(
+            "reload-cost: {written} paths exported in {write_ms:.0} ms ({:.1} MiB TSV); \
+             IPC re-parse + postings {reload_ms:.0} ms; total per small USN batch >= {:.0} ms",
+            size as f64 / (1024.0 * 1024.0),
+            write_ms + reload_ms
+        );
     }
 }

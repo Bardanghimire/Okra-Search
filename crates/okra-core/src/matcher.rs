@@ -183,7 +183,206 @@ pub fn fuzzy(query: &str, text: &str) -> Option<Match> {
     fuzzy_with(&Query::new(query), text)
 }
 
+/// Upper bound on the score of any candidate that is NOT a normalized prefix match, including
+/// the +/-3 file/directory tie-break. The first matched character earns at most 24 (start bonus,
+/// no gap) and each later one at most 12 (adjacency) + 8 + 10 (separator boundary). The +20/+40
+/// contiguous-prefix and exact bonuses apply only to prefix alignments, so they are excluded.
+/// Prefix matches additionally get `PREFIX_FILENAME_BONUS`, so once a result heap holds enough
+/// entries at or above this bound, non-prefix candidates can be skipped without scoring.
+pub fn non_prefix_score_ceiling(query_len: usize) -> i64 {
+    24 + 30 * (query_len.saturating_sub(1) as i64) + 3
+}
+
+/// True when the whitespace-free lowercase name starts with the (already normalized) query.
+pub fn is_normalized_prefix(lower: &str, query: &Query) -> bool {
+    normalized_name_starts_with(lower, query.normalized())
+}
+
+thread_local! {
+    static SPARSE: RefCell<SparseScratch> = RefCell::new(SparseScratch::default());
+}
+
+#[derive(Default)]
+struct SparseScratch {
+    t: Vec<char>,
+    tl: Vec<char>,
+    prev: Vec<(u32, i64)>,
+    cur: Vec<(u32, i64)>,
+}
+
+/// Score-only version of [`run_dp`] that returns exactly the same value.
+///
+/// It keeps only the positions where the name matches each query character (a sparse row)
+/// instead of an m x n table, and it needs no traceback matrix: the +20 contiguous-prefix bonus
+/// applies exactly when the best alignment ends at index m-1, because a cell (i, j) with j == i
+/// can only be reached from (i-1, i-1), so a best end at m-1 implies the whole diagonal matched.
+/// `sparse_score_matches_the_dp` checks equality with `run_dp` on randomized inputs.
+fn run_sparse(q: &[char], text: &str, lower: Option<&str>) -> Option<i64> {
+    let m = q.len();
+    if m == 0 {
+        return Some(0);
+    }
+    // Same allocation-free subsequence rejection as the dynamic program.
+    let mut qi = 0;
+    let mut n = 0usize;
+    match lower {
+        Some(lower) => {
+            for c in lower.chars() {
+                n += 1;
+                if qi < m && c == q[qi] {
+                    qi += 1;
+                }
+            }
+        }
+        None => {
+            for c in text.chars() {
+                n += 1;
+                if qi < m && lc(c) == q[qi] {
+                    qi += 1;
+                }
+            }
+        }
+    }
+    if qi < m || m > n {
+        return None;
+    }
+
+    SPARSE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let SparseScratch { t, tl, prev, cur } = &mut *guard;
+        match lower {
+            // Hot path: the NTFS cache always supplies `lower`, and most Windows names are
+            // ASCII, so index the bytes directly instead of decoding two Vec<char> per candidate.
+            Some(lower) if text.is_ascii() => {
+                sparse_core(q, text.as_bytes(), lower.as_bytes(), n, prev, cur)
+            }
+            _ => {
+                t.clear();
+                t.extend(text.chars());
+                tl.clear();
+                match lower {
+                    Some(lower) => tl.extend(lower.chars()),
+                    None => tl.extend(t.iter().map(|&c| lc(c))),
+                }
+                debug_assert_eq!(t.len(), tl.len());
+                sparse_core(q, t, tl, n, prev, cur)
+            }
+        }
+    })
+}
+
+fn sparse_core<T: Copy + Into<char>>(
+    q: &[char],
+    t: &[T],
+    tl: &[T],
+    n: usize,
+    prev: &mut Vec<(u32, i64)>,
+    cur: &mut Vec<(u32, i64)>,
+) -> Option<i64> {
+    let m = q.len();
+    let bonus_at = |j: usize| -> i64 {
+        let mut bonus = 8;
+        if j == 0 {
+            bonus += 16;
+        } else {
+            let p: char = t[j - 1].into();
+            if is_sep(p) {
+                bonus += 10;
+            } else if p.is_lowercase() && Into::<char>::into(t[j]).is_uppercase() {
+                bonus += 8;
+            }
+        }
+        bonus
+    };
+
+    prev.clear();
+    for j in 0..n {
+        if Into::<char>::into(tl[j]) == q[0] {
+            prev.push((j as u32, bonus_at(j) - (j as i64).min(10)));
+        }
+    }
+    for i in 1..m {
+        cur.clear();
+        // `far` walks the previous row once: it accumulates the running maximum over all
+        // k <= j - 7 (same capped gap penalty), the smallest k winning ties.
+        let mut far_val = NEG;
+        let mut far_ptr = 0usize;
+        let mut near_ptr = 0usize;
+        for j in i..n {
+            if Into::<char>::into(tl[j]) != q[i] {
+                continue;
+            }
+            while far_ptr < prev.len() && (prev[far_ptr].0 as usize) + 7 <= j {
+                let v = prev[far_ptr].1;
+                if v > far_val {
+                    far_val = v;
+                }
+                far_ptr += 1;
+            }
+            let mut best = if far_val != NEG { far_val - 7 } else { NEG };
+            // Near predecessors: k in [max(i-1, j-6), j-1], strict improvement.
+            let lo = (i - 1).max(j.saturating_sub(6));
+            while near_ptr < prev.len() && (prev[near_ptr].0 as usize) < lo {
+                near_ptr += 1;
+            }
+            let mut p = near_ptr;
+            while p < prev.len() && (prev[p].0 as usize) < j {
+                let (k, v) = prev[p];
+                let k = k as usize;
+                let gap = if k + 1 == j {
+                    12
+                } else {
+                    -((j - k - 1) as i64).min(6) - 1
+                };
+                let s = v + gap;
+                if s > best {
+                    best = s;
+                }
+                p += 1;
+            }
+            if best != NEG {
+                cur.push((j as u32, best + bonus_at(j)));
+            }
+        }
+        std::mem::swap(prev, cur);
+        if prev.is_empty() {
+            return None;
+        }
+    }
+
+    let (mut bj, mut bs) = (usize::MAX, NEG);
+    for &(j, v) in prev.iter() {
+        if v > bs {
+            bs = v;
+            bj = j as usize;
+        }
+    }
+    if bj == usize::MAX {
+        return None;
+    }
+    let mut score = bs - (n as i64) / 8;
+    if bj == m - 1 {
+        score += 20; // contiguous prefix
+        if m == n {
+            score += 40; // exact
+        }
+    }
+    Some(score)
+}
+
 fn run(
+    q: &[char],
+    text: &str,
+    lower: Option<&str>,
+    indices_out: Option<&mut Vec<usize>>,
+) -> Option<i64> {
+    if indices_out.is_none() {
+        return run_sparse(q, text, lower);
+    }
+    run_dp(q, text, lower, indices_out)
+}
+
+fn run_dp(
     q: &[char],
     text: &str,
     lower: Option<&str>,
@@ -620,6 +819,96 @@ mod tests {
             let want = reference::fuzzy(q, &text).unwrap();
             let got = fuzzy(q, &text).unwrap();
             assert_eq!((want.0, want.1), (got.score, got.indices));
+        }
+    }
+
+    /// Differential test: the sparse score-only DP must return exactly what the full DP
+    /// returns, on randomized names with separators, mixed case, digits, whitespace and
+    /// non-ASCII letters, for both the `lower` and the on-the-fly-lowercase paths.
+    #[test]
+    fn sparse_score_matches_the_dp() {
+        const ALPHA: &[char] = &[
+            'a', 'b', 'c', 'A', 'B', 'C', '_', '-', '.', ' ', '1', '2', '/', 'é', 'É',
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (mut compared, mut matched) = (0usize, 0usize);
+        for round in 0..600_000 {
+            let len = 1 + (next() % if round % 10 == 0 { 40 } else { 16 }) as usize;
+            let text: String = (0..len)
+                .map(|_| ALPHA[(next() % ALPHA.len() as u64) as usize])
+                .collect();
+            let lower: String = text.chars().map(lc).collect();
+            let q: Vec<char> = match next() % 3 {
+                // true prefix, true subsequence, or arbitrary short query
+                0 => {
+                    let take = 1 + (next() % len as u64) as usize;
+                    lower.chars().take(take).filter(|c| !c.is_whitespace()).collect()
+                }
+                1 => lower
+                    .chars()
+                    .filter(|_| next() % 2 == 0)
+                    .filter(|c| !c.is_whitespace())
+                    .collect(),
+                _ => (0..1 + (next() % 4) as usize)
+                    .map(|_| lc(ALPHA[(next() % ALPHA.len() as u64) as usize]))
+                    .filter(|c| !c.is_whitespace())
+                    .collect(),
+            };
+            if q.is_empty() {
+                continue;
+            }
+            for lower_arg in [Some(lower.as_str()), None] {
+                let dp = run_dp(&q, &text, lower_arg, None);
+                let sparse = run_sparse(&q, &text, lower_arg);
+                assert_eq!(dp, sparse, "text {text:?} query {q:?} lower={}", lower_arg.is_some());
+                compared += 1;
+                matched += dp.is_some() as usize;
+            }
+        }
+        assert!(matched > 200_000, "too few matching cases: {matched}/{compared}");
+    }
+
+    /// The non-prefix ceiling must hold for every non-prefix candidate (it is what lets the
+    /// search skip them once the heap is full of prefix-band hits).
+    #[test]
+    fn non_prefix_ceiling_bounds_every_non_prefix_score() {
+        const ALPHA: &[char] = &['a', 'b', 'c', 'A', 'B', '_', '-', '.', ' ', '1', '/'];
+        let mut seed = 0xDEAD_BEEF_CAFE_F00Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..300_000 {
+            let len = 1 + (next() % 20) as usize;
+            let name: String = (0..len)
+                .map(|_| ALPHA[(next() % ALPHA.len() as u64) as usize])
+                .collect();
+            let lower: String = name.chars().map(lc).collect();
+            let qlen = 1 + (next() % 5) as usize;
+            let text_q: String = (0..qlen)
+                .map(|_| ALPHA[(next() % ALPHA.len() as u64) as usize])
+                .collect();
+            let query = Query::new(&text_q);
+            if query.is_empty() || is_normalized_prefix(&lower, &query) {
+                continue;
+            }
+            for is_dir in [false, true] {
+                if let Some(score) = file_name_score(&query, &name, &lower, is_dir) {
+                    assert!(
+                        score <= non_prefix_score_ceiling(query.len()),
+                        "name {name:?} query {text_q:?}: {score} > {}",
+                        non_prefix_score_ceiling(query.len())
+                    );
+                }
+            }
         }
     }
 }
